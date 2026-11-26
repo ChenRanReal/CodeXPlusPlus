@@ -150,17 +150,6 @@
   display: flex;
   align-items: center;
   min-width: 0;
-  gap: 7px;
-}
-
-.settings-brand__mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  flex: none;
-  color: var(--settings-text);
 }
 
 .settings-brand__copy {

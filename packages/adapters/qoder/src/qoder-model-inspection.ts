@@ -7,13 +7,14 @@ export async function loadQoderModels(
   query: Pick<QoderQuery, "initializationResult" | "getAvailableModels">,
   controller: AbortController,
   closing: AbortSignal,
+  timeoutMs = MODEL_INSPECTION_TIMEOUT_MS,
 ): Promise<QoderModelInfo[]> {
   const cancel = () => controller.abort(closing.reason);
   closing.addEventListener("abort", cancel, { once: true });
   if (closing.aborted) cancel();
   const timer = setTimeout(
-    () => controller.abort(new Error("Qoder Model inspection timed out after 10000ms")),
-    MODEL_INSPECTION_TIMEOUT_MS,
+    () => controller.abort(new Error(`Qoder Model inspection timed out after ${timeoutMs}ms`)),
+    timeoutMs,
   );
   let rejectAborted: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {

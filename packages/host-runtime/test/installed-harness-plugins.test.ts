@@ -1,5 +1,5 @@
 import path from "node:path";
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 
@@ -13,27 +13,13 @@ import { installedHarnessPluginOptions, loadHarnessPlugins } from "../src/index.
 
 const sourceRuntimeUrl = pathToFileURL(path.resolve("packages/host-runtime/dist/main.js")).href;
 const pluginRoot = path.resolve("packages/host-runtime/dist/plugins");
-const classes = {
-  pi: "PiAdapter",
-  copilot: "CopilotAdapter",
-  "claude-code": "ClaudeCodeAdapter",
-  "deepseek-harness": "DeepSeekHarnessAdapter",
-  opencode: "OpenCodeAdapter",
-  grok: "GrokAdapter",
-  omp: "OmpAdapter",
-  "qwen-code": "QwenCodeAdapter",
-  antigravity: "AntigravityAdapter",
-  "kimi-code": "KimiAdapter",
-  "kiro-cli": "KiroAdapter",
-  codebuddy: "CodeBuddyAdapter",
-  workbuddy: "WorkBuddyAdapter",
-  "cursor-cli": "CursorAdapter",
-  devin: "DevinAdapter",
-  hermes: "HermesAdapter",
-  qoder: "QoderAdapter",
-  "qoder-cn": "QoderAdapter",
-  zcode: "ZcodeAdapter",
-};
+const installedHarnessIds = [
+  "antigravity",
+  "codebuddy",
+  "cursor-cli",
+  "deepseek-harness",
+  "qoder-cn",
+];
 
 const unavailable: HarnessInspection = {
   status: "notInstalled",
@@ -78,21 +64,10 @@ describe("installed Harness composition", () => {
 
   describe("explicit commands", () => {
     const commands: Array<[id: string, variable: string]> = [
-      ["copilot", "CODEXHOST_COPILOT_COMMAND"],
-      ["pi", "CODEXHOST_PI_COMMAND"],
-      ["claude-code", "CODEXHOST_CLAUDE_COMMAND"],
-      ["grok", "CODEXHOST_GROK_COMMAND"],
-      ["opencode", "CODEXHOST_OPENCODE_COMMAND"],
-      ["omp", "CODEXHOST_OMP_COMMAND"],
-      ["qwen-code", "CODEXHOST_QWEN_COMMAND"],
       ["antigravity", "CODEXHOST_ANTIGRAVITY_COMMAND"],
-      ["kiro-cli", "CODEXHOST_KIRO_COMMAND"],
       ["codebuddy", "CODEXHOST_CODEBUDDY_COMMAND"],
-      ["workbuddy", "CODEXHOST_WORKBUDDY_COMMAND"],
       ["cursor-cli", "CODEXHOST_CURSOR_COMMAND"],
-      ["devin", "CODEXHOST_DEVIN_COMMAND"],
-      ["hermes", "CODEXHOST_HERMES_COMMAND"],
-      ["qoder", "CODEXHOST_QODER_COMMAND"],
+      ["deepseek-harness", "CODEXHOST_DEEPSEEK_HARNESS_COMMAND"],
       ["qoder-cn", "CODEXHOST_QODERCN_COMMAND"],
     ];
     let registry: Awaited<ReturnType<typeof load>>;
@@ -112,7 +87,7 @@ describe("installed Harness composition", () => {
         const adapter = [...registry.adapters].find(([key]) => key === id)?.[1];
         expect(await adapter?.inspect()).toMatchObject({
           status: "notInstalled",
-          error: { code: id === "hermes" ? "HERMES_NOT_FOUND" : "notInstalled" },
+          error: { code: "notInstalled" },
         });
       },
       35_000,
@@ -123,7 +98,7 @@ describe("installed Harness composition", () => {
     const registry = await loadHarnessPlugins({
       roots: [pluginRoot],
       context: {
-        environment: { PATH: "", CODEXHOST_CLAUDE_COMMAND: "/must/not/spawn/in/background" },
+        environment: { PATH: "", CODEXHOST_CODEBUDDY_COMMAND: "/must/not/spawn/in/background" },
         platform: "darwin",
         managedRemoteHost: true,
         brokerDescriptorPath: path.resolve(".missing-fixture", "broker.json"),
@@ -132,12 +107,11 @@ describe("installed Harness composition", () => {
       warmup: false,
     });
     try {
-      const adapter = [...registry.adapters].find(([id]) => id === "claude-code")?.[1];
+      const adapter = registry.adapters.get(harnessIdSchema.parse("codebuddy"));
       expect(adapter?.constructor.name).toBe("BrokeredHarnessAdapter");
       expect(adapter?.commandCatalog?.commands.map(({ invocation }) => invocation)).toEqual([
         "/compact",
-        "/init",
-        "/recap",
+        "/cost",
       ]);
       expect(await adapter?.inspect()).toMatchObject({
         status: "unavailable",
@@ -153,10 +127,12 @@ describe("installed Harness composition", () => {
     try {
       for (const [id, adapter] of first.adapters) expect(adapter).not.toBe(second.adapters.get(id));
       await first.close();
-      expect(second.list()).toHaveLength(Object.keys(classes).length + 1);
-      for (const [id, adapter] of first.usageAdapters) {
-        expect(adapter).not.toBe(second.usageAdapters.get(id));
-      }
+      expect(
+        second
+          .list()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(installedHarnessIds);
     } finally {
       await Promise.all([first.close(), second.close()]);
     }
@@ -190,8 +166,12 @@ it.runIf(Boolean(process.env.CODEXHOST_OPENCODE_REAL_COMMAND))(
     const plugins = path.join(root, "plugins");
     let registry: Awaited<ReturnType<typeof loadHarnessPlugins>> | undefined;
     try {
-      await cp(path.join(pluginRoot, "opencode"), path.join(plugins, "opencode"), {
-        recursive: true,
+      const buildScript = path.resolve("packages/harness-adapter/scripts/build-plugin.mjs");
+      const { buildHarnessPlugin } = await import(pathToFileURL(buildScript).href);
+      await buildHarnessPlugin({
+        pluginRoot: path.resolve("packages/adapters/opencode"),
+        outputRoot: path.join(plugins, "opencode"),
+        allowedRuntimePackages: new Set(["@opencode-ai/sdk", "@opencode/client", "zod"]),
       });
       await writeFile(
         path.join(plugins, "enabled.json"),

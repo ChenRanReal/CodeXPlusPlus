@@ -20,6 +20,31 @@ function probe(getAvailableModels: NonNullable<QoderQuery["getAvailableModels"]>
   };
 }
 
+it("allows the native Windows Qoder CN catalog to load on a cold start", async () => {
+  vi.useFakeTimers();
+  const nativeProbe = probe(
+    () => new Promise((resolve) => setTimeout(() => resolve([model("available")]), 15_000)),
+  );
+  const adapter = new QoderAdapter({
+    variant: "cn",
+    platform: "win32",
+    resolveExecutable: () => "qoderclicn.exe",
+    queryFactory: () => nativeProbe as unknown as QoderQuery,
+    startDaemon: async () => ({ stop: async () => undefined }) as unknown as QoderSdkDaemon,
+  });
+  try {
+    const result = adapter.inspect();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await result).toMatchObject({
+      status: "ready",
+      catalog: { models: [{ label: "available" }] },
+    });
+  } finally {
+    vi.useRealTimers();
+    await adapter.close();
+  }
+});
+
 describe.each(["global", "cn"] as const)("Qoder %s model inspection", (variant) => {
   it("loads cold daemon models live and caches the catalog by cwd until refresh", async () => {
     const probes: ReturnType<typeof probe>[] = [];

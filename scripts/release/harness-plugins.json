@@ -1,4 +1,24 @@
 {
-  "plugins": ["packages/adapters/antigravity", "packages/adapters/cursor-cli"],
-  "runtimePackages": ["@agentclientprotocol/sdk", "diff", "zod"]
+  "plugins": [
+    "packages/adapters/antigravity",
+    "packages/adapters/cursor-cli",
+    "packages/adapters/deepseek-harness",
+    "packages/adapters/codebuddy",
+    "packages/adapters/qoder-cn"
+  ],
+  "runtimePackages": [
+    "@agentclientprotocol/sdk",
+    "@modelcontextprotocol/sdk",
+    "@qoder-ai/qoder-agent-sdk",
+    "@qodercn-ai/qodercn-agent-sdk",
+    "ajv",
+    "ajv-formats",
+    "diff",
+    "fast-deep-equal",
+    "fast-uri",
+    "json-schema-traverse",
+    "ws",
+    "zod",
+    "zod-to-json-schema"
+  ]
 }

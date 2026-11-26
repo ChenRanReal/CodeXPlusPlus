@@ -291,6 +291,7 @@ export class QoderAdapter implements HarnessAdapter {
                   probeQuery,
                   controller,
                   this.#inspectionController.signal,
+                  this.#variant === "cn" && this.#platform === "win32" ? 30_000 : undefined,
                 );
               }
             } finally {

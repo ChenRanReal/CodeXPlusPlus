@@ -4,8 +4,6 @@ import delegationCss from "./delegation.css";
 import consoleComponentsCss from "../console/components.css";
 import usageCss from "../console/usage/usage.css";
 import tailwindCss from "./tailwind.css";
-import coloredBrandCss from "../renderer-brand-mark.css";
-import { createRendererColoredBrandMark } from "../renderer-brand-mark.js";
 import {
   RendererSettingsNavigationState,
   RendererSettingsPageScope,
@@ -86,7 +84,7 @@ export function mountRendererSettingsShell(
   const shadow = root.attachShadow({ mode: "open" });
   const style = ownerDocument.createElement("style");
   // Tailwind declares the cascade layer order, so it must precede the unlayered settings CSS.
-  style.textContent = `${tailwindCss}\n${settingsCss}\n${accountsCss}\n${delegationCss}\n${consoleComponentsCss}\n${usageCss}\n${coloredBrandCss}`;
+  style.textContent = `${tailwindCss}\n${settingsCss}\n${accountsCss}\n${delegationCss}\n${consoleComponentsCss}\n${usageCss}`;
 
   // A page beside the native navigation rail, not a modal: the rail stays
   // usable and native navigation replaces the page.
@@ -100,9 +98,6 @@ export function mountRendererSettingsShell(
   header.className = "settings-header";
   const brand = ownerDocument.createElement("div");
   brand.className = "settings-brand";
-  const brandMark = ownerDocument.createElement("span");
-  brandMark.className = "settings-brand__mark";
-  brandMark.append(createRendererColoredBrandMark(ownerDocument, 24));
   const brandCopy = ownerDocument.createElement("span");
   brandCopy.className = "settings-brand__copy";
   const brandName = ownerDocument.createElement("span");
@@ -113,7 +108,7 @@ export function mountRendererSettingsShell(
   brandTitle.id = "codexhost-settings-page-title";
   brandTitle.textContent = messages.title;
   brandCopy.append(brandName, brandTitle);
-  brand.append(brandMark, brandCopy);
+  brand.append(brandCopy);
 
   const headerActions = ownerDocument.createElement("div");
   headerActions.className = "settings-header-actions";

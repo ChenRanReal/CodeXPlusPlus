@@ -78,6 +78,7 @@
 | 插件加载 | 复制海外版 bundle 至临时隔离根，通过 `loadHarnessPlugins` 加载并检查 | 首次 15 项；普通读取复用同一结果；显式刷新重新得到 15 项；检查结束关闭 Registry |
 | Host 集成 | 主目录 Desktop 重启后，通过其控制通道调用 `codexhost/harness/inspect` | 普通检查与显式刷新均 ready、15 项、默认 Qwen3.8-Flash；Renderer 安装状态 installed、无失败 |
 | 真实原生验收 | macOS、海外版、本机 CLI 登录、默认 Qwen3.8-Flash；模型发现，不提交 Prompt | 冷启动及刷新通过；不包含实际对话、中国版原生 CLI 或 SSH |
+| Windows Qoder CN 模型发现 | CLI 1.1.97、SDK 1.0.58；从隔离目录加载打包后的 Adapter，以本机 CLI 登录读取模型清单 | 返回 14 个模型，默认 Auto；模型探测上限为 30 秒，覆盖冷启动；验收范围为模型发现 |
 | Desktop / 委派 | Desktop 可见模型选择 / 真实委派 | 未操作模型选择或发送对话；真实委派未验收 |
 | 静态检查 | `npm run build:typescript`、`npm run typecheck` | 通过 |
 | Session 目录与检查生命周期 | `npx vitest run --config tests/vitest.config.js packages/adapters/qoder/test` | 192 项通过；含不同于 Host cwd 的项目、原生默认 Model、共享超时预算、关闭取消及刷新竞态 |
