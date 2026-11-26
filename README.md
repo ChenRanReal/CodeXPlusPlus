@@ -1,4 +1,4 @@
-## Codex++ 精簡版
+## CodeX++
 
 此分支基於上游 `v0.26.1`，預裝 [Antigravity CLI](https://antigravity.google/docs/ide/extensions/acp/) 與 [Cursor CLI](https://cursor.com/docs/cli/acp)。兩者以本機 ACP stdio 執行，並使用各自的 CLI 登入與模型清單。
 
