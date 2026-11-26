@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="CodeX++" Width="520" SizeToContent="Height"
+        Title="CodeX++" Width="560" SizeToContent="Height"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         FontFamily="Segoe UI, Microsoft JhengHei UI" FontSize="13">
@@ -79,30 +79,30 @@
         </TextBlock>
         <Button x:Name="CloseButton" Grid.Column="2" Width="32" Height="32" Padding="0"
                 VerticalAlignment="Center" Background="Transparent" BorderBrush="Transparent"
-                Content="×" FontSize="20" ToolTip="關閉" AutomationProperties.Name="關閉啟動視窗"/>
+                Content="×" FontSize="20" ToolTip="关闭" AutomationProperties.Name="关闭启动窗口"/>
       </Grid>
       <StackPanel Grid.Row="1" Margin="0,0,0,20">
         <TextBlock x:Name="StateTitle" FontSize="24" FontWeight="SemiBold"
-                   Foreground="{StaticResource PrimaryText}" Text="正在檢查啟動環境"/>
+                   Foreground="{StaticResource PrimaryText}" Text="正在检查启动环境"/>
         <TextBlock x:Name="StateDetail" Foreground="{StaticResource SecondaryText}" Margin="0,7,0,0"
-                   TextWrapping="Wrap" MinHeight="20" Text="確認本機執行環境與 Codex Desktop。"/>
+                   TextWrapping="Wrap" MinHeight="20" Text="确认本机文件与 Codex Desktop。"/>
       </StackPanel>
       <Border Grid.Row="2" Background="#A5101726" BorderBrush="#33415B" BorderThickness="1" CornerRadius="11"
               Padding="14,8" Margin="0,0,0,16">
         <StackPanel>
           <DockPanel Height="32">
             <TextBlock x:Name="CheckMark" Style="{StaticResource RowMark}" VerticalAlignment="Center"/>
-            <TextBlock Style="{StaticResource RowText}" Text="檢查啟動環境"/>
+            <TextBlock Style="{StaticResource RowText}" Text="检查启动环境"/>
           </DockPanel>
           <Border Background="#27344B" Height="1" />
           <DockPanel Height="32">
             <TextBlock x:Name="DesktopMark" Style="{StaticResource RowMark}" VerticalAlignment="Center"/>
-            <TextBlock Style="{StaticResource RowText}" Text="啟動 Codex Desktop"/>
+            <TextBlock Style="{StaticResource RowText}" Text="启动 Codex Desktop"/>
           </DockPanel>
           <Border Background="#27344B" Height="1" />
           <DockPanel Height="32">
             <TextBlock x:Name="RendererMark" Style="{StaticResource RowMark}" VerticalAlignment="Center"/>
-            <TextBlock Style="{StaticResource RowText}" Text="接上 Host 並載入擴充"/>
+            <TextBlock Style="{StaticResource RowText}" Text="接上 Host 并加载扩展"/>
           </DockPanel>
         </StackPanel>
       </Border>
@@ -114,18 +114,35 @@
         <ProgressBar x:Name="LaunchProgress" VerticalAlignment="Center" Height="4"
                      Background="#26344A" Foreground="{StaticResource Accent}"
                      Margin="0,0,12,0" BorderThickness="0" IsIndeterminate="True"/>
-        <StackPanel Grid.Column="1" Orientation="Horizontal" x:Name="Actions" Visibility="Collapsed">
-          <Button x:Name="CopyButton" Content="複製診斷" Margin="0,0,8,0"/>
-          <Button x:Name="RetryButton" Content="重試" Background="#75EACB"
-                  Foreground="#12251F" BorderBrush="#75EACB" FontWeight="SemiBold"/>
-        </StackPanel>
+        <TextBlock x:Name="ElapsedText" Grid.Column="1" VerticalAlignment="Center"
+                   Foreground="{StaticResource SecondaryText}" Text="已等待 00:00"/>
       </Grid>
-      <Expander x:Name="Details" Grid.Row="4" Header="啟動診斷" Foreground="{StaticResource SecondaryText}"
-                Visibility="Collapsed" Margin="0,0,0,2">
-        <Border Background="#11192A" CornerRadius="7" Padding="9" Margin="0,7,0,0">
-          <TextBlock x:Name="DiagnosticText" Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap"/>
+      <DockPanel Grid.Row="4" Margin="0,0,0,2">
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
+          <StackPanel Orientation="Horizontal" x:Name="Actions" Visibility="Collapsed" Margin="0,0,0,8">
+            <Button x:Name="RestartButton" Content="重新启动" Margin="0,0,8,0" Visibility="Collapsed"
+                    Background="#75EACB" Foreground="#12251F" BorderBrush="#75EACB" FontWeight="SemiBold"/>
+            <Button x:Name="DismissButton" Content="取消" Margin="0,0,8,0" Visibility="Collapsed"/>
+            <Button x:Name="RetryButton" Content="重试" Background="#75EACB"
+                    Foreground="#12251F" BorderBrush="#75EACB" FontWeight="SemiBold"/>
+          </StackPanel>
+          <Expander x:Name="Details" Header="错误详情" Foreground="{StaticResource SecondaryText}"
+                    Visibility="Collapsed">
+            <Border Background="#11192A" CornerRadius="7" Padding="9" Margin="0,7,0,8">
+              <TextBlock x:Name="DiagnosticText" Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap"/>
+            </Border>
+          </Expander>
+          <Button x:Name="CopyButton" HorizontalAlignment="Left" Content="复制当前状态" Padding="0,4"
+                  Background="Transparent" BorderBrush="Transparent"/>
+        </StackPanel>
+        <Border Background="#11192A" BorderBrush="#33415B" BorderThickness="1" CornerRadius="9" Padding="10,8">
+          <ScrollViewer x:Name="ActivityScroll" MaxHeight="108" VerticalScrollBarVisibility="Auto">
+            <TextBlock x:Name="ActivityLog" Foreground="{StaticResource SecondaryText}" FontSize="12"
+                       FontFamily="Cascadia Mono, Consolas" TextWrapping="Wrap"
+                       Text="00:00  正在确认本机文件与 Codex Desktop"/>
+          </ScrollViewer>
         </Border>
-      </Expander>
+      </DockPanel>
     </Grid>
   </Border>
 </Window>

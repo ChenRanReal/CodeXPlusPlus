@@ -1,6 +1,6 @@
 param(
     [string]$RuntimeDirectory = (Join-Path $PSScriptRoot '../../.work/CodeXPlusPlus'),
-    [ValidateSet('checking', 'desktop', 'renderer', 'blocked', 'failed', 'ready')]
+    [ValidateSet('checking', 'desktop', 'renderer', 'blocked', 'failed', 'ready', 'running', 'confirm')]
     [string]$Preview,
     [string]$CapturePath
 )
@@ -23,7 +23,8 @@ $window.Icon = $icon
 $view = @{}
 foreach ($name in @('LaunchCard', 'Header', 'BrandImage', 'CloseButton', 'StateTitle',
         'StateDetail', 'CheckMark', 'DesktopMark', 'RendererMark', 'LaunchProgress',
-        'Actions', 'RetryButton', 'CopyButton', 'Details', 'DiagnosticText')) {
+        'ElapsedText', 'ActivityLog', 'ActivityScroll', 'Actions', 'RestartButton', 'DismissButton',
+        'RetryButton', 'CopyButton', 'Details', 'DiagnosticText')) {
     $view[$name] = $window.FindName($name)
 }
 $view.BrandImage.Source = $icon
@@ -45,6 +46,9 @@ $statusPath = Join-Path ([IO.Path]::GetTempPath()) "codex-plus-launch-$PID.json"
 $workerPath = Join-Path $PSScriptRoot 'Invoke-CodeXPlusPlusLaunch.ps1'
 $script:worker = $null
 $script:latestState = ''
+$script:latestFingerprint = ''
+$script:launchMutex = $null
+$script:launchMutexOwned = $false
 $script:step = 0
 $script:desktopPid = 0
 $script:desktopIconApplied = $false
@@ -57,27 +61,74 @@ function Brush([string]$Color) {
     [Windows.Media.SolidColorBrush]::new([Windows.Media.ColorConverter]::ConvertFromString($Color))
 }
 
-function Set-LaunchView([string]$State, [string]$Diagnostic) {
-    $script:latestState = $State
-    switch ($State) {
-        'checking' { $script:step = 0; $title = '正在檢查啟動環境'; $detail = '確認本機執行環境與 Codex Desktop。' }
-        'desktop'  { $script:step = 1; $title = '正在啟動桌面'; $detail = '啟動 Codex Desktop，等待桌面 Controller。' }
-        'renderer' { $script:step = 2; $title = '正在載入 CodeX++'; $detail = '等待桌面接上 Host 並載入擴充。' }
-        'ready'    { $script:step = 3; $title = 'CodeX++ 已就緒'; $detail = 'Host 已連線，桌面擴充已載入。' }
-        'blocked'  { $script:step = 1; $title = 'Codex 已經開啟'; $detail = $Diagnostic }
-        'failed'   { $title = 'CodeX++ 啟動失敗'; $detail = '桌面擴充尚未就緒，可展開診斷查看原因。' }
+function Show-LaunchReminder([string]$State, [switch]$Quiet) {
+    $window.Topmost = $true
+    $null = $window.Activate()
+    if ($Preview -or $Quiet) { return }
+    if ($State -eq 'failed') { [System.Media.SystemSounds]::Hand.Play() }
+    else { [System.Media.SystemSounds]::Asterisk.Play() }
+}
+
+function Enter-LaunchGate {
+    if ($Preview -or $script:launchMutexOwned) { return $true }
+    if (!$script:launchMutex) {
+        $script:launchMutex = [Threading.Mutex]::new($false, 'Local\CodeXPlusPlusLaunch')
     }
+    try {
+        $script:launchMutexOwned = $script:launchMutex.WaitOne(0)
+    } catch [Threading.AbandonedMutexException] {
+        $script:launchMutexOwned = $true
+    }
+    return $script:launchMutexOwned
+}
+
+function Set-LaunchView([string]$State, [string]$Diagnostic, [string]$Log = '', [int]$Elapsed = 0) {
+    $stateChanged = $script:latestState -ne $State
+    $script:latestState = $State
+    $stalled = $Diagnostic -like '这一步已经*'
+    switch ($State) {
+        'checking' { $script:step = 0; $title = '正在检查启动环境'; $detail = '确认本机文件与 Codex Desktop。' }
+        'desktop'  { $script:step = 1; $title = '正在启动桌面'; $detail = '启动 Codex Desktop，等待桌面 Controller。' }
+        'renderer' { $script:step = 2; $title = '正在加载 CodeX++'; $detail = '等待桌面接上 Host 并加载扩展。' }
+        'ready'    { $script:step = 3; $title = 'CodeX++ 已就绪'; $detail = 'Host 已连上，桌面扩展已加载。' }
+        'running'  {
+            if ($Diagnostic -like '*启动窗口*') {
+                $script:step = 0
+                $title = '启动窗口已经打开'
+            } else {
+                $script:step = 3
+                $title = 'CodeX++ 已经启动'
+            }
+            $detail = '不用再次打开。'
+        }
+        'confirm'  { $script:step = 1; $title = 'Codex 已经启动'; $detail = '要重新启动吗？重新启动会关闭之前已经打开的窗口。' }
+        'blocked'  { $script:step = 1; $title = 'Codex 已经被启动'; $detail = $Diagnostic }
+        'failed'   { $title = 'CodeX++ 启动失败'; $detail = '桌面扩展还没就绪。' }
+    }
+    if ($stalled) { $title = '这一步还没有新进展' }
+    if ($Diagnostic) { $detail = $Diagnostic }
     $failed = $State -in @('blocked', 'failed')
+    $remind = $State -in @('running', 'blocked', 'failed', 'confirm')
     $view.StateTitle.Text = $title
     $view.StateDetail.Text = $detail
-    $view.Actions.Visibility = if ($failed) { 'Visible' } else { 'Collapsed' }
+    $view.ElapsedText.Text = '已等待 {0:mm\:ss}' -f [TimeSpan]::FromSeconds([Math]::Max($Elapsed, 0))
+    if ($Log) { $view.ActivityLog.Text = $Log }
+    $view.ActivityScroll.ScrollToEnd()
+    $view.Actions.Visibility = if ($remind) { 'Visible' } else { 'Collapsed' }
+    $view.RestartButton.Visibility = if ($State -eq 'confirm') { 'Visible' } else { 'Collapsed' }
+    $view.DismissButton.Visibility = if ($State -in @('running', 'confirm')) { 'Visible' } else { 'Collapsed' }
+    $view.DismissButton.Content = if ($State -eq 'confirm') { '取消' } else { '知道了' }
+    $view.RetryButton.Visibility = if ($failed) { 'Visible' } else { 'Collapsed' }
     $view.Details.Visibility = if ($failed) { 'Visible' } else { 'Collapsed' }
     $view.Details.IsExpanded = $State -eq 'failed'
     $view.DiagnosticText.Text = $Diagnostic
-    $view.CopyButton.Content = '複製診斷'
-    $view.LaunchProgress.IsIndeterminate = !$failed -and $State -ne 'ready'
-    $view.LaunchProgress.Value = if ($State -eq 'ready') { 100 } elseif ($failed) { $script:step * 33 } else { 0 }
-    $view.LaunchProgress.Foreground = if ($failed) { Brush '#F1A37F' } else { Brush '#75EACB' }
+    if ($view.CopyButton.Content -ne '已复制') { $view.CopyButton.Content = '复制当前状态' }
+    $view.LaunchProgress.Foreground = if ($failed -or $stalled) { Brush '#F1A37F' } else { Brush '#75EACB' }
+    if ($stateChanged) {
+        $view.LaunchProgress.IsIndeterminate = $State -in @('checking', 'desktop', 'renderer')
+        $view.LaunchProgress.Value = if ($State -in @('ready', 'running')) { 100 } elseif ($State -eq 'confirm') { 34 } elseif ($failed) { $script:step * 33 } else { 0 }
+        if ($remind) { Show-LaunchReminder $State }
+    }
     $marks = @($view.CheckMark, $view.DesktopMark, $view.RendererMark)
     for ($i = 0; $i -lt $marks.Count; $i++) {
         $mark = $marks[$i]
@@ -85,8 +136,8 @@ function Set-LaunchView([string]$State, [string]$Diagnostic) {
             $mark.Text = '✓'
             $mark.Foreground = Brush '#75EACB'
         } elseif ($i -eq $script:step) {
-            $mark.Text = if ($failed) { '!' } else { '●' }
-            $mark.Foreground = if ($failed) { Brush '#F1A37F' } else { Brush '#BDB9FF' }
+            $mark.Text = if ($failed -or $stalled) { '!' } else { '●' }
+            $mark.Foreground = if ($failed -or $stalled) { Brush '#F1A37F' } else { Brush '#BDB9FF' }
         } else {
             $mark.Text = '○'
             $mark.Foreground = Brush '#7C8AA4'
@@ -107,22 +158,30 @@ function Save-LaunchCapture {
     try { $encoder.Save($stream) } finally { $stream.Dispose() }
 }
 
-function Start-LaunchWorker {
-    Set-LaunchView 'checking'
+function Start-LaunchWorker([switch]$ReplaceExisting) {
+    $script:latestFingerprint = ''
+    $window.Topmost = $false
+    if (!(Enter-LaunchGate)) {
+        Set-LaunchView 'running' '启动窗口已经打开。请查看正在显示的那个 CodeX++ 启动窗口。' '00:00  重复打开：启动窗口已经在运行' 0
+        return
+    }
+    Set-LaunchView 'checking' '' "00:00  正在确认本机文件与 Codex Desktop" 0
     if (Test-Path -LiteralPath $statusPath) { Remove-Item -LiteralPath $statusPath }
     if ($script:worker) { $script:worker.Dispose() }
     try {
         $start = [Diagnostics.ProcessStartInfo]::new($pwsh)
         $start.UseShellExecute = $false
         $start.CreateNoWindow = $true
-        foreach ($argument in @('-NoLogo', '-NoProfile', '-File', $workerPath,
-                '-RuntimeDirectory', $RuntimeDirectory, '-StatusPath', $statusPath)) {
+        $workerArguments = @('-NoLogo', '-NoProfile', '-File', $workerPath,
+            '-RuntimeDirectory', $RuntimeDirectory, '-StatusPath', $statusPath)
+        if ($ReplaceExisting) { $workerArguments += '-ReplaceExisting' }
+        foreach ($argument in $workerArguments) {
             $start.ArgumentList.Add($argument)
         }
         $script:worker = [Diagnostics.Process]::Start($start)
         $poll.Start()
     } catch {
-        Set-LaunchView 'failed' $_.Exception.Message
+        Set-LaunchView 'failed' $_.Exception.Message $_.Exception.Message
     }
 }
 
@@ -147,14 +206,35 @@ $poll.Add_Tick({
         try { $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json }
         catch { return }
     }
-    if ($status -and $status.state -ne $script:latestState) {
-        Set-LaunchView $status.state $status.detail
-        if ($status.state -eq 'ready') {
+    if ($status) {
+        $fingerprint = "$($status.state)|$($status.detail)|$($status.elapsed)|$($status.log)"
+        if ($fingerprint -ne $script:latestFingerprint) {
+            $script:latestFingerprint = $fingerprint
+            Set-LaunchView $status.state $status.detail $status.log ([int]$status.elapsed)
+        }
+        if ($status.state -eq 'ready' -and $script:latestState -eq 'ready') {
             $poll.Stop()
             $script:desktopPid = $status.desktopPid
             try { Apply-ManagedDesktopIcon }
             catch { Write-Warning "桌面工作列圖示設定失敗：$($_.Exception.Message)" }
             $autoClose.Start()
+            return
+        }
+        if ($status.state -eq 'confirm' -and $script:latestState -eq 'confirm') {
+            $poll.Stop()
+            $script:desktopPid = $status.desktopPid
+            return
+        }
+        if ($status.state -eq 'running' -and $script:latestState -eq 'running') {
+            $poll.Stop()
+            $script:desktopPid = $status.desktopPid
+            try { Apply-ManagedDesktopIcon }
+            catch { Write-Warning "桌面工作列圖示設定失敗：$($_.Exception.Message)" }
+            if ($script:desktopPid) {
+                $shell = New-Object -ComObject WScript.Shell
+                [void]$shell.AppActivate($script:desktopPid)
+            }
+            Show-LaunchReminder 'running' -Quiet
             return
         }
         if ($status.state -in @('blocked', 'failed')) {
@@ -164,7 +244,7 @@ $poll.Add_Tick({
     }
     if ($script:worker -and $script:worker.HasExited -and $status.state -notin @('blocked', 'failed', 'ready')) {
         $poll.Stop()
-        Set-LaunchView 'failed' "啟動程序提前結束（代碼 $($script:worker.ExitCode)）。"
+        Set-LaunchView 'failed' "启动程序提前结束（代码 $($script:worker.ExitCode)）。" $view.ActivityLog.Text
     }
 })
 $autoClose.Add_Tick({
@@ -176,20 +256,34 @@ $autoClose.Add_Tick({
     }
     $window.Close()
 })
+$view.DismissButton.Add_Click({
+    if ($script:desktopPid) {
+        $shell = New-Object -ComObject WScript.Shell
+        [void]$shell.AppActivate($script:desktopPid)
+    }
+    $window.Close()
+})
+$view.RestartButton.Add_Click({ if (!$Preview) { Start-LaunchWorker -ReplaceExisting } })
 $view.RetryButton.Add_Click({ if (!$Preview) { Start-LaunchWorker } })
 $view.CopyButton.Add_Click({
-    [Windows.Clipboard]::SetText($view.DiagnosticText.Text)
-    $view.CopyButton.Content = '已複製'
+    $copied = @($view.ActivityLog.Text, $view.DiagnosticText.Text) | Where-Object { $_ } 
+    [Windows.Clipboard]::SetText(($copied -join "`r`n"))
+    $view.CopyButton.Content = '已复制'
 })
 $window.Add_ContentRendered({
     if ($Preview) {
         $diagnostic = switch ($Preview) {
-            'blocked' { '請先從「檔案」選單完整退出目前的 Codex，再按「重試」。' }
-            'failed'  { 'Codex Desktop exited before starting the codexhost Host chain' }
-            default   { '' }
+            'desktop' { '这一步已经 13 秒没有新进展：正在创建 Codex Desktop 进程' }
+            'renderer' { '等待桌面接上 Host；扩展状态：加载中' }
+            'running' { '启动窗口已经打开。请查看正在显示的那个 CodeX++ 启动窗口。' }
+            'confirm' { '要重新启动吗？重新启动会关闭之前已经打开的窗口。' }
+            'blocked' { 'Codex 已经被启动。请先退出当前窗口，再打开 CodeX++。' }
+            'failed'  { '启动失败。Codex 桌面在接上 Host 之前就退出了。' }
+            default   { '正在确认本机文件与 Codex Desktop。' }
         }
-        if ($Preview -eq 'failed') { Set-LaunchView 'renderer' }
-        Set-LaunchView $Preview $diagnostic
+        $log = "00:00  正在确认本机文件与 Codex Desktop`n00:02  已找到 Codex Desktop`n00:03  正在创建 Codex Desktop 进程`n00:16  仍停在这一步，已 13 秒没有新进展"
+        if ($Preview -eq 'failed') { Set-LaunchView 'renderer' $diagnostic $log 16 }
+        Set-LaunchView $Preview $diagnostic $log $(if ($Preview -eq 'ready') { 21 } else { 16 })
         if ($CapturePath) {
             $window.Dispatcher.BeginInvoke([Action]{
                 Save-LaunchCapture
@@ -204,6 +298,14 @@ $window.Add_Closed({
     $poll.Stop()
     $autoClose.Stop()
     if ($script:worker) { $script:worker.Dispose() }
+    if ($script:launchMutex) {
+        if ($script:launchMutexOwned) {
+            try { $script:launchMutex.ReleaseMutex() } catch { }
+        }
+        $script:launchMutex.Dispose()
+        $script:launchMutex = $null
+        $script:launchMutexOwned = $false
+    }
     if (Test-Path -LiteralPath $statusPath) { Remove-Item -LiteralPath $statusPath -ErrorAction SilentlyContinue }
 })
 [void]$window.ShowDialog()
