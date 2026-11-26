@@ -24,7 +24,7 @@ import {
   RENDERER_SETTINGS_BRAND_NAME,
   type RendererSettingsMessages,
 } from "./localization.js";
-import { CODEXHOST_GITHUB_REPOSITORY_URL, createDefaultRendererSettingsRegistry } from "./pages.js";
+import { createDefaultRendererSettingsRegistry } from "./pages.js";
 import { attachRendererSettingsRailPage, type RendererSettingsRailPage } from "./rail-page.js";
 import { RELEASE_ANNOUNCEMENT_DIALOG_ATTRIBUTE } from "./release-announcement-dialog.js";
 
@@ -266,7 +266,7 @@ export function mountRendererSettingsShell(
 
   const starLink = ownerDocument.createElement("a");
   starLink.className = "settings-nav-button settings-nav-star-link";
-  starLink.href = CODEXHOST_GITHUB_REPOSITORY_URL;
+  starLink.href = "https://github.com/ChenRanReal/CodeXPlusPlus";
   starLink.target = "_blank";
   starLink.rel = "noopener noreferrer";
   starLink.setAttribute("aria-label", messages.starOnGitHub);
