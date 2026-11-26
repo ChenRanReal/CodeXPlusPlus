@@ -1,0 +1,536 @@
+import { z } from "zod";
+
+import { codexhostErrorSchema } from "./errors.js";
+import {
+  harnessPermissionModeCatalogSchema,
+  harnessPermissionModeIdSchema,
+} from "./harness-permission-modes.js";
+import { HARNESS_TRANSPORT_MODEL_ID_MAX_LENGTH } from "./harness-route-limit.js";
+import { harnessIdSchema, hostThreadIdSchema, hostTurnIdSchema } from "./ids.js";
+import { threadUsageSnapshotSchema } from "./thread-usage.js";
+
+export const HARNESS_MODEL_REF_MAX_LENGTH = 512;
+export const HARNESS_MODEL_LABEL_MAX_LENGTH = 256;
+export const HARNESS_THINKING_OPTION_ID_MAX_LENGTH = 128;
+export const THREAD_OWNERSHIP_LIST_MAX_LENGTH = 100;
+
+const nonBlankTextSchema = z.string().refine((value) => value.trim().length > 0, {
+  message: "Value must not be empty or whitespace",
+});
+
+export const harnessModelRefIdSchema = z
+  .string()
+  .min(1)
+  .max(HARNESS_MODEL_REF_MAX_LENGTH)
+  .refine((id) => !/\p{Cc}/u.test(id), "Model Ref must not contain control characters")
+  .brand<"HarnessModelRefId">();
+
+export const harnessModelServiceTierSchema = z.enum(["priority", "ultrafast"]);
+export type HarnessModelServiceTier = z.infer<typeof harnessModelServiceTierSchema>;
+
+export const harnessModelRefSchema = z
+  .object({
+    id: harnessModelRefIdSchema,
+    serviceTier: harnessModelServiceTierSchema.optional(),
+  })
+  .strict();
+
+export type HarnessModelRef = z.infer<typeof harnessModelRefSchema>;
+
+export function sameHarnessModelRef(
+  left: HarnessModelRef | undefined,
+  right: HarnessModelRef | undefined,
+): boolean {
+  return left?.id === right?.id && left?.serviceTier === right?.serviceTier;
+}
+
+/** String key for UI controls that cannot carry a Ref object. */
+export function harnessModelRefKey(ref: HarnessModelRef): string {
+  return ref.serviceTier === undefined ? ref.id : `${ref.id}\u001f${ref.serviceTier}`;
+}
+
+export function harnessModelRefFromKey(key: string): HarnessModelRef {
+  const separator = key.indexOf("\u001f");
+  return harnessModelRefSchema.parse(
+    separator === -1
+      ? { id: key }
+      : { id: key.slice(0, separator), serviceTier: key.slice(separator + 1) },
+  );
+}
+
+export const harnessThinkingOptionIdSchema = nonBlankTextSchema
+  .max(HARNESS_THINKING_OPTION_ID_MAX_LENGTH)
+  .regex(/^[A-Za-z0-9._~-]+$/u, "Thinking option ID must use transport-safe characters")
+  .brand<"HarnessThinkingOptionId">();
+
+export type HarnessThinkingOptionId = z.infer<typeof harnessThinkingOptionIdSchema>;
+
+export const harnessResolvedModelLabelSchema = nonBlankTextSchema.max(
+  HARNESS_MODEL_LABEL_MAX_LENGTH,
+);
+
+export const harnessThinkingOptionSchema = z
+  .object({
+    id: harnessThinkingOptionIdSchema,
+    label: nonBlankTextSchema.max(HARNESS_MODEL_LABEL_MAX_LENGTH),
+  })
+  .strict();
+
+export type HarnessThinkingOption = z.infer<typeof harnessThinkingOptionSchema>;
+
+export const harnessModelSchema = z
+  .object({
+    ref: harnessModelRefSchema,
+    label: nonBlankTextSchema.max(HARNESS_MODEL_LABEL_MAX_LENGTH),
+    resolvedModelLabel: harnessResolvedModelLabelSchema.optional(),
+    /** Optional opaque selection for this same Model with priority processing enabled. */
+    fastModel: harnessModelRefSchema.optional(),
+    supportedThinkingOptionIds: z.array(harnessThinkingOptionIdSchema).optional(),
+  })
+  .strict()
+  .refine(
+    (model) => model.fastModel?.serviceTier === undefined || model.fastModel.id === model.ref.id,
+    {
+      path: ["fastModel", "id"],
+      message: "A tiered Fast Model must share the base Model ID",
+    },
+  );
+
+export type HarnessModel = z.infer<typeof harnessModelSchema>;
+
+/** Resolve a normal or advertised Fast selection without interpreting Harness-owned refs. */
+export function catalogModelForRef(
+  catalog: HarnessModelCatalog | undefined,
+  ref: HarnessModelRef | undefined,
+): HarnessModel | undefined {
+  if (!ref) return undefined;
+  return catalog?.models.find(
+    (model) => sameHarnessModelRef(model.ref, ref) || sameHarnessModelRef(model.fastModel, ref),
+  );
+}
+
+const harnessThinkingOptionsSchema = z
+  .array(harnessThinkingOptionSchema)
+  .superRefine((options, context) => {
+    const ids = new Set<string>();
+    for (const [index, option] of options.entries()) {
+      if (ids.has(option.id)) {
+        context.addIssue({
+          code: "custom",
+          message: "Thinking option IDs must be unique",
+          path: [index, "id"],
+        });
+      }
+      ids.add(option.id);
+    }
+  });
+
+export const harnessModelCatalogSchema = z
+  .object({
+    models: z.array(harnessModelSchema),
+    defaultModel: harnessModelRefSchema.optional(),
+    thinkingOptions: harnessThinkingOptionsSchema,
+    defaultThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
+  })
+  .strict()
+  .superRefine((catalog, context) => {
+    const refs: HarnessModelRef[] = [];
+    const thinkingIds = new Set(catalog.thinkingOptions.map(({ id }) => id));
+    for (const [index, model] of catalog.models.entries()) {
+      if (refs.some((ref) => sameHarnessModelRef(ref, model.ref))) {
+        context.addIssue({
+          code: "custom",
+          message: "Model Catalog refs must be unique",
+          path: ["models", index, "ref", "id"],
+        });
+      }
+      refs.push(model.ref);
+      if (model.fastModel) {
+        if (refs.some((ref) => sameHarnessModelRef(ref, model.fastModel))) {
+          context.addIssue({
+            code: "custom",
+            message: "Fast Model refs must be distinct and unique",
+            path: ["models", index, "fastModel"],
+          });
+        }
+        refs.push(model.fastModel);
+      }
+      const supportedThinkingIds = new Set<string>();
+      for (const [optionIndex, optionId] of (model.supportedThinkingOptionIds ?? []).entries()) {
+        if (supportedThinkingIds.has(optionId)) {
+          context.addIssue({
+            code: "custom",
+            message: "Supported Thinking option IDs must be unique per Model",
+            path: ["models", index, "supportedThinkingOptionIds", optionIndex],
+          });
+        }
+        supportedThinkingIds.add(optionId);
+        if (!thinkingIds.has(optionId)) {
+          context.addIssue({
+            code: "custom",
+            message: "Supported Thinking option must exist in the catalog",
+            path: ["models", index, "supportedThinkingOptionIds", optionIndex],
+          });
+        }
+      }
+    }
+    if (catalog.defaultModel && !catalogModelForRef(catalog, catalog.defaultModel)) {
+      context.addIssue({
+        code: "custom",
+        message: "Default Model must exist in the Model Catalog",
+        path: ["defaultModel", "id"],
+      });
+    }
+    if (catalog.defaultThinkingOptionId && !thinkingIds.has(catalog.defaultThinkingOptionId)) {
+      context.addIssue({
+        code: "custom",
+        message: "Default Thinking option must exist in the catalog",
+        path: ["defaultThinkingOptionId"],
+      });
+    }
+  });
+
+export type HarnessModelCatalog = z.infer<typeof harnessModelCatalogSchema>;
+
+const harnessHistoryCapabilitiesSchema = z
+  .object({
+    fork: z.boolean(),
+    forkAcrossCwd: z.boolean(),
+    rollbackLastTurn: z.boolean(),
+  })
+  .strict()
+  .refine((history) => history.fork || !history.forkAcrossCwd, {
+    path: ["forkAcrossCwd"],
+    message: "Cross-cwd Fork requires exact history Fork support",
+  });
+
+export const harnessPermissionModeScopeSchema = z.enum(["live", "atCreate"]);
+
+export type HarnessPermissionModeScope = z.infer<typeof harnessPermissionModeScopeSchema>;
+
+export function permissionModeFixedAtCreate(configuration: {
+  permissionModeScope?: HarnessPermissionModeScope;
+}): boolean {
+  return configuration.permissionModeScope === "atCreate";
+}
+
+export const harnessSessionCapabilitiesSchema = z
+  .object({
+    configuration: z
+      .object({
+        selectModel: z.boolean(),
+        selectThinkingOption: z.boolean(),
+        selectPermissionMode: z.boolean(),
+        permissionModeScope: harnessPermissionModeScopeSchema.default("live"),
+      })
+      .strict(),
+    history: harnessHistoryCapabilitiesSchema,
+    subagents: z
+      .object({
+        observe: z.boolean(),
+        readTranscript: z.boolean(),
+      })
+      .strict()
+      .optional(),
+    autonomousTurns: z
+      .object({
+        observe: z.boolean(),
+      })
+      .strict()
+      .optional(),
+    /** True only when `turn.steer` delivers input into the active Turn through a native primitive. */
+    steer: z.boolean().optional(),
+    /**
+     * True when the native plan (task list) outlives the Turn that changed it, so a reopened
+     * Thread gets its latest plan again. Otherwise a plan stays with the Turn that made it.
+     */
+    persistentPlan: z.boolean().optional(),
+  })
+  .strict();
+
+export type HarnessSessionCapabilities = z.infer<typeof harnessSessionCapabilitiesSchema>;
+
+export const harnessConfigurationStateSchema = z
+  .object({
+    effectiveModel: harnessModelRefSchema.optional(),
+    resolvedModelLabel: harnessResolvedModelLabelSchema.optional(),
+    effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
+    availableThinkingOptions: harnessThinkingOptionsSchema.optional(),
+    effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
+  })
+  .strict()
+  .superRefine((state, context) => {
+    if (
+      state.effectiveThinkingOptionId &&
+      state.availableThinkingOptions &&
+      !state.availableThinkingOptions.some(({ id }) => id === state.effectiveThinkingOptionId)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Effective Thinking option must be currently available",
+        path: ["effectiveThinkingOptionId"],
+      });
+    }
+  });
+
+export type HarnessConfigurationState = z.infer<typeof harnessConfigurationStateSchema>;
+
+export const harnessModelSelectionStateSchema = harnessConfigurationStateSchema;
+export type HarnessModelSelectionState = HarnessConfigurationState;
+
+export const harnessWebUiCapabilitySchema = z
+  .object({
+    open: z.literal(true),
+  })
+  .strict();
+
+export type HarnessWebUiCapability = z.infer<typeof harnessWebUiCapabilitySchema>;
+
+const readyHarnessInspectionSchema = z
+  .object({
+    status: z.literal("ready"),
+    catalog: harnessModelCatalogSchema,
+    permissionModes: harnessPermissionModeCatalogSchema.optional(),
+    capabilities: harnessSessionCapabilitiesSchema,
+    webUi: harnessWebUiCapabilitySchema.optional(),
+  })
+  .strict()
+  .superRefine((inspection, context) => {
+    const selectable = inspection.capabilities.configuration.selectPermissionMode;
+    if (selectable !== Boolean(inspection.permissionModes)) {
+      context.addIssue({
+        code: "custom",
+        message: "Permission Mode catalog and capability must agree",
+        path: selectable
+          ? ["permissionModes"]
+          : ["capabilities", "configuration", "selectPermissionMode"],
+      });
+    }
+  });
+
+const failedHarnessInspectionSchema = z
+  .object({
+    status: z.enum(["notInstalled", "unavailable", "error"]),
+    error: codexhostErrorSchema,
+  })
+  .strict();
+
+export const harnessInspectionSchema = z.union([
+  readyHarnessInspectionSchema,
+  failedHarnessInspectionSchema,
+]);
+
+export type HarnessInspection = z.infer<typeof harnessInspectionSchema>;
+
+export const harnessInspectParamsSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+    cwd: nonBlankTextSchema.max(16_384).optional(),
+    refresh: z.boolean().optional(),
+    /** `availability` asks only whether the Harness can run; see `InspectHarnessInput.purpose`. */
+    purpose: z.literal("availability").optional(),
+    credentialAccess: z.enum(["allow", "retry"]).optional(),
+  })
+  .strict();
+
+export type HarnessInspectParams = z.infer<typeof harnessInspectParamsSchema>;
+
+export const harnessWebUiOpenParamsSchema = z
+  .object({
+    harnessId: harnessIdSchema,
+  })
+  .strict();
+
+export type HarnessWebUiOpenParams = z.infer<typeof harnessWebUiOpenParamsSchema>;
+
+export const harnessWebUiOpenResultSchema = z.object({}).strict();
+
+export type HarnessWebUiOpenResult = z.infer<typeof harnessWebUiOpenResultSchema>;
+
+export const threadModelSelectParamsSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    model: harnessModelRefSchema,
+  })
+  .strict();
+
+export type ThreadModelSelectParams = z.infer<typeof threadModelSelectParamsSchema>;
+
+export const threadThinkingSelectParamsSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    thinkingOptionId: harnessThinkingOptionIdSchema,
+  })
+  .strict();
+
+export type ThreadThinkingSelectParams = z.infer<typeof threadThinkingSelectParamsSchema>;
+
+export const threadInspectionParamsSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    includeReferenceCapability: z.boolean().optional(),
+  })
+  .strict();
+
+export type ThreadInspectionParams = z.infer<typeof threadInspectionParamsSchema>;
+
+const codexThreadInspectionSchema = z
+  .object({
+    owner: z.literal("codex"),
+    locked: z.boolean(),
+    effectiveModel: harnessModelRefSchema.optional(),
+    resolvedModelLabel: harnessResolvedModelLabelSchema.optional(),
+    effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
+    effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
+    history: harnessHistoryCapabilitiesSchema.optional(),
+    supportsThreadReferences: z.literal(true).optional(),
+  })
+  .strict();
+
+const externalThreadInspectionSchema = z
+  .object({
+    owner: z.literal("external"),
+    harnessId: nonBlankTextSchema.max(256),
+    transportModelId: nonBlankTextSchema.max(HARNESS_TRANSPORT_MODEL_ID_MAX_LENGTH),
+    effectiveModel: harnessModelRefSchema.optional(),
+    resolvedModelLabel: harnessResolvedModelLabelSchema.optional(),
+    effectiveThinkingOptionId: harnessThinkingOptionIdSchema.optional(),
+    availableThinkingOptions: harnessThinkingOptionsSchema.optional(),
+    effectivePermissionModeId: harnessPermissionModeIdSchema.optional(),
+    /** Live Session catalog when it, not the Adapter inspection, contains `effectiveModel`. */
+    catalog: harnessModelCatalogSchema.optional(),
+    history: harnessHistoryCapabilitiesSchema,
+    usage: threadUsageSnapshotSchema.optional(),
+    locked: z.literal(true),
+  })
+  .strict();
+
+export const threadInspectionSchema = z.discriminatedUnion("owner", [
+  codexThreadInspectionSchema,
+  externalThreadInspectionSchema,
+]);
+
+export type ThreadInspection = z.infer<typeof threadInspectionSchema>;
+
+export const threadOwnershipListParamsSchema = z
+  .object({
+    threadIds: z.array(hostThreadIdSchema).min(1).max(THREAD_OWNERSHIP_LIST_MAX_LENGTH),
+  })
+  .strict()
+  .superRefine(({ threadIds }, context) => {
+    const seen = new Set<string>();
+    for (const [index, threadId] of threadIds.entries()) {
+      if (seen.has(threadId)) {
+        context.addIssue({
+          code: "custom",
+          message: "Thread ownership-list IDs must be unique",
+          path: ["threadIds", index],
+        });
+      }
+      seen.add(threadId);
+    }
+  });
+
+export type ThreadOwnershipListParams = z.infer<typeof threadOwnershipListParamsSchema>;
+
+const codexThreadOwnershipSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    owner: z.literal("codex"),
+  })
+  .strict();
+
+const externalThreadOwnershipSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    owner: z.literal("external"),
+    harnessId: z.string().max(256).pipe(harnessIdSchema),
+  })
+  .strict();
+
+export const threadOwnershipSchema = z.discriminatedUnion("owner", [
+  codexThreadOwnershipSchema,
+  externalThreadOwnershipSchema,
+]);
+
+export type ThreadOwnership = z.infer<typeof threadOwnershipSchema>;
+
+export const threadOwnershipListResultSchema = z
+  .object({
+    threads: z.array(threadOwnershipSchema).min(1).max(THREAD_OWNERSHIP_LIST_MAX_LENGTH),
+  })
+  .strict()
+  .superRefine(({ threads }, context) => {
+    const seen = new Set<string>();
+    for (const [index, thread] of threads.entries()) {
+      if (seen.has(thread.threadId)) {
+        context.addIssue({
+          code: "custom",
+          message: "Thread ownership-list results must be unique",
+          path: ["threads", index, "threadId"],
+        });
+      }
+      seen.add(thread.threadId);
+    }
+  });
+
+export type ThreadOwnershipListResult = z.infer<typeof threadOwnershipListResultSchema>;
+
+export const threadSteeringInspectParamsSchema = z
+  .object({
+    threadId: hostThreadIdSchema,
+    /** The text about to be steered; a Harness command always stops and restarts. */
+    text: z.string().optional(),
+  })
+  .strict();
+
+/**
+ * `turn/steer` parameter naming the delivery the Renderer already presented, so the Host follows
+ * it instead of deciding again: `activeTurn` inserts natively, `newTurn` stops and restarts.
+ */
+export const THREAD_STEER_DELIVERY_PARAM = "codexhostSteerDelivery";
+/** A Web steer may only be accepted while its selected Turn can still take the steer. */
+export const THREAD_STEER_STRICT_TARGET_PARAM = "codexhostSteerStrictTarget";
+/** External Thread header field advertising Host enforcement of the strict target. */
+export const THREAD_STEER_STRICT_TARGET_FIELD = "codexhostSupportsStrictSteer";
+/** Native RPC preparation retains additionalContext across its start/steer choice. */
+export const THREAD_STEERING_CONTEXT_PARAM = "codexhost_external_steering";
+export const threadSteeringContextSchema = z
+  .object({
+    kind: z.literal("application"),
+    value: z
+      .string()
+      .transform((text, context): unknown => {
+        try {
+          return JSON.parse(text);
+        } catch {
+          context.addIssue({ code: "custom", message: "Invalid steering context JSON" });
+          return z.NEVER;
+        }
+      })
+      .pipe(
+        z
+          .object({
+            expectedTurnId: hostTurnIdSchema,
+            clientUserMessageId: z.string().min(1),
+            delivery: z.enum(["newTurn", "activeTurn"]),
+          })
+          .strict(),
+      ),
+  })
+  .strict()
+  .transform((context) => context.value);
+export const threadSteerDeliverySchema = z.enum(["activeTurn", "newTurn"]);
+export type ThreadSteerDelivery = z.infer<typeof threadSteerDeliverySchema>;
+
+/**
+ * How a steer submitted now reaches the Thread: `official` keeps Codex's own steer,
+ * `activeTurn` joins the running Turn natively, `newTurn` stops it and starts the input next.
+ */
+export const threadSteeringInspectResultSchema = z
+  .object({
+    delivery: z.enum(["official", "activeTurn", "newTurn"]),
+  })
+  .strict();
+
+export type ThreadSteeringInspectResult = z.infer<typeof threadSteeringInspectResultSchema>;

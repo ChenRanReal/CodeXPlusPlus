@@ -1,0 +1,746 @@
+import type { ThreadUsageSnapshot } from "@codexhost/shared-contracts";
+import createElement from "lucide/dist/esm/createElement.mjs";
+import Activity from "lucide/dist/esm/icons/activity.mjs";
+
+import type { RendererSettingsLocale } from "./settings/localization.js";
+
+import {
+  applyRendererTriggerChipSqueezeRoot,
+  applyRendererTriggerChipSqueezeTrigger,
+  ensureRendererTriggerChipStyle,
+  rendererUsageTriggerMaxWidth,
+  TRIGGER_CHIP_CLASS,
+} from "./renderer-trigger-chip-style.js";
+
+export { rendererUsageTriggerMaxWidth } from "./renderer-trigger-chip-style.js";
+
+export interface RendererUsageControl {
+  root: HTMLDivElement;
+  trigger: HTMLButtonElement;
+  popover: HTMLDivElement;
+  anchor: HTMLElement | null;
+  label: HTMLSpanElement;
+  locale: RendererSettingsLocale;
+  onOpen: (() => void) | null;
+  dispose(): void;
+  place(anchor: HTMLElement | null): boolean;
+}
+
+interface RendererUsageMessages {
+  readonly usage: string;
+  readonly context: string;
+  readonly recordedCredits: string;
+  readonly latestCacheHit: string;
+  readonly sessionCacheHit: string;
+  readonly outputSpeed: string;
+  readonly averageOutputSpeed: string;
+  readonly apiOutputSpeed: string;
+  readonly apiOutputSpeedDescription: string;
+  readonly timeToFirstOutput: string;
+  readonly cacheRead: string;
+  readonly cacheReadWrite: string;
+  readonly cacheHitSummary: string;
+  readonly sessionGroup: string;
+  readonly turnGroup: string;
+  readonly tokensGroup: string;
+  readonly totalTokens: string;
+  readonly inputOutput: string;
+  readonly sessionCostEstimate: string;
+  readonly unpricedModels: string;
+  readonly threadUsage: string;
+  readonly threadUsageDetails: string;
+  readonly tokensSummary: string;
+  readonly tokensPerSecond: string;
+}
+
+const ENGLISH_USAGE_MESSAGES: RendererUsageMessages = Object.freeze({
+  usage: "Usage",
+  context: "Context",
+  recordedCredits: "Recorded usage",
+  latestCacheHit: "Latest cache hit (CH)",
+  sessionCacheHit: "Average cache hit",
+  outputSpeed: "Output speed (TPS)",
+  averageOutputSpeed: "Average output speed (TPS)",
+  apiOutputSpeed: "API average speed",
+  apiOutputSpeedDescription:
+    "Output tokens / native API time, including first-token wait; not generation TPS.",
+  timeToFirstOutput: "Time to first token (TTFT)",
+  cacheRead: "Cache read",
+  cacheReadWrite: "Cache read / write",
+  cacheHitSummary: "CH",
+  sessionGroup: "Session",
+  turnGroup: "Latest turn",
+  tokensGroup: "Tokens",
+  totalTokens: "Total",
+  inputOutput: "Input / output",
+  sessionCostEstimate: "Cost estimate",
+  unpricedModels: "Not priced: ",
+  threadUsage: "Thread Usage",
+  threadUsageDetails: "Thread Usage details",
+  tokensSummary: "tokens",
+  tokensPerSecond: "tok/s",
+});
+
+const CHINESE_USAGE_MESSAGES: RendererUsageMessages = Object.freeze({
+  usage: "用量",
+  context: "上下文",
+  recordedCredits: "已记录消耗",
+  latestCacheHit: "最近缓存命中（CH）",
+  sessionCacheHit: "平均缓存命中",
+  outputSpeed: "输出速度（TPS）",
+  averageOutputSpeed: "平均输出速度（TPS）",
+  apiOutputSpeed: "API 平均速度",
+  apiOutputSpeedDescription: "输出 Token ÷ 原生 API 耗时，含首字等待；不是生成 TPS。",
+  timeToFirstOutput: "首 token（TTFT）",
+  cacheRead: "缓存读取",
+  cacheReadWrite: "缓存读取 / 写入",
+  cacheHitSummary: "CH",
+  sessionGroup: "会话",
+  turnGroup: "本轮",
+  tokensGroup: "Token",
+  totalTokens: "总数",
+  inputOutput: "输入 / 输出",
+  sessionCostEstimate: "费用估算",
+  unpricedModels: "未计价：",
+  threadUsage: "对话用量",
+  threadUsageDetails: "对话用量详情",
+  tokensSummary: "Token",
+  tokensPerSecond: "tok/s",
+});
+
+export function rendererUsageMessages(locale: RendererSettingsLocale): RendererUsageMessages {
+  return locale === "zh-CN" ? CHINESE_USAGE_MESSAGES : ENGLISH_USAGE_MESSAGES;
+}
+
+function decimal(value: number, fractionDigits: number): string {
+  return value.toFixed(fractionDigits).replace(/\.?0+$/u, "");
+}
+
+export function formatRendererCacheHitRate(value: number): string {
+  return `${decimal(value, 1)}%`;
+}
+
+/** Cents from one dollar up; below that a third digit keeps small costs from reading $0.00. */
+export function formatRendererCost(value: number): string {
+  return `$${value.toFixed(Math.abs(value) >= 1 ? 2 : 3)}`;
+}
+
+/** A cost that leaves unpriced Models out is a lower bound. */
+function formatUsageCost(usage: ThreadUsageSnapshot & { totalCostUsd: number }): string {
+  const cost = formatRendererCost(usage.totalCostUsd);
+  return usage.unpricedModels?.length ? `≥${cost}` : cost;
+}
+
+export function formatRendererCredits(value: number): string {
+  return `${value > 0 && value < 0.001 ? "<0.001" : decimal(value, 3)} credits`;
+}
+
+export function formatRendererTokenRate(
+  value: number,
+  locale: RendererSettingsLocale = "en",
+): string {
+  const rate = value >= 100 ? String(Math.round(value)) : decimal(value, 1);
+  return `${rate} ${rendererUsageMessages(locale).tokensPerSecond}`;
+}
+
+export function formatRendererLatency(
+  milliseconds: number,
+  locale: RendererSettingsLocale = "en",
+): string {
+  const chinese = locale === "zh-CN";
+  return milliseconds < 1_000
+    ? `${Math.round(milliseconds)}${chinese ? " 毫秒" : "ms"}`
+    : `${decimal(milliseconds / 1_000, 1)}${chinese ? " 秒" : "s"}`;
+}
+
+export function formatRendererTokenCount(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const absolute = Math.abs(value);
+  if (absolute < 1_000) return `${sign}${Math.round(absolute)}`;
+  if (absolute < 1_000_000) return `${sign}${decimal(absolute / 1_000, 1)}K`;
+  if (absolute < 1_000_000_000) return `${sign}${decimal(absolute / 1_000_000, 1)}M`;
+  return `${sign}${decimal(absolute / 1_000_000_000, 1)}B`;
+}
+
+export function formatRendererContextSummary(usedTokens: number, windowTokens: number): string {
+  return `${decimal((usedTokens / windowTokens) * 100, 1)}% / ${formatRendererTokenCount(windowTokens)}`;
+}
+
+export function formatRendererCreditsPercent(value: number): string {
+  return `${decimal(value, 1)}%`;
+}
+
+export interface RendererUsageRingOptions {
+  size: number;
+  strokeWidth: number;
+  color: string;
+  trackColor?: string;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** A small radial progress ring (0-100), used by the credits/plan-usage pills and popovers. */
+export function createRendererUsageRing(
+  percent: number,
+  options: RendererUsageRingOptions,
+): SVGSVGElement {
+  const { size, strokeWidth, color } = options;
+  const trackColor = options.trackColor ?? "color-mix(in srgb, currentColor 18%, transparent)";
+  const radius = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const clamped = Math.min(100, Math.max(0, percent));
+  const offset = circumference * (1 - clamped / 100);
+  const center = size / 2;
+
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("width", String(size));
+  svg.setAttribute("height", String(size));
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("aria-hidden", "true");
+  svg.style.display = "block";
+  svg.style.flex = "0 0 auto";
+  svg.style.transform = "rotate(-90deg)";
+
+  const track = document.createElementNS(SVG_NS, "circle");
+  track.setAttribute("cx", String(center));
+  track.setAttribute("cy", String(center));
+  track.setAttribute("r", String(radius));
+  track.setAttribute("fill", "none");
+  track.setAttribute("stroke", trackColor);
+  track.setAttribute("stroke-width", String(strokeWidth));
+
+  const fill = document.createElementNS(SVG_NS, "circle");
+  fill.setAttribute("cx", String(center));
+  fill.setAttribute("cy", String(center));
+  fill.setAttribute("r", String(radius));
+  fill.setAttribute("fill", "none");
+  fill.setAttribute("stroke", color);
+  fill.setAttribute("stroke-width", String(strokeWidth));
+  fill.setAttribute("stroke-linecap", "round");
+  fill.setAttribute("stroke-dasharray", String(circumference));
+  fill.setAttribute("stroke-dashoffset", String(offset));
+
+  svg.append(track, fill);
+  return svg;
+}
+
+export function formatRendererPlanReset(
+  unixSeconds: number,
+  locale?: RendererSettingsLocale,
+): string {
+  const date = new Date(unixSeconds * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(locale === "zh-CN" ? "zh-CN" : undefined, {
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+export function formatRendererPlanWindow(
+  usedPercent: number,
+  resetsAtUnix?: number,
+  locale?: RendererSettingsLocale,
+): string {
+  const percent = formatRendererCreditsPercent(usedPercent);
+  if (resetsAtUnix === undefined) return percent;
+  const reset = formatRendererPlanReset(resetsAtUnix, locale);
+  return reset.length > 0 ? `${percent} · ${reset}` : percent;
+}
+
+/** Whether a snapshot contains anything useful for the left Usage popover. */
+export function rendererUsageHasDisplayData(usage: ThreadUsageSnapshot | null): boolean {
+  return (
+    usage?.cacheHitRatePercent !== undefined ||
+    usage?.sessionCacheHitRatePercent !== undefined ||
+    usage?.sessionOutputTokensPerSecond !== undefined ||
+    usage?.outputTokensPerSecond !== undefined ||
+    usage?.apiOutputTokensPerSecond !== undefined ||
+    usage?.timeToFirstOutputMs !== undefined ||
+    usage?.totalCostUsd !== undefined ||
+    usage?.totalCredits !== undefined ||
+    usage?.contextUsagePercent !== undefined ||
+    (usage?.contextUsedTokens !== undefined && usage.contextWindowTokens !== undefined) ||
+    usage?.totalTokens !== undefined ||
+    usage?.inputTokens !== undefined ||
+    usage?.cachedInputTokens !== undefined ||
+    usage?.cacheWriteInputTokens !== undefined ||
+    usage?.outputTokens !== undefined
+  );
+}
+
+/**
+ * Shared chrome for the Usage/Credits popovers: a raised card rather than a
+ * flat system-color panel. `Canvas`/`CanvasText` still anchor the palette (so
+ * this reads correctly regardless of the host page's own light/dark theme).
+ *
+ * Light and dark need different elevation recipes, not just inverted colors:
+ * a light surface reads as clean when it stays near-white and lets a soft,
+ * tight shadow carry the elevation; the same "tint the fill toward the
+ * foreground colour" trick that lifts a dark surface off a near-black page
+ * instead muddies a light one into flat grey, and the deep 45px/0.35-alpha
+ * shadow tuned for a dark host smears into a dirty halo on a light one.
+ * `light-dark()` switches on the same resolved `color-scheme` that already
+ * drives `Canvas`/`CanvasText` here, so it tracks the host page's actual
+ * theme rather than the OS preference.
+ */
+export function applyRendererPopoverChrome(popover: HTMLElement): void {
+  popover.style.border =
+    "1px solid light-dark(rgba(15, 23, 42, 0.10), color-mix(in srgb, CanvasText 16%, transparent))";
+  popover.style.borderRadius = "14px";
+  popover.style.backgroundColor = "light-dark(Canvas, color-mix(in srgb, Canvas 88%, white 12%))";
+  popover.style.color = "CanvasText";
+  popover.style.boxShadow =
+    "light-dark(0 10px 24px rgba(15, 23, 42, 0.12), 0 20px 45px rgba(0, 0, 0, 0.42)), 0 2px 8px light-dark(rgba(15, 23, 42, 0.06), rgba(0, 0, 0, 0.28))";
+}
+
+function addDetailRow(parent: HTMLElement, label: string, value: string): void {
+  const row = document.createElement("div");
+  row.style.display = "grid";
+  row.style.gridTemplateColumns = "minmax(0, 1fr) auto";
+  row.style.gap = "20px";
+  row.style.padding = "4px 0";
+  const labelElement = document.createElement("span");
+  labelElement.textContent = label;
+  labelElement.style.color = "color-mix(in srgb, currentColor 68%, transparent)";
+  const valueElement = document.createElement("span");
+  valueElement.textContent = value;
+  valueElement.style.fontVariantNumeric = "tabular-nums";
+  valueElement.style.textAlign = "right";
+  row.append(labelElement, valueElement);
+  parent.append(row);
+}
+
+function addGroupHeading(parent: HTMLElement, label: string): void {
+  const heading = document.createElement("div");
+  heading.textContent = label;
+  heading.dataset.codexhostUsageGroup = "";
+  heading.style.fontSize = "11px";
+  heading.style.fontWeight = "600";
+  heading.style.letterSpacing = "0.02em";
+  heading.style.color = "color-mix(in srgb, currentColor 52%, transparent)";
+  heading.style.margin = "10px 0 2px";
+  parent.append(heading);
+}
+
+function addContextRow(
+  parent: HTMLElement,
+  label: string,
+  percent: number | null,
+  value: string,
+): void {
+  addDetailRow(parent, label, value);
+  if (percent === null) return;
+  const track = document.createElement("div");
+  track.setAttribute("aria-hidden", "true");
+  track.style.height = "4px";
+  track.style.borderRadius = "2px";
+  track.style.margin = "2px 0 4px";
+  track.style.backgroundColor = "color-mix(in srgb, currentColor 14%, transparent)";
+  track.style.overflow = "hidden";
+  const fill = document.createElement("div");
+  fill.style.height = "100%";
+  fill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+  fill.style.borderRadius = "2px";
+  fill.style.backgroundColor =
+    percent >= 90
+      ? "light-dark(#c2410c, #fb923c)"
+      : "color-mix(in srgb, currentColor 62%, transparent)";
+  track.append(fill);
+  parent.append(track);
+}
+
+type DetailRow = readonly [label: string, value: string, note?: string | undefined];
+
+function addNote(parent: HTMLElement, text: string): void {
+  const note = document.createElement("div");
+  note.textContent = text;
+  note.style.fontSize = "11px";
+  note.style.color = "color-mix(in srgb, currentColor 52%, transparent)";
+  note.style.textAlign = "right";
+  note.style.overflowWrap = "anywhere";
+  note.style.marginTop = "-2px";
+  parent.append(note);
+}
+
+function addGroup(parent: HTMLElement, label: string, rows: readonly DetailRow[]): void {
+  if (rows.length === 0) return;
+  addGroupHeading(parent, label);
+  for (const [rowLabel, value, note] of rows) {
+    addDetailRow(parent, rowLabel, value);
+    if (note) addNote(parent, note);
+  }
+}
+
+function renderDetails(
+  popover: HTMLDivElement,
+  usage: ThreadUsageSnapshot | null,
+  messages: RendererUsageMessages,
+  locale: RendererSettingsLocale,
+): void {
+  popover.replaceChildren();
+  const heading = document.createElement("div");
+  heading.textContent = messages.usage;
+  heading.style.fontWeight = "600";
+  heading.style.marginBottom = "6px";
+  popover.append(heading);
+
+  if (usage?.contextUsagePercent !== undefined) {
+    addContextRow(
+      popover,
+      messages.context,
+      usage.contextUsagePercent,
+      `${decimal(usage.contextUsagePercent, 1)}%`,
+    );
+  } else if (usage?.contextUsedTokens !== undefined && usage.contextWindowTokens !== undefined) {
+    const contextPercent =
+      usage.contextWindowTokens > 0
+        ? (usage.contextUsedTokens / usage.contextWindowTokens) * 100
+        : null;
+    addContextRow(
+      popover,
+      messages.context,
+      contextPercent,
+      contextPercent === null
+        ? `/${formatRendererTokenCount(usage.contextWindowTokens)}`
+        : `${decimal(contextPercent, 1)}% / ${formatRendererTokenCount(usage.contextWindowTokens)}`,
+    );
+  }
+
+  const session: DetailRow[] = [];
+  if (usage?.totalCostUsd !== undefined) {
+    const unpriced = usage.unpricedModels?.length
+      ? `${messages.unpricedModels}${usage.unpricedModels.join(", ")}`
+      : undefined;
+    session.push([
+      messages.sessionCostEstimate,
+      formatUsageCost({ ...usage, totalCostUsd: usage.totalCostUsd }),
+      unpriced,
+    ]);
+  }
+  if (usage?.totalCredits !== undefined) {
+    session.push([messages.recordedCredits, formatRendererCredits(usage.totalCredits)]);
+  }
+  if (usage?.sessionCacheHitRatePercent !== undefined) {
+    session.push([
+      messages.sessionCacheHit,
+      formatRendererCacheHitRate(usage.sessionCacheHitRatePercent),
+    ]);
+  }
+  if (usage?.sessionOutputTokensPerSecond !== undefined) {
+    session.push([
+      messages.averageOutputSpeed,
+      formatRendererTokenRate(usage.sessionOutputTokensPerSecond, locale),
+    ]);
+  }
+  if (usage?.cacheHitRatePercent !== undefined) {
+    session.push([messages.latestCacheHit, formatRendererCacheHitRate(usage.cacheHitRatePercent)]);
+  }
+  addGroup(popover, messages.sessionGroup, session);
+
+  const turn: DetailRow[] = [];
+  if (usage?.outputTokensPerSecond !== undefined) {
+    turn.push([messages.outputSpeed, formatRendererTokenRate(usage.outputTokensPerSecond, locale)]);
+  }
+  if (usage?.apiOutputTokensPerSecond !== undefined) {
+    turn.push([
+      messages.apiOutputSpeed,
+      formatRendererTokenRate(usage.apiOutputTokensPerSecond, locale),
+      messages.apiOutputSpeedDescription,
+    ]);
+  }
+  if (usage?.timeToFirstOutputMs !== undefined) {
+    turn.push([
+      messages.timeToFirstOutput,
+      formatRendererLatency(usage.timeToFirstOutputMs, locale),
+    ]);
+  }
+  addGroup(popover, messages.turnGroup, turn);
+
+  const tokens: DetailRow[] = [];
+  const count = (value: number | undefined) =>
+    value === undefined ? "-" : formatRendererTokenCount(value);
+  if (usage?.inputTokens !== undefined || usage?.outputTokens !== undefined) {
+    tokens.push([
+      messages.inputOutput,
+      `${count(usage.inputTokens)} / ${count(usage.outputTokens)}`,
+    ]);
+  }
+  // Cache writes appear only when a Harness reports some; many never do.
+  if (usage?.cacheWriteInputTokens !== undefined && usage.cacheWriteInputTokens > 0) {
+    tokens.push([
+      messages.cacheReadWrite,
+      `${count(usage.cachedInputTokens)} / ${count(usage.cacheWriteInputTokens)}`,
+    ]);
+  } else if (usage?.cachedInputTokens !== undefined) {
+    tokens.push([messages.cacheRead, count(usage.cachedInputTokens)]);
+  }
+  if (usage?.totalTokens !== undefined) {
+    tokens.push([messages.totalTokens, formatRendererTokenCount(usage.totalTokens)]);
+  }
+  addGroup(popover, messages.tokensGroup, tokens);
+}
+
+function popoverIsOpen(popover: HTMLDivElement): boolean {
+  try {
+    return popover.matches(":popover-open");
+  } catch {
+    return !popover.hidden;
+  }
+}
+
+function positionPopover(control: Pick<RendererUsageControl, "trigger" | "popover">): void {
+  const triggerRect = control.trigger.getBoundingClientRect();
+  const width = Math.min(320, Math.max(260, window.innerWidth - 24));
+  const left = Math.max(12, Math.min(triggerRect.left, window.innerWidth - width - 12));
+  control.popover.style.width = `${width}px`;
+  control.popover.style.left = `${left}px`;
+  control.popover.style.right = "auto";
+  control.popover.style.top = "auto";
+  control.popover.style.bottom = `${Math.max(12, window.innerHeight - triggerRect.top + 8)}px`;
+}
+
+function closePopover(control: Pick<RendererUsageControl, "trigger" | "popover">): void {
+  if (popoverIsOpen(control.popover) && typeof control.popover.hidePopover === "function") {
+    control.popover.hidePopover();
+  }
+  control.popover.hidden = true;
+  control.trigger.setAttribute("aria-expanded", "false");
+}
+
+function openPopover(control: Pick<RendererUsageControl, "trigger" | "popover" | "onOpen">): void {
+  const wasOpen = control.trigger.getAttribute("aria-expanded") === "true";
+  positionPopover(control);
+  control.popover.hidden = false;
+  if (typeof control.popover.showPopover === "function" && !popoverIsOpen(control.popover)) {
+    control.popover.showPopover();
+  }
+  control.trigger.setAttribute("aria-expanded", "true");
+  if (!wasOpen) control.onOpen?.();
+}
+
+function togglePopover(
+  control: Pick<RendererUsageControl, "trigger" | "popover" | "onOpen">,
+): void {
+  if (control.trigger.getAttribute("aria-expanded") === "true") closePopover(control);
+  else openPopover(control);
+}
+
+export function mountRendererUsageControl(
+  composerId: string,
+  locale: RendererSettingsLocale = "en",
+): RendererUsageControl {
+  ensureRendererTriggerChipStyle(document);
+  const messages = rendererUsageMessages(locale);
+
+  const root = document.createElement("div");
+  root.dataset.codexhostUsageControl = composerId;
+  root.className = "relative min-w-0";
+  root.style.display = "none";
+  root.style.alignItems = "center";
+  root.style.alignSelf = "center";
+  root.style.height = "28px";
+  root.style.verticalAlign = "middle";
+  applyRendererTriggerChipSqueezeRoot(root, rendererUsageTriggerMaxWidth(), "40px");
+
+  const trigger = document.createElement("button");
+  trigger.className = TRIGGER_CHIP_CLASS;
+  trigger.type = "button";
+  trigger.setAttribute("aria-haspopup", "dialog");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-label", messages.threadUsage);
+  trigger.title = messages.threadUsage;
+  // Usage is secondary metadata, not a primary composer action. Keep the
+  // compact, muted treatment used by the previous Composer integration while
+  // avoiding Codex's private trigger class names.
+  trigger.style.color = "var(--color-text-tertiary, #8f8f8f)";
+  trigger.style.gap = "4px";
+  applyRendererTriggerChipSqueezeTrigger(trigger);
+  // Match the 28px height shared by the Model/Permission-mode/Agent triggers
+  // it sits next to — a shorter box here previously threw off the row's
+  // vertical alignment (visible as Usage sitting a few px lower than its
+  // neighbors), whether the host lays this row out as flex or inline content.
+  trigger.style.height = "28px";
+  trigger.style.padding = "0 8px";
+  trigger.style.verticalAlign = "middle";
+  trigger.style.fontSize = "12px";
+  trigger.style.lineHeight = "16px";
+  trigger.style.fontVariantNumeric = "tabular-nums";
+  trigger.style.letterSpacing = "0";
+
+  const icon = document.createElement("span");
+  icon.dataset.codexhostUsageIcon = "";
+  icon.style.display = "none";
+  icon.style.alignItems = "center";
+  icon.append(createElement(Activity, { width: 16, height: 16, "aria-hidden": "true" }));
+
+  const label = document.createElement("span");
+  label.dataset.codexhostUsageLabel = "";
+  label.style.display = "inline-block";
+  label.style.maxWidth = "100%";
+  label.style.overflow = "hidden";
+  label.style.textOverflow = "ellipsis";
+  label.style.whiteSpace = "nowrap";
+  trigger.append(icon, label);
+
+  const popover = document.createElement("div");
+  popover.id = `${composerId}-usage-popover`;
+  popover.setAttribute("role", "dialog");
+  popover.setAttribute("aria-label", messages.threadUsageDetails);
+  popover.setAttribute("popover", "auto");
+  popover.hidden = typeof popover.showPopover !== "function";
+  popover.style.position = "fixed";
+  popover.style.boxSizing = "border-box";
+  popover.style.margin = "0";
+  popover.style.inset = "auto";
+  popover.style.width = "260px";
+  popover.style.maxWidth = "min(320px, calc(100vw - 24px))";
+  popover.style.padding = "10px 12px";
+  applyRendererPopoverChrome(popover);
+  popover.style.font = "13px/1.35 system-ui, sans-serif";
+  popover.style.letterSpacing = "0";
+  popover.style.zIndex = "2147483647";
+  trigger.setAttribute("aria-controls", popover.id);
+
+  let placementReference: Element | null = null;
+  const control: RendererUsageControl = {
+    root,
+    trigger,
+    popover,
+    anchor: null,
+    label,
+    locale,
+    onOpen: null,
+    dispose() {
+      closePopover(control);
+      if (closeTimer !== null) window.clearTimeout(closeTimer);
+      root.remove();
+      popover.remove();
+      placementReference = null;
+    },
+    place(anchor) {
+      if (!anchor?.parentElement) return false;
+      const container = anchor.parentElement;
+      if (
+        control.anchor === anchor &&
+        placementReference === anchor &&
+        root.parentElement === container &&
+        root.nextElementSibling === anchor
+      ) {
+        return true;
+      }
+      control.anchor = anchor;
+      placementReference = anchor;
+      container.insertBefore(root, anchor);
+      return true;
+    },
+  };
+
+  let closeTimer: number | null = null;
+  const cancelClose = (): void => {
+    if (closeTimer === null) return;
+    window.clearTimeout(closeTimer);
+    closeTimer = null;
+  };
+  const scheduleClose = (): void => {
+    cancelClose();
+    closeTimer = window.setTimeout(() => {
+      closeTimer = null;
+      if (!trigger.matches(":hover") && !popover.matches(":hover")) closePopover(control);
+    }, 140);
+  };
+
+  trigger.addEventListener("click", () => togglePopover(control));
+  trigger.addEventListener("pointerenter", () => {
+    cancelClose();
+    openPopover(control);
+  });
+  trigger.addEventListener("pointerleave", scheduleClose);
+  trigger.addEventListener("focus", () => {
+    cancelClose();
+    openPopover(control);
+  });
+  trigger.addEventListener("blur", scheduleClose);
+  popover.addEventListener("pointerenter", cancelClose);
+  popover.addEventListener("pointerleave", scheduleClose);
+  popover.addEventListener("toggle", () => {
+    const open = popoverIsOpen(popover);
+    trigger.setAttribute("aria-expanded", String(open));
+  });
+  root.append(trigger);
+  document.body.append(popover);
+
+  return control;
+}
+
+export function renderRendererUsageControl(
+  control: RendererUsageControl,
+  usage: ThreadUsageSnapshot | null,
+  locale: RendererSettingsLocale = control.locale,
+): boolean {
+  control.locale = locale;
+  const messages = rendererUsageMessages(locale);
+  control.popover.setAttribute("aria-label", messages.threadUsageDetails);
+  const cacheHitRatePercent = usage?.cacheHitRatePercent;
+  const outputTokensPerSecond = usage?.outputTokensPerSecond;
+  const totalCostUsd = usage?.totalCostUsd;
+  const hasContext =
+    usage?.contextUsedTokens !== undefined && usage.contextWindowTokens !== undefined;
+  const hasTokenUsage =
+    usage?.totalTokens !== undefined ||
+    usage?.inputTokens !== undefined ||
+    usage?.cachedInputTokens !== undefined ||
+    usage?.cacheWriteInputTokens !== undefined ||
+    usage?.outputTokens !== undefined;
+  const visible = rendererUsageHasDisplayData(usage);
+  control.root.style.display = visible ? "inline-flex" : "none";
+  if (!visible) {
+    closePopover(control);
+    return false;
+  }
+
+  const summary = [
+    usage?.totalCredits !== undefined ? formatRendererCredits(usage.totalCredits) : null,
+    cacheHitRatePercent !== undefined
+      ? `${messages.cacheHitSummary} ${formatRendererCacheHitRate(cacheHitRatePercent)}`
+      : null,
+    outputTokensPerSecond !== undefined
+      ? formatRendererTokenRate(outputTokensPerSecond, locale)
+      : usage?.apiOutputTokensPerSecond !== undefined
+        ? `API ${formatRendererTokenRate(usage.apiOutputTokensPerSecond, locale)}`
+        : null,
+    usage && totalCostUsd !== undefined ? formatUsageCost({ ...usage, totalCostUsd }) : null,
+  ].filter((value): value is string => value !== null);
+  const contextPercent = usage?.contextUsagePercent;
+  if (contextPercent !== undefined && summary.length === 0) summary.push(messages.usage);
+  if (
+    summary.length === 0 &&
+    hasContext &&
+    usage?.contextWindowTokens !== undefined &&
+    usage.contextWindowTokens > 0
+  ) {
+    summary.push(
+      formatRendererContextSummary(usage.contextUsedTokens ?? 0, usage.contextWindowTokens),
+    );
+  }
+  if (summary.length === 0 && usage?.totalTokens !== undefined) {
+    summary.push(`${formatRendererTokenCount(usage.totalTokens)} ${messages.tokensSummary}`);
+  }
+  if (summary.length === 0 && hasTokenUsage) {
+    summary.push(
+      `${formatRendererTokenCount((usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0))} ${messages.tokensSummary}`,
+    );
+  }
+  const compactSummary = summary.join(" · ") || messages.usage;
+  const accessibleSummary = `${messages.threadUsage}: ${compactSummary}${
+    contextPercent !== undefined ? `; ${messages.context} ${decimal(contextPercent, 1)}%` : ""
+  }`;
+  applyRendererTriggerChipSqueezeRoot(control.root, rendererUsageTriggerMaxWidth(), "40px");
+  applyRendererTriggerChipSqueezeTrigger(control.trigger);
+  control.trigger.setAttribute("aria-label", accessibleSummary);
+  control.trigger.title = accessibleSummary;
+  control.label.textContent = compactSummary;
+  renderDetails(control.popover, usage, messages, locale);
+  return true;
+}

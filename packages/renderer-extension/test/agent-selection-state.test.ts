@@ -1,0 +1,851 @@
+import {
+  harnessModelRefSchema,
+  harnessPermissionModeIdSchema,
+  harnessThinkingOptionIdSchema,
+} from "@codexhost/shared-contracts";
+import { describe, expect, it, vi } from "vitest";
+
+import { DraftAgentController } from "../src/index.js";
+import { scopedComposerTarget } from "../src/renderer-binding-probe.js";
+
+function controller(): DraftAgentController<object> {
+  return new DraftAgentController<object>({
+    idFactory: (sequence) => `composer-${sequence}`,
+    enabledAgents: [
+      "codex",
+      "pi",
+      "claude-code",
+      "grok",
+      "opencode",
+      "antigravity",
+      "qoder",
+      "kimi-code",
+    ],
+  });
+}
+
+describe("Renderer draft Agent controller", () => {
+  it("discovers unknown IDs and keeps persisted ownership after removal", async () => {
+    const agents = new DraftAgentController();
+    const composer = {};
+    const operations = { applyAgent: vi.fn(() => true), clearPrewarm: vi.fn(async () => {}) };
+    agents.mount(composer, ["default"], "third-party");
+    expect(agents.get(composer).agent).toBe("third-party");
+    expect(await agents.switchAgent(composer, "another-plugin", operations)).toBe(false);
+    agents.setEnabledAgents(["another-plugin"]);
+    expect(await agents.switchAgent(composer, "another-plugin", operations)).toBe(true);
+    const model = harnessModelRefSchema.parse({ id: "native-model" });
+    agents.setExternalModel(composer, "another-plugin", model);
+    agents.clearConfiguration(composer);
+    expect(agents.modelForAgent(composer, "another-plugin")).toBeUndefined();
+    agents.restore(composer, "another-plugin", model);
+    agents.setEnabledAgents([]);
+    expect(agents.get(composer)).toMatchObject({ agent: "another-plugin", phase: "locked" });
+    expect(agents.modelForAgent(composer, "another-plugin")).toEqual(model);
+  });
+  it("preserves pending submission when detaching a successfully transferred draft", () => {
+    const agents = controller();
+    const original = {};
+    const replacement = {};
+    agents.mount(original, ["default"], "pi");
+    agents.markSubmissionPending(original);
+    const identity = agents.get(original).composerId;
+    expect(agents.transfer(original, replacement, ["default"])).toBe(true);
+    agents.detach(original, true);
+    expect(agents.isSubmissionPending(replacement)).toBe(true);
+    expect(agents.transfer(replacement, replacement, ["conversation", "pi-thread"])).toBe(true);
+    expect(agents.get(replacement)).toMatchObject({
+      composerId: identity,
+      agent: "pi",
+      phase: "locked",
+    });
+    expect(agents.isSubmissionPending(replacement)).toBe(false);
+    expect(agents.mount(original, ["default"], "codex").composerId).not.toBe(identity);
+  });
+  it.each([false, true])(
+    "detaches reused roots without leaking external state (locked=%s)",
+    (locked) => {
+      const agents = controller();
+      const root = {};
+      const target = locked ? ["conversation", "pi-thread"] : ["default", "client-new-thread:old"];
+      agents.mount(root, target, "pi");
+      const model = harnessModelRefSchema.parse({ id: "old-pi-model" });
+      if (locked) agents.restore(root, "pi", model);
+      else agents.setExternalModel(root, "pi", model);
+      agents.markSubmissionPending(root);
+      const old = agents.get(root);
+      const request = agents.beginModelRequest(root);
+      const ownership = agents.beginOwnershipRequest(root);
+      agents.detach(root);
+      const fresh = agents.mount(root, ["default", "client-new-thread:new"], "codex");
+      expect(fresh).toMatchObject({ agent: "codex", phase: "draft" });
+      expect(fresh.composerId).not.toBe(old.composerId);
+      expect(agents.modelForAgent(root, "pi")).toBeUndefined();
+      expect(agents.isSubmissionPending(root)).toBe(false);
+      expect(agents.isCurrentModelRequest(root, request)).toBe(false);
+      expect(agents.isCurrentOwnershipRequest(root, ownership)).toBe(false);
+      const revisit = {};
+      expect(agents.mount(revisit, target)).toMatchObject({
+        agent: "pi",
+        phase: locked ? "locked" : "draft",
+      });
+      expect(agents.modelForAgent(revisit, "pi")).toEqual(model);
+      expect(agents.isSubmissionPending(revisit)).toBe(false);
+    },
+  );
+  it("keeps Codex locked across Composer replacement", () => {
+    const agents = controller();
+    const draft = {};
+    const replacement = {};
+    agents.mount(draft, ["default"]);
+    agents.markSubmissionPending(draft);
+    agents.recordSubmission(draft);
+    expect(agents.transfer(draft, replacement, ["conversation", "thread-b"])).toBe(true);
+    expect(agents.get(replacement)).toMatchObject({ phase: "locked", agent: "codex" });
+    agents.recordSubmission(replacement);
+    agents.clearPendingSubmission(replacement);
+    expect(agents.get(replacement)).toMatchObject({ phase: "locked", agent: "codex" });
+    expect(agents.mount({}, ["default"])).toMatchObject({ phase: "draft", agent: "codex" });
+    const reopened = {};
+    agents.restore(reopened, "codex");
+    expect(agents.get(reopened)).toMatchObject({ phase: "locked", agent: "codex" });
+  });
+
+  it("clears pending submission without changing the selected Agent", () => {
+    const agents = controller();
+    const draft = {};
+    agents.mount(draft, ["default"]);
+    agents.markSubmissionPending(draft);
+    agents.recordSubmission(draft);
+    agents.clearPendingSubmission(draft);
+    expect(agents.isSubmissionPending(draft)).toBe(false);
+    expect(agents.get(draft)).toMatchObject({ agent: "codex" });
+    agents.recordSubmission(draft);
+    expect(agents.get(draft)).toMatchObject({ agent: "codex" });
+  });
+
+  it("isolates Agent selection by Composer", async () => {
+    const firstComposer = {};
+    const secondComposer = {};
+    const agents = controller();
+
+    await agents.switchAgent(firstComposer, "pi", {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    });
+
+    expect(agents.get(firstComposer)).toEqual({
+      composerId: "composer-1",
+      agent: "pi",
+      phase: "draft",
+    });
+    expect(agents.get(secondComposer)).toEqual({
+      composerId: "composer-2",
+      agent: "codex",
+      phase: "draft",
+    });
+  });
+
+  it("uses only the Agent of the most recent new-Thread submission for new default Composers", async () => {
+    const submittedPi = {};
+    const unsubmittedDraft = {};
+    const openedCodex = {};
+    const afterPassiveWork = {};
+    const afterFollowUp = {};
+    const afterCodexSubmission = {};
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({ id: "pi-model-v1.submitted" });
+    const operations = {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    };
+
+    agents.mount(submittedPi, ["default"]);
+    await agents.switchAgent(submittedPi, "pi", operations);
+    agents.setExternalModel(submittedPi, "pi", model);
+    agents.markSubmissionPending(submittedPi);
+    agents.recordSubmission(submittedPi);
+    agents.lock(submittedPi);
+
+    agents.mount(unsubmittedDraft, ["default"]);
+    expect(agents.get(unsubmittedDraft)).toEqual({
+      composerId: "composer-2",
+      agent: "pi",
+      phase: "draft",
+    });
+    await agents.switchAgent(unsubmittedDraft, "codex", operations);
+
+    agents.mount(openedCodex, ["conversation", "official-thread"]);
+    expect(agents.get(openedCodex)).toMatchObject({ agent: "codex", phase: "draft" });
+    agents.restore(openedCodex, "codex");
+
+    agents.mount(afterPassiveWork, ["default"]);
+    expect(agents.get(afterPassiveWork)).toEqual({
+      composerId: "composer-4",
+      agent: "pi",
+      phase: "draft",
+    });
+    expect(agents.modelForAgent(afterPassiveWork, "pi")).toBeUndefined();
+
+    agents.recordSubmission(openedCodex);
+    agents.mount(afterFollowUp, ["default"]);
+    expect(agents.get(afterFollowUp)).toMatchObject({ agent: "pi", phase: "draft" });
+
+    await agents.switchAgent(afterFollowUp, "codex", operations);
+    agents.markSubmissionPending(afterFollowUp);
+    agents.recordSubmission(afterFollowUp);
+    agents.mount(afterCodexSubmission, ["default"]);
+    expect(agents.get(afterCodexSubmission)).toMatchObject({
+      agent: "codex",
+      phase: "draft",
+    });
+  });
+
+  it("uses an enabled production launch default before any submission", () => {
+    const composer = {};
+    const agents = new DraftAgentController<object>({
+      idFactory: (sequence) => `composer-${sequence}`,
+      defaultAgent: "pi",
+    });
+
+    agents.mount(composer, ["default"]);
+    expect(agents.get(composer)).toEqual({
+      composerId: "composer-1",
+      agent: "pi",
+      phase: "draft",
+    });
+    // Defaults may precede asynchronous plugin discovery; switching still requires discovery.
+    expect(
+      new DraftAgentController({ defaultAgent: "unknown-plugin" }).mount({}, ["default"]).agent,
+    ).toBe("unknown-plugin");
+  });
+
+  it("enables Claude Code from the supplied plugin directory", async () => {
+    const composer = {};
+    const agents = controller();
+    const applyAgent = vi.fn(() => true);
+
+    await expect(
+      agents.switchAgent(composer, "claude-code", {
+        applyAgent,
+        clearPrewarm: vi.fn(async () => undefined),
+      }),
+    ).resolves.toBe(true);
+    expect(applyAgent).toHaveBeenCalledWith("claude-code");
+    expect(agents.get(composer).agent).toBe("claude-code");
+  });
+
+  it("keeps OpenCode Model and Thinking selection scoped to its draft", async () => {
+    const composer = {};
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({
+      id: "opencode-model-v1.WyJwcm92aWRlci0xIiwibW9kZWwtMSJd",
+    });
+    const thinkingOptionId = harnessThinkingOptionIdSchema.parse("ocv.aGlnaA");
+
+    await agents.switchAgent(composer, "opencode", {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    });
+    agents.setExternalModel(composer, "opencode", model);
+    agents.setExternalThinkingOption(composer, "opencode", thinkingOptionId);
+
+    expect(agents.get(composer)).toMatchObject({
+      agent: "opencode",
+      configurationByAgent: { opencode: { model, thinkingOptionId } },
+    });
+    expect(agents.modelForAgent(composer, "opencode")).toEqual(model);
+    expect(agents.thinkingOptionForAgent(composer, "opencode")).toBe(thinkingOptionId);
+  });
+
+  it("uses the same draft lifecycle for explicitly enabled Claude Code", async () => {
+    const composer = {};
+    const agents = new DraftAgentController<object>({
+      idFactory: (sequence) => `composer-${sequence}`,
+      enabledAgents: ["codex", "pi", "claude-code"],
+    });
+    const operations = {
+      applyAgent: vi.fn(() => true),
+      clearPrewarm: vi.fn(async () => undefined),
+    };
+
+    await expect(agents.switchAgent(composer, "pi", operations)).resolves.toBe(true);
+    await expect(agents.switchAgent(composer, "claude-code", operations)).resolves.toBe(true);
+    await expect(agents.switchAgent(composer, "codex", operations)).resolves.toBe(true);
+
+    expect(operations.applyAgent).toHaveBeenNthCalledWith(1, "pi");
+    expect(operations.applyAgent).toHaveBeenNthCalledWith(2, "claude-code");
+    expect(operations.applyAgent).toHaveBeenNthCalledWith(3, "codex");
+    expect(agents.get(composer)).toMatchObject({ agent: "codex", phase: "draft" });
+  });
+
+  it("keeps the draft mutable until submission locks the final Agent", async () => {
+    const composer = {};
+    const agents = controller();
+    const operations = {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    };
+
+    await agents.switchAgent(composer, "pi", operations);
+    await agents.switchAgent(composer, "codex", operations);
+    await agents.switchAgent(composer, "pi", operations);
+    expect(agents.get(composer)).toMatchObject({ agent: "pi", phase: "draft" });
+
+    agents.lock(composer);
+    await expect(agents.switchAgent(composer, "codex", operations)).resolves.toBe(false);
+    expect(agents.get(composer)).toEqual({
+      composerId: "composer-1",
+      agent: "pi",
+      phase: "locked",
+    });
+  });
+
+  it("keeps a locally rejected submission mutable and locks only after a Thread binds", async () => {
+    const rejectedComposer = {};
+    const acceptedComposer = {};
+    const agents = controller();
+    const operations = {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    };
+
+    await agents.switchAgent(rejectedComposer, "grok", operations);
+    agents.markSubmissionPending(rejectedComposer);
+    expect(agents.isSubmissionPending(rejectedComposer)).toBe(true);
+    expect(agents.get(rejectedComposer).phase).toBe("draft");
+
+    agents.clearPendingSubmission(rejectedComposer);
+    expect(agents.isSubmissionPending(rejectedComposer)).toBe(false);
+    await expect(agents.switchAgent(rejectedComposer, "codex", operations)).resolves.toBe(true);
+
+    await agents.switchAgent(acceptedComposer, "grok", operations);
+    agents.markSubmissionPending(acceptedComposer);
+    expect(
+      agents.transfer(acceptedComposer, acceptedComposer, ["conversation", "grok-thread"]),
+    ).toBe(true);
+    expect(agents.isSubmissionPending(acceptedComposer)).toBe(false);
+    expect(agents.get(acceptedComposer)).toMatchObject({ agent: "grok", phase: "locked" });
+  });
+
+  it("transfers identity, selection, and switching state to one replacement Composer", async () => {
+    const originalComposer = {};
+    const replacementComposer = {};
+    const existingComposer = {};
+    const agents = controller();
+    let releaseClear: (() => void) | undefined;
+    const switching = agents.switchAgent(originalComposer, "pi", {
+      applyAgent: () => true,
+      clearPrewarm: () =>
+        new Promise<void>((resolve) => {
+          releaseClear = resolve;
+        }),
+    });
+    agents.get(existingComposer);
+
+    expect(agents.transfer(originalComposer, replacementComposer)).toBe(true);
+    expect(agents.isSwitching(replacementComposer)).toBe(true);
+    expect(agents.transfer(originalComposer, existingComposer)).toBe(false);
+    releaseClear?.();
+    await switching;
+
+    expect(agents.get(replacementComposer)).toEqual({
+      composerId: "composer-1",
+      agent: "pi",
+      phase: "draft",
+    });
+    expect(agents.get(existingComposer)).toEqual({
+      composerId: "composer-2",
+      agent: "codex",
+      phase: "draft",
+    });
+  });
+
+  it("restores a submitted Agent when its conversation target is revisited", async () => {
+    const draftComposer = {};
+    const firstConversation = {};
+    const secondConversation = {};
+    const revisitedConversation = {};
+    const firstTargetMember = {};
+    const secondTargetMember = {};
+    const draftTarget = ["default"];
+    const firstTarget = ["conversation", firstTargetMember];
+    const equivalentFirstTarget = ["conversation", firstTargetMember];
+    const secondTarget = ["conversation", secondTargetMember];
+    const agents = controller();
+
+    agents.mount(draftComposer, draftTarget);
+    await agents.switchAgent(draftComposer, "pi", {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    });
+    agents.lock(draftComposer);
+    expect(agents.transfer(draftComposer, firstConversation, firstTarget)).toBe(true);
+
+    agents.mount(secondConversation, secondTarget);
+    expect(agents.get(secondConversation)).toMatchObject({ agent: "codex", phase: "draft" });
+    agents.mount(revisitedConversation, equivalentFirstTarget);
+
+    expect(agents.get(revisitedConversation)).toEqual({
+      composerId: "composer-1",
+      agent: "pi",
+      phase: "locked",
+    });
+  });
+
+  it("binds an in-place first conversation target to the existing logical Composer", async () => {
+    const composer = {};
+    const revisit = {};
+    const defaultTarget = ["default"];
+    const conversationTarget = ["conversation", "late-fork-thread"];
+    const agents = controller();
+
+    agents.mount(composer, defaultTarget);
+    await agents.switchAgent(composer, "pi", {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    });
+    agents.lock(composer);
+    const original = agents.get(composer);
+
+    expect(agents.transfer(composer, composer, conversationTarget)).toBe(true);
+    agents.mount(revisit, ["conversation", "late-fork-thread"]);
+
+    expect(agents.get(revisit)).toEqual(original);
+  });
+
+  it("does not reuse a Thread Agent state across Hosts", () => {
+    const composer = {};
+    const target = ["conversation", "same-thread"] as const;
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({ id: "pi-model-v1.remote" });
+    const localTarget = scopedComposerTarget(target, "local");
+    const remoteTarget = scopedComposerTarget(target, "remote-ssh:company");
+
+    agents.mount(composer, localTarget);
+    agents.restore(composer, "pi", model);
+    expect(agents.get(composer)).toMatchObject({
+      agent: "pi",
+      configurationByAgent: { pi: { model } },
+    });
+
+    expect(agents.rebindConversation(composer, remoteTarget)).toMatchObject({
+      agent: "codex",
+      phase: "draft",
+    });
+    expect(agents.modelForAgent(composer, "pi")).toBeUndefined();
+
+    expect(agents.rebindConversation(composer, localTarget)).toMatchObject({
+      agent: "pi",
+      phase: "locked",
+      configurationByAgent: { pi: { model } },
+    });
+  });
+
+  it("rebinds a reused Composer without carrying another conversation's Pi state", () => {
+    const composer = {};
+    const piTarget = ["conversation", "pi-thread"];
+    const codexTarget = ["conversation", "codex-thread"];
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({ id: "openai~gpt-5.6-sol" });
+    const thinkingOptionId = harnessThinkingOptionIdSchema.parse("high");
+
+    agents.mount(composer, piTarget);
+    agents.restore(composer, "pi", model, thinkingOptionId);
+    const staleModelRequest = agents.beginModelRequest(composer);
+    const staleOwnershipRequest = agents.beginOwnershipRequest(composer);
+
+    expect(agents.rebindConversation(composer, codexTarget)).toMatchObject({
+      agent: "codex",
+      phase: "draft",
+    });
+    expect(agents.modelForAgent(composer, "pi")).toBeUndefined();
+    expect(agents.thinkingOptionForAgent(composer, "pi")).toBeUndefined();
+    expect(agents.isCurrentModelRequest(composer, staleModelRequest)).toBe(false);
+    expect(agents.isCurrentOwnershipRequest(composer, staleOwnershipRequest)).toBe(false);
+
+    expect(agents.restore(composer, "codex")).toMatchObject({
+      agent: "codex",
+      phase: "locked",
+    });
+  });
+
+  it("restores a newly mounted Fork owner and ignores stale ownership generations", () => {
+    const forkComposer = {};
+    const replacement = {};
+    const target = ["conversation", "fork-thread"];
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({ id: "pi-model-v1.fork" });
+    const thinkingOptionId = harnessThinkingOptionIdSchema.parse("high");
+    const staleClaudePermissionMode = harnessPermissionModeIdSchema.parse("acceptEdits");
+
+    agents.mount(forkComposer, target);
+    agents.setExternalPermissionMode(forkComposer, "claude-code", staleClaudePermissionMode);
+    const stale = agents.beginOwnershipRequest(forkComposer);
+    const current = agents.beginOwnershipRequest(forkComposer);
+    expect(agents.isCurrentOwnershipRequest(forkComposer, stale)).toBe(false);
+    expect(agents.isCurrentOwnershipRequest(forkComposer, current)).toBe(true);
+    expect(agents.restore(forkComposer, "pi", model, thinkingOptionId)).toMatchObject({
+      agent: "pi",
+      phase: "locked",
+      configurationByAgent: { pi: { model, thinkingOptionId } },
+    });
+
+    agents.mount(replacement, ["conversation", "fork-thread"]);
+    expect(agents.get(replacement)).toMatchObject({
+      agent: "pi",
+      phase: "locked",
+      configurationByAgent: { pi: { model, thinkingOptionId } },
+    });
+    expect(agents.restore(replacement, "claude-code")).toMatchObject({
+      agent: "claude-code",
+      phase: "locked",
+    });
+    expect(agents.permissionModeForAgent(replacement, "claude-code")).toBeUndefined();
+  });
+
+  it("restores an identified draft across unpaired remounts without inheriting it in new drafts", () => {
+    const agents = controller();
+    const original = {};
+    const replacement = {};
+    const model = harnessModelRefSchema.parse({ id: "pi-model-v1.fast" });
+    const target = ["default", "client-new-thread:first"];
+    agents.mount(original, target, "pi");
+    agents.setExternalModel(original, "pi", model);
+    agents.markSubmissionPending(original);
+    agents.mount(replacement, [...target], "codex");
+    expect(agents.get(replacement)).toEqual(agents.get(original));
+    expect(agents.isSubmissionPending(replacement)).toBe(true);
+    expect(agents.transfer(replacement, replacement, ["conversation", "sent-thread"])).toBe(true);
+    expect(agents.get(replacement)).toMatchObject({
+      phase: "locked",
+      configurationByAgent: { pi: { model } },
+    });
+    const newDraft = {};
+    agents.mount(newDraft, ["default", "client-new-thread:second"], "pi");
+    expect(agents.get(newDraft)).toMatchObject({ phase: "draft", agent: "pi" });
+    expect(agents.modelForAgent(newDraft, "pi")).toBeUndefined();
+  });
+
+  it("does not share selection between drafts without a stable identity", () => {
+    const agents = controller();
+    const original = {};
+    agents.mount(original, ["default"], "pi");
+    agents.setExternalModel(
+      original,
+      "pi",
+      harnessModelRefSchema.parse({ id: "pi-model-v1.fast" }),
+    );
+    expect(agents.mount({}, ["default"], "pi").configurationByAgent).toBeUndefined();
+  });
+
+  it("transfers Pi Model state and request generations with logical Composer identity", () => {
+    const draft = {};
+    const conversation = {};
+    const revisit = {};
+    const newDefault = {};
+    const targetMember = {};
+    const target = ["conversation", targetMember];
+    const agents = controller();
+    const model = harnessModelRefSchema.parse({ id: "pi-model-v1.synthetic" });
+    const thinkingOptionId = harnessThinkingOptionIdSchema.parse("xhigh");
+
+    agents.mount(draft, ["default"]);
+    agents.setExternalModel(draft, "pi", model);
+    agents.setExternalThinkingOption(draft, "pi", thinkingOptionId);
+    const firstGeneration = agents.beginModelRequest(draft);
+    expect(agents.transfer(draft, conversation, target)).toBe(true);
+    expect(agents.get(conversation)).toMatchObject({
+      configurationByAgent: { pi: { model, thinkingOptionId } },
+    });
+    expect(agents.isCurrentModelRequest(conversation, firstGeneration)).toBe(true);
+
+    const secondGeneration = agents.beginModelRequest(conversation);
+    expect(agents.isCurrentModelRequest(draft, firstGeneration)).toBe(false);
+    expect(agents.isCurrentModelRequest(draft, secondGeneration)).toBe(true);
+    agents.mount(revisit, ["conversation", targetMember]);
+    expect(agents.get(revisit)).toMatchObject({
+      configurationByAgent: { pi: { model, thinkingOptionId } },
+    });
+
+    agents.mount(newDefault, ["default"]);
+    expect(agents.modelForAgent(newDefault, "pi")).toBeUndefined();
+    expect(agents.thinkingOptionForAgent(newDefault, "pi")).toBeUndefined();
+  });
+
+  it("isolates Claude and Pi Model state across one logical Composer lifecycle", async () => {
+    const draft = {};
+    const conversation = {};
+    const revisit = {};
+    const newDefault = {};
+    const agents = controller();
+    const piModel = harnessModelRefSchema.parse({ id: "pi-model-v1.isolated" });
+    const claudeModel = harnessModelRefSchema.parse({ id: "claude-model-v1.isolated" });
+    const claudePermissionMode = harnessPermissionModeIdSchema.parse("acceptEdits");
+    const piPermissionMode = harnessPermissionModeIdSchema.parse("future-pi-mode");
+    const piThinking = harnessThinkingOptionIdSchema.parse("max");
+    const claudeThinking = harnessThinkingOptionIdSchema.parse("auto");
+
+    agents.mount(draft, ["default"]);
+    agents.setExternalModel(draft, "pi", piModel);
+    agents.setExternalModel(draft, "claude-code", claudeModel);
+    agents.setExternalPermissionMode(draft, "pi", piPermissionMode);
+    agents.setExternalPermissionMode(draft, "claude-code", claudePermissionMode);
+    agents.setExternalThinkingOption(draft, "pi", piThinking);
+    agents.setExternalThinkingOption(draft, "claude-code", claudeThinking);
+    expect(agents.modelForAgent(draft, "pi")).toEqual(piModel);
+    expect(agents.modelForAgent(draft, "claude-code")).toEqual(claudeModel);
+    expect(agents.permissionModeForAgent(draft, "pi")).toBe(piPermissionMode);
+    expect(agents.permissionModeForAgent(draft, "claude-code")).toBe(claudePermissionMode);
+    expect(agents.thinkingOptionForAgent(draft, "pi")).toBe(piThinking);
+    expect(agents.thinkingOptionForAgent(draft, "claude-code")).toBe(claudeThinking);
+    expect(agents.transfer(draft, conversation, ["conversation", "claude-thread"])).toBe(true);
+    agents.mount(revisit, ["conversation", "claude-thread"]);
+    expect(agents.get(revisit)).toMatchObject({
+      configurationByAgent: {
+        pi: { model: piModel, thinkingOptionId: piThinking, permissionModeId: piPermissionMode },
+        "claude-code": {
+          model: claudeModel,
+          thinkingOptionId: claudeThinking,
+          permissionModeId: claudePermissionMode,
+        },
+      },
+    });
+
+    agents.mount(newDefault, ["default"]);
+    expect(agents.modelForAgent(newDefault, "pi")).toBeUndefined();
+    expect(agents.modelForAgent(newDefault, "claude-code")).toBeUndefined();
+    expect(agents.permissionModeForAgent(newDefault, "pi")).toBeUndefined();
+    expect(agents.permissionModeForAgent(newDefault, "claude-code")).toBeUndefined();
+    expect(agents.thinkingOptionForAgent(newDefault, "pi")).toBeUndefined();
+    expect(agents.thinkingOptionForAgent(newDefault, "claude-code")).toBeUndefined();
+  });
+
+  it("keeps an Antigravity effort selection so the carrier can encode it", () => {
+    const draft = {};
+    const agents = controller();
+    const effort = harnessThinkingOptionIdSchema.parse("low");
+    const model = harnessModelRefSchema.parse({ id: "gemini-3.1-pro" });
+    agents.mount(draft, ["default"]);
+    agents.setExternalModel(draft, "antigravity", model);
+    agents.setExternalThinkingOption(draft, "antigravity", effort);
+
+    // Without this the composer builds a carrier with no effort and the first
+    // Turn runs without --effort.
+    expect(agents.thinkingOptionForAgent(draft, "antigravity")).toBe(effort);
+    expect(agents.get(draft)).toMatchObject({
+      configurationByAgent: { antigravity: { model, thinkingOptionId: effort } },
+    });
+
+    agents.setExternalThinkingOption(draft, "antigravity", undefined);
+    expect(agents.thinkingOptionForAgent(draft, "antigravity")).toBeUndefined();
+  });
+
+  it("applies the target Agent before clearing stale prewarm", async () => {
+    const composer = {};
+    const agents = controller();
+    const operations: string[] = [];
+
+    await expect(
+      agents.switchAgent(composer, "pi", {
+        applyAgent(agent) {
+          operations.push(`apply:${agent}`);
+          return true;
+        },
+        async clearPrewarm() {
+          operations.push("clear");
+        },
+      }),
+    ).resolves.toBe(true);
+
+    expect(operations).toEqual(["apply:pi", "clear"]);
+    expect(agents.get(composer).agent).toBe("pi");
+  });
+
+  it("rejects concurrent switching for the same logical Composer", async () => {
+    const composer = {};
+    const agents = controller();
+    let releaseClear: (() => void) | undefined;
+    const first = agents.switchAgent(composer, "pi", {
+      applyAgent: () => true,
+      clearPrewarm: () =>
+        new Promise<void>((resolve) => {
+          releaseClear = resolve;
+        }),
+    });
+
+    expect(agents.isSwitching(composer)).toBe(true);
+    const secondOperations = {
+      applyAgent: () => {
+        throw new Error("overlapping selection must not apply a draft writer");
+      },
+      clearPrewarm: async () => undefined,
+    };
+    await expect(agents.switchAgent(composer, "claude-code", secondOperations)).resolves.toBe(
+      false,
+    );
+    releaseClear?.();
+    await first;
+    expect(agents.isSwitching(composer)).toBe(false);
+    expect(agents.get(composer).agent).toBe("pi");
+  });
+
+  it("restores the prior Agent when prewarm clearing fails", async () => {
+    const composer = {};
+    const agents = controller();
+    const operations: string[] = [];
+
+    await expect(
+      agents.switchAgent(composer, "pi", {
+        applyAgent(agent) {
+          operations.push(`apply:${agent}`);
+          return true;
+        },
+        async clearPrewarm() {
+          operations.push("clear");
+          throw new Error("synthetic clear failure");
+        },
+      }),
+    ).resolves.toBe(false);
+
+    expect(operations).toEqual(["apply:pi", "clear", "apply:codex"]);
+    expect(agents.get(composer).agent).toBe("codex");
+  });
+
+  it("fails closed when the prior Agent cannot be restored", async () => {
+    const composer = {};
+    const agents = controller();
+
+    await expect(
+      agents.switchAgent(composer, "pi", {
+        applyAgent(agent) {
+          return agent === "pi";
+        },
+        async clearPrewarm() {
+          throw new Error("synthetic clear failure");
+        },
+      }),
+    ).rejects.toThrow("could not restore the prior Agent");
+    expect(agents.isSwitching(composer)).toBe(false);
+  });
+
+  it("supports Qoder draft switching, model scoping, and restoration", async () => {
+    const composer = {};
+    const agents = controller();
+    const qoderModel = harnessModelRefSchema.parse({ id: "qoder-default-model" });
+    const qoderThinking = harnessThinkingOptionIdSchema.parse("medium");
+    const permissionMode = harnessPermissionModeIdSchema.parse("auto");
+    const operations = {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    };
+
+    agents.mount(composer, ["default"]);
+    await agents.switchAgent(composer, "qoder", operations);
+    expect(agents.get(composer)).toMatchObject({
+      agent: "qoder",
+      phase: "draft",
+    });
+
+    agents.setExternalModel(composer, "qoder", qoderModel);
+    agents.setExternalThinkingOption(composer, "qoder", qoderThinking);
+    agents.setExternalPermissionMode(composer, "qoder", permissionMode);
+
+    expect(agents.modelForAgent(composer, "qoder")).toEqual(qoderModel);
+    expect(agents.thinkingOptionForAgent(composer, "qoder")).toBe(qoderThinking);
+    expect(agents.permissionModeForAgent(composer, "qoder")).toBe(permissionMode);
+
+    expect(agents.modelForAgent(composer, "pi")).toBeUndefined();
+    expect(agents.modelForAgent(composer, "kiro-cli")).toBeUndefined();
+
+    agents.lock(composer);
+    expect(agents.get(composer).phase).toBe("locked");
+
+    const restored = {};
+    agents.mount(restored, ["conversation", "qoder-thread-1"]);
+    agents.restore(restored, "qoder", qoderModel, qoderThinking, permissionMode);
+    expect(agents.get(restored)).toMatchObject({
+      agent: "qoder",
+      phase: "locked",
+      configurationByAgent: {
+        qoder: {
+          model: qoderModel,
+          thinkingOptionId: qoderThinking,
+          permissionModeId: permissionMode,
+        },
+      },
+    });
+    expect(agents.modelForAgent(restored, "qoder")).toEqual(qoderModel);
+    expect(agents.thinkingOptionForAgent(restored, "qoder")).toBe(qoderThinking);
+    expect(agents.permissionModeForAgent(restored, "qoder")).toBe(permissionMode);
+  });
+  it("restores, reads, updates and clears CodeBuddy thinking independently of Qoder", () => {
+    const agents = controller();
+    const composer = {};
+    const high = harnessThinkingOptionIdSchema.parse("high");
+    const low = harnessThinkingOptionIdSchema.parse("low");
+    agents.mount(composer, ["default"]);
+    agents.setExternalThinkingOption(composer, "qoder", low);
+    agents.restore(composer, "codebuddy", undefined, high);
+    expect(agents.thinkingOptionForAgent(composer, "codebuddy")).toBe(high);
+    agents.setExternalThinkingOption(composer, "codebuddy", low);
+    expect(agents.thinkingOptionForAgent(composer, "codebuddy")).toBe(low);
+    agents.setExternalThinkingOption(composer, "codebuddy");
+    expect(agents.thinkingOptionForAgent(composer, "codebuddy")).toBeUndefined();
+    agents.restore(composer, "codebuddy", undefined, high);
+    agents.restore(composer, "codebuddy");
+    expect(agents.thinkingOptionForAgent(composer, "codebuddy")).toBeUndefined();
+    expect(agents.thinkingOptionForAgent(composer, "qoder")).toBe(low);
+  });
+
+  it("supports Kimi Code draft switching, model scoping, thinking options, and restoration", async () => {
+    const composer = {};
+    const agents = controller();
+    const kimiModel = harnessModelRefSchema.parse({ id: "kimi-k1.5" });
+    const kimiThinking = harnessThinkingOptionIdSchema.parse("high");
+    const permissionMode = harnessPermissionModeIdSchema.parse("prompt");
+    const operations = {
+      applyAgent: () => true,
+      clearPrewarm: async () => undefined,
+    };
+
+    agents.mount(composer, ["default"]);
+    await agents.switchAgent(composer, "kimi-code", operations);
+    expect(agents.get(composer)).toMatchObject({
+      agent: "kimi-code",
+      phase: "draft",
+    });
+
+    agents.setExternalModel(composer, "kimi-code", kimiModel);
+    agents.setExternalThinkingOption(composer, "kimi-code", kimiThinking);
+    agents.setExternalPermissionMode(composer, "kimi-code", permissionMode);
+
+    expect(agents.modelForAgent(composer, "kimi-code")).toEqual(kimiModel);
+    expect(agents.thinkingOptionForAgent(composer, "kimi-code")).toBe(kimiThinking);
+    expect(agents.permissionModeForAgent(composer, "kimi-code")).toBe(permissionMode);
+
+    expect(agents.modelForAgent(composer, "pi")).toBeUndefined();
+    expect(agents.modelForAgent(composer, "qoder")).toBeUndefined();
+
+    agents.lock(composer);
+    expect(agents.get(composer).phase).toBe("locked");
+
+    const restored = {};
+    agents.mount(restored, ["conversation", "kimi-thread-1"]);
+    agents.restore(restored, "kimi-code", kimiModel, kimiThinking, permissionMode);
+    expect(agents.get(restored)).toMatchObject({
+      agent: "kimi-code",
+      phase: "locked",
+      configurationByAgent: {
+        "kimi-code": {
+          model: kimiModel,
+          thinkingOptionId: kimiThinking,
+          permissionModeId: permissionMode,
+        },
+      },
+    });
+    expect(agents.modelForAgent(restored, "kimi-code")).toEqual(kimiModel);
+    expect(agents.thinkingOptionForAgent(restored, "kimi-code")).toBe(kimiThinking);
+    expect(agents.permissionModeForAgent(restored, "kimi-code")).toBe(permissionMode);
+  });
+});

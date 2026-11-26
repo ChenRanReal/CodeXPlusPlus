@@ -1,0 +1,1200 @@
+import { spawnSync } from "node:child_process";
+import {
+  chmod,
+  copyFile,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+import { describe, expect, it } from "vitest";
+
+import {
+  NPM_MINIMUM_NODE_VERSION,
+  NPM_NODE_ENGINE,
+  NPM_NODE_REQUIREMENT,
+  NPM_PACKAGE_NAME,
+  NPM_PLATFORM_PACKAGE_NAMES,
+  createNpmBinLauncherSource,
+  createNpmReadme,
+  createNpmPackageManifest,
+  expectedNpmPackagePaths,
+  npmPackageCpu,
+  npmPackageOs,
+  npmPackCommand,
+  npmPlatformPackageName,
+  resolveRuntimeLicenseSource,
+  writeThirdPartyNotices,
+  npmReleaseBuildCommands,
+  npmTarballFileName,
+  minimumNodeVersionFromEngines,
+  parseNpmReleaseArguments,
+  validateNpmPackage,
+} from "../../scripts/release/prepare-npm.mjs";
+import {
+  createNpmMetaReadme,
+  createNpmMetaPackageManifest,
+  expectedNpmMetaPackagePaths,
+  validateNpmMetaPackage,
+} from "../../scripts/release/prepare-npm-meta.mjs";
+import { hostReleaseTargetId, releaseTarget } from "../../scripts/release/targets.mjs";
+
+const launcherStdout =
+  "Shared Host stopped; interrupted 2 running task(s)\nstartup:" + "x".repeat(1024 * 1024);
+
+async function temporaryDirectory() {
+  return mkdtemp(path.join(os.tmpdir(), "codexhost-npm-package-"));
+}
+
+async function createNpmPackageFixture(root, target) {
+  for (const relative of expectedNpmPackagePaths(target)) {
+    const absolute = path.join(root, ...relative.split("/"));
+    await mkdir(path.dirname(absolute), { recursive: true });
+    if (relative === "package.json") {
+      await writeFile(
+        absolute,
+        `${JSON.stringify(createNpmPackageManifest({ version: "0.1.0", target }), null, 2)}\n`,
+      );
+      continue;
+    }
+    await writeFile(absolute, `npm-package:${relative}\n`);
+  }
+}
+
+async function writeExecutable(filePath, contents) {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, contents);
+  await chmod(filePath, 0o755);
+}
+
+async function createHomebrewNodeLayout(root) {
+  const brewPrefix = path.join(root, "opt", "homebrew");
+  const cellarNode = path.join(brewPrefix, "Cellar", "node", "26.7.0", "bin", "node");
+  const prefixNpm = path.join(brewPrefix, "lib", "node_modules", "npm", "bin", "npm-cli.js");
+  const libexecNpm = path.join(
+    brewPrefix,
+    "Cellar",
+    "node",
+    "26.7.0",
+    "libexec",
+    "lib",
+    "node_modules",
+    "npm",
+    "bin",
+    "npm-cli.js",
+  );
+  await mkdir(path.dirname(cellarNode), { recursive: true });
+  try {
+    await link(process.execPath, cellarNode);
+  } catch {
+    await copyFile(process.execPath, cellarNode);
+    await chmod(cellarNode, 0o755);
+  }
+  await writeExecutable(prefixNpm, '#!/usr/bin/env node\nconsole.log("homebrew-prefix-npm");\n');
+  await writeExecutable(libexecNpm, '#!/usr/bin/env node\nconsole.log("homebrew-libexec-npm");\n');
+  await mkdir(path.join(brewPrefix, "bin"), { recursive: true });
+  await symlink(
+    path.relative(path.join(brewPrefix, "bin"), cellarNode),
+    path.join(brewPrefix, "bin", "node"),
+  );
+  await symlink(
+    path.relative(path.join(brewPrefix, "bin"), prefixNpm),
+    path.join(brewPrefix, "bin", "npm"),
+  );
+  return { brewPrefix, cellarNode, prefixNpm, libexecNpm };
+}
+
+async function createGlobalCodexhostInstall(prefix) {
+  const platformPackage =
+    process.platform === "win32"
+      ? `@codexhost/cli-win32-${process.arch}`
+      : `@codexhost/cli-darwin-${process.arch}`;
+  const packageRoot = path.join(prefix, "lib", "node_modules", platformPackage);
+  const launcherPath = path.join(
+    prefix,
+    "lib",
+    "node_modules",
+    "@codexhost",
+    "cli",
+    "bin",
+    "codexhost.js",
+  );
+  const userBin = path.join(prefix, "bin", "codexhost");
+  await writeExecutable(launcherPath, createNpmBinLauncherSource({ version: "0.1.5" }));
+  await mkdir(path.dirname(userBin), { recursive: true });
+  await symlink(path.relative(path.dirname(userBin), launcherPath), userBin);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    path.join(packageRoot, "package.json"),
+    `${JSON.stringify({ name: platformPackage, version: "0.1.5" })}\n`,
+  );
+  const executableSuffix = process.platform === "win32" ? ".exe" : "";
+  for (const relative of [
+    path.join("bin", `codexhost${executableSuffix}`),
+    path.join("libexec", `codexhost-shim${executableSuffix}`),
+    path.join("app", "host-runtime.mjs"),
+    path.join("app", "desktop-controller.mjs"),
+    path.join("app", "renderer-extension.js"),
+  ]) {
+    await writeExecutable(path.join(packageRoot, relative), `fixture:${relative}\n`);
+  }
+  return { launcherPath, userBin, packageRoot };
+}
+
+function spawnCodexhost(nodePath, launcherPath, args, extraEnv = {}) {
+  const environment = { ...process.env, ...extraEnv };
+  delete environment.npm_execpath;
+  delete environment.HOMEBREW_PREFIX;
+  if (extraEnv.PATH === undefined) environment.PATH = path.dirname(nodePath);
+  return spawnSync(nodePath, [launcherPath, ...args], {
+    encoding: "utf8",
+    env: environment,
+    windowsHide: true,
+  });
+}
+
+async function createNpmMetaPackageFixture(root) {
+  for (const relative of expectedNpmMetaPackagePaths()) {
+    const absolute = path.join(root, ...relative.split("/"));
+    await mkdir(path.dirname(absolute), { recursive: true });
+    if (relative === "package.json") {
+      await writeFile(
+        absolute,
+        `${JSON.stringify(createNpmMetaPackageManifest({ version: "0.1.0" }), null, 2)}\n`,
+      );
+    } else if (relative === "bin/codexhost.js") {
+      await writeFile(absolute, createNpmBinLauncherSource({ version: "0.1.0" }));
+    } else {
+      await writeFile(absolute, `npm-meta-package:${relative}\n`);
+    }
+  }
+}
+
+async function createLauncherLifecycleFixture(root, platform) {
+  const launcherPath = path.join(root, "node_modules", "@codexhost", "cli", "bin", "codexhost.js");
+  const platformPackage = `@codexhost/cli-${platform}-x64`;
+  const platformRoot = path.join(root, "node_modules", ...platformPackage.split("/"));
+  const executableSuffix = platform === "win32" ? ".exe" : "";
+  const npmCliPath = path.join(root, "npm-cli.js");
+  const preloadPath = path.join(root, "launcher-child-preload.mjs");
+
+  await writeExecutable(launcherPath, createNpmBinLauncherSource({ version: "0.1.0" }));
+  await mkdir(platformRoot, { recursive: true });
+  await writeFile(
+    path.join(platformRoot, "package.json"),
+    `${JSON.stringify({ name: platformPackage, version: "0.1.0" })}\n`,
+  );
+  for (const relative of [
+    path.join("bin", `codexhost${executableSuffix}`),
+    path.join("libexec", `codexhost-shim${executableSuffix}`),
+    path.join("app", "host-runtime.mjs"),
+    path.join("app", "desktop-controller.mjs"),
+    path.join("app", "renderer-extension.js"),
+  ]) {
+    await writeExecutable(path.join(platformRoot, relative), `fixture:${relative}\n`);
+  }
+  await writeFile(npmCliPath, "// fixture npm CLI\n");
+  await writeFile(
+    preloadPath,
+    `import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
+import { PassThrough } from "node:stream";
+
+Object.defineProperty(process, "platform", {
+  configurable: true,
+  value: process.env.CODEXHOST_TEST_PLATFORM,
+});
+Object.defineProperty(process, "arch", {
+  configurable: true,
+  value: "x64",
+});
+if (process.env.CODEXHOST_TEST_TTY === "1") {
+  Object.defineProperty(process.stdout, "isTTY", {
+    configurable: true,
+    value: true,
+  });
+}
+
+childProcess.spawn = () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  setTimeout(() => child.stdout.write(${JSON.stringify(launcherStdout)} + "rea"), 10);
+  setTimeout(() => child.stdout.write("dy\\n"), 20);
+  setTimeout(() => child.emit("exit", 7, null), 80);
+  return child;
+};
+syncBuiltinESMExports();
+`,
+  );
+
+  return { launcherPath, npmCliPath, preloadPath, platformRoot };
+}
+
+async function runLauncherLifecycle(
+  platform,
+  { locale = "en_US.UTF-8", noColor = false, tty = false, platformVersion = "0.1.0" } = {},
+) {
+  const root = await temporaryDirectory();
+  try {
+    const { launcherPath, npmCliPath, preloadPath, platformRoot } =
+      await createLauncherLifecycleFixture(root, platform);
+    await writeFile(
+      path.join(platformRoot, "package.json"),
+      JSON.stringify({ name: `@codexhost/cli-${platform}-x64`, version: platformVersion }),
+    );
+    const environment = {
+      ...process.env,
+      CODEXHOST_STARTUP_TRACE: "1",
+      CODEXHOST_TEST_PLATFORM: platform,
+      CODEXHOST_TEST_TTY: tty ? "1" : "0",
+      LC_ALL: locale,
+      npm_execpath: npmCliPath,
+    };
+    if (tty) environment.TERM = "xterm-256color";
+    if (noColor) environment.NO_COLOR = "1";
+    else delete environment.NO_COLOR;
+    const args = ["--import", pathToFileURL(preloadPath).href, launcherPath];
+    return spawnSync(process.execPath, args, {
+      encoding: "utf8",
+      env: environment,
+      maxBuffer: 2 * 1024 * 1024,
+      timeout: 2_000,
+      windowsHide: true,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function runGeneratedWrapperLifecycle(platform, userArguments, exitCodes) {
+  const root = await temporaryDirectory();
+  try {
+    const { launcherPath, npmCliPath } = await createLauncherLifecycleFixture(root, platform);
+    const preloadPath = path.join(root, "remote-broker-preload.mjs");
+    const callsPath = path.join(root, "spawn-calls.jsonl");
+    await writeFile(
+      preloadPath,
+      `import childProcess from "node:child_process";
+import { appendFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
+import { PassThrough } from "node:stream";
+
+Object.defineProperty(process, "platform", { configurable: true, value: process.env.CODEXHOST_TEST_PLATFORM });
+Object.defineProperty(process, "arch", { configurable: true, value: "x64" });
+const exitCodes = JSON.parse(process.env.CODEXHOST_TEST_EXIT_CODES);
+let call = 0;
+childProcess.spawn = (command, args, options) => {
+  appendFileSync(process.env.CODEXHOST_TEST_CALLS, JSON.stringify({
+    command,
+    args,
+    npmNodePath: options?.env?.CODEXHOST_NPM_NODE_PATH,
+    npmWrapperPath: options?.env?.CODEXHOST_NPM_LAUNCHER_PATH,
+    stdoutFd: Array.isArray(options?.stdio) ? options.stdio[1]?.fd : null,
+  }) + "\\n");
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  const exitCode = exitCodes[call++] ?? 1;
+  setTimeout(() => child.emit("exit", exitCode, null), 5);
+  return child;
+};
+syncBuiltinESMExports();
+`,
+    );
+    const result = spawnSync(
+      process.execPath,
+      ["--import", pathToFileURL(preloadPath).href, launcherPath, ...userArguments],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEXHOST_TEST_PLATFORM: platform,
+          CODEXHOST_TEST_CALLS: callsPath,
+          CODEXHOST_TEST_EXIT_CODES: JSON.stringify(exitCodes),
+          npm_execpath: npmCliPath,
+        },
+        timeout: 2_000,
+        windowsHide: true,
+      },
+    );
+    const calls = (await readFile(callsPath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    return { result, calls };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+describe("npm package release", () => {
+  it("maps the current host to a release target id", () => {
+    expect(hostReleaseTargetId("darwin", "arm64")).toBe("macos-arm64");
+    expect(hostReleaseTargetId("darwin", "x64")).toBe("macos-x64");
+    expect(hostReleaseTargetId("win32", "x64")).toBe("windows-x64");
+    expect(hostReleaseTargetId("win32", "arm64")).toBe("windows-arm64");
+    expect(hostReleaseTargetId("linux", "x64")).toBe("linux-x64");
+    expect(hostReleaseTargetId("linux", "arm64")).toBe("linux-arm64");
+  });
+
+  it("defaults the npm release target to the current host", () => {
+    const parsed = parseNpmReleaseArguments([], {
+      hostPlatform: "darwin",
+      hostArch: "arm64",
+    });
+    expect(parsed.help).toBe(false);
+    expect(parsed.target.id).toBe("macos-arm64");
+    expect(parsed.pack).toBe(false);
+    expect(parsed.skipBuild).toBe(false);
+    expect(parsed.version).toBeUndefined();
+  });
+
+  it("parses npm release options", () => {
+    const parsed = parseNpmReleaseArguments(
+      ["--target", "macos-arm64", "--version", "0.1.0", "--pack", "--skip-build"],
+      { hostPlatform: "darwin", hostArch: "arm64" },
+    );
+    expect(parsed.target.id).toBe("macos-arm64");
+    expect(parsed.version).toBe("0.1.0");
+    expect(parsed.pack).toBe(true);
+    expect(parsed.skipBuild).toBe(true);
+  });
+
+  it("rejects cross-operating-system npm targets", () => {
+    expect(() =>
+      parseNpmReleaseArguments(["--target", "windows-x64"], {
+        hostPlatform: "darwin",
+        hostArch: "arm64",
+      }),
+    ).toThrow("requires host platform");
+  });
+
+  it("builds the same Rust and TypeScript inputs as the installer channel", () => {
+    const commands = npmReleaseBuildCommands(releaseTarget("macos-arm64"));
+    expect(commands.map((command) => command.label)).toEqual([
+      "TypeScript build",
+      "Renderer build",
+      "Rust release build",
+      "Desktop shell release build",
+    ]);
+    const rust = commands.find((command) => command.label === "Rust release build");
+    expect(rust.args).toContain("codexhost-launcher");
+    expect(rust.args).toContain("codexhost-shim");
+    expect(rust.args).toContain("codexhost-updater");
+    expect(rust.args).not.toContain("codexhost-platform");
+    const shell = commands.find((command) => command.label === "Desktop shell release build");
+    expect(shell.args).toContain("apps/desktop-shell/src-tauri/Cargo.toml");
+    expect(shell.args).toContain("aarch64-apple-darwin");
+  });
+
+  it("links Linux native binaries at the glibc baseline instead of the build host's glibc", () => {
+    for (const [targetName, rustTarget] of [
+      ["linux-x64", "x86_64-unknown-linux-gnu.2.28"],
+      ["linux-arm64", "aarch64-unknown-linux-gnu.2.28"],
+    ]) {
+      const commands = npmReleaseBuildCommands(releaseTarget(targetName));
+      expect(commands.map((command) => command.label)).not.toContain("Desktop shell release build");
+      const rust = commands.at(-1);
+      expect(rust.command).toBe("cargo");
+      expect(rust.args[0]).toBe("zigbuild");
+      expect(rust.args).toContain(rustTarget);
+      expect(rust.args).toContain("codexhost-updater");
+    }
+    const macos = npmReleaseBuildCommands(releaseTarget("macos-arm64")).find(
+      (command) => command.label === "Rust release build",
+    );
+    expect(macos.args.slice(0, 3)).toEqual(["build", "--target", "aarch64-apple-darwin"]);
+  });
+
+  it("runs npm pack through npm_execpath on Windows", () => {
+    expect(
+      npmPackCommand("win32", { npm_execpath: "C:\\npm\\npm-cli.js" }, "C:\\node.exe"),
+    ).toEqual({
+      command: "C:\\node.exe",
+      args: ["C:\\npm\\npm-cli.js", "pack"],
+    });
+    expect(npmPackCommand("darwin", {}, "/usr/bin/node")).toEqual({
+      command: "npm",
+      args: ["pack"],
+    });
+  });
+
+  it("generates SDK notices from repository license assets", async () => {
+    const root = process.cwd();
+    const output = await temporaryDirectory();
+    try {
+      await writeThirdPartyNotices(root, output);
+      const notice = await readFile(path.join(output, "THIRD_PARTY_NOTICES.txt"), "utf8");
+      const license = await readFile(
+        path.join(output, "licenses/OpenCode-SDK-LICENSE.txt"),
+        "utf8",
+      );
+      expect(
+        resolveRuntimeLicenseSource(root, {
+          packageName: "@opencode-ai/sdk",
+          source: "scripts/release/licenses/opencode-ai-sdk-1.18.25-MIT.txt",
+        }),
+      ).toBe(path.join(root, "scripts/release/licenses/opencode-ai-sdk-1.18.25-MIT.txt"));
+      for (const name of ["Qoder", "QoderCN"]) {
+        const licensePath = `licenses/${name}-Agent-SDK-LICENSE.txt`;
+        expect(notice).toContain(licensePath);
+        expect(await readFile(path.join(output, licensePath), "utf8")).toContain(
+          "Qoder Product Service Terms",
+        );
+      }
+      expect(notice).toContain("@qoder-ai/qoder-agent-sdk");
+      expect(notice).toContain("@qodercn-ai/qodercn-agent-sdk");
+      expect(notice).toContain("@opencode-ai/sdk");
+      expect(notice).toContain("@opencode/client");
+      expect(
+        await readFile(path.join(output, "licenses/OpenCode-v2-Client-LICENSE.txt"), "utf8"),
+      ).toContain("MIT License");
+      expect(notice).toContain("licenses/OpenCode-SDK-LICENSE.txt");
+      expect(license).toContain("Copyright (c) 2025 opencode");
+      expect(notice).toContain("licenses/DesktopScreenshot-NOTICES.txt");
+      const nativeNotices = await readFile(
+        path.join(output, "licenses/DesktopScreenshot-NOTICES.txt"),
+        "utf8",
+      );
+      expect(nativeNotices).toContain("xcap 0.9.8");
+      expect(nativeNotices).toContain("Apache License");
+    } finally {
+      await rm(output, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes a scoped platform package with platform constraints", () => {
+    const target = releaseTarget("macos-arm64");
+    const manifest = createNpmPackageManifest({ version: "0.1.0", target });
+    expect(manifest.name).toBe("@codexhost/cli-darwin-arm64");
+    expect(npmPlatformPackageName(target)).toBe(manifest.name);
+    expect(manifest.private).toBeUndefined();
+    expect(manifest.bin).toBeUndefined();
+    expect(manifest.os).toEqual(npmPackageOs(target));
+    expect(manifest.cpu).toEqual(npmPackageCpu(target));
+    expect(manifest.engines.node).toBe(NPM_NODE_ENGINE);
+    expect(manifest.publishConfig.access).toBe("public");
+    expect(manifest.files).toEqual([
+      "bin/**",
+      "libexec/**",
+      "app/**",
+      "licenses/**",
+      "README.md",
+      "THIRD_PARTY_NOTICES.txt",
+    ]);
+  });
+
+  it("publishes the repository minimum Node.js version without an upper bound", async () => {
+    const rootManifest = JSON.parse(
+      await readFile(path.join(import.meta.dirname, "../../package.json"), "utf8"),
+    );
+    expect(NPM_MINIMUM_NODE_VERSION).toBe(minimumNodeVersionFromEngines(rootManifest.engines.node));
+    expect(minimumNodeVersionFromEngines(">=22.19.0 <23.0.0 || >=24.0.0 <25.0.0")).toBe("22.19.0");
+    expect(minimumNodeVersionFromEngines(">=24.1.0 || >=22.20.3 <23")).toBe("22.20.3");
+    expect(() => minimumNodeVersionFromEngines("^22")).toThrow("no minimum version");
+    // No upper bound, but Node.js 23.x lacks node:sqlite APIs that bundled plugins import.
+    expect(NPM_NODE_ENGINE).toBe(`>=${NPM_MINIMUM_NODE_VERSION} <23.0.0 || >=24.0.0`);
+    expect(NPM_NODE_REQUIREMENT).toBe(`Node.js ${NPM_MINIMUM_NODE_VERSION} or later, except 23.x`);
+    expect(createNpmMetaPackageManifest({ version: "0.1.0" }).engines).toEqual({
+      node: NPM_NODE_ENGINE,
+    });
+    for (const id of Object.keys(NPM_PLATFORM_PACKAGE_NAMES)) {
+      const target = releaseTarget(id);
+      expect(createNpmPackageManifest({ version: "0.1.0", target }).engines).toEqual({
+        node: NPM_NODE_ENGINE,
+      });
+      expect(createNpmReadme({ version: "0.1.0", target })).toContain(NPM_NODE_REQUIREMENT);
+    }
+    expect(createNpmMetaReadme({ version: "0.1.0" })).toContain(NPM_NODE_REQUIREMENT);
+  });
+
+  it.each([
+    ["22.0.0", 1],
+    ["22.18.9", 1],
+    ["20.19.0", 1],
+    [NPM_MINIMUM_NODE_VERSION, 0],
+    ["23.0.0", 1],
+    ["23.3.9", 1],
+    ["23.4.0", 1],
+    ["23.11.0", 1],
+    ["24.0.0", 0],
+    ["25.2.1", 0],
+  ])("gates the npm wrapper on Node.js %s", async (nodeVersion, status) => {
+    const root = await temporaryDirectory();
+    const launcherPath = path.join(root, "codexhost.mjs");
+    const preloadPath = path.join(root, "node-version-preload.mjs");
+    try {
+      await writeFile(launcherPath, createNpmBinLauncherSource({ version: "1.2.3" }));
+      await writeFile(
+        preloadPath,
+        `Object.defineProperty(process.versions, "node", { configurable: true, value: ${JSON.stringify(nodeVersion)} });\n`,
+      );
+      const result = spawnSync(
+        process.execPath,
+        ["--import", pathToFileURL(preloadPath).href, launcherPath, "--version"],
+        { encoding: "utf8", windowsHide: true },
+      );
+      expect(result.status, result.stderr).toBe(status);
+      if (status === 0) {
+        expect(result.stdout).toBe("1.2.3\n");
+      } else {
+        expect(result.stdout).toBe("");
+        expect(result.stderr).toBe(
+          `codexhost: Node.js ${nodeVersion} is not supported; ${NPM_PACKAGE_NAME} requires ${NPM_NODE_REQUIREMENT}.\n`,
+        );
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes one meta package with exact optional platform dependencies", () => {
+    const manifest = createNpmMetaPackageManifest({ version: "0.1.0" });
+    expect(manifest.name).toBe(NPM_PACKAGE_NAME);
+    expect(manifest.bin.codexhost).toBe("bin/codexhost.js");
+    expect(manifest.os).toBeUndefined();
+    expect(manifest.cpu).toBeUndefined();
+    expect(manifest.optionalDependencies).toEqual(
+      Object.fromEntries(Object.values(NPM_PLATFORM_PACKAGE_NAMES).map((name) => [name, "0.1.0"])),
+    );
+  });
+
+  it("prints the star prompt before npm launch setup begins", () => {
+    const source = createNpmBinLauncherSource({ version: "0.1.0" });
+    const promptCall = source.indexOf("  printStarPrompt();");
+    const platformResolution = source.indexOf("const platformPackages =");
+
+    expect(promptCall).toBeGreaterThanOrEqual(0);
+    expect(promptCall).toBeLessThan(platformResolution);
+    expect(source.match(/\n {2}printStarPrompt\(\);/gu)).toHaveLength(1);
+  });
+
+  it("routes bare codexhost to the default launcher chooser and injects resources for explicit launch", () => {
+    const source = createNpmBinLauncherSource({ version: "0.1.0" });
+    expect(source).toContain('"darwin-arm64": "@codexhost/cli-darwin-arm64"');
+    expect(source).toContain('"linux-x64": "@codexhost/cli-linux-x64"');
+    expect(source).toContain('"linux-arm64": "@codexhost/cli-linux-arm64"');
+    expect(source).toContain("require.resolve");
+    expect(source).toContain("--omit=optional");
+    expect(source).toContain("launchArguments = []");
+    expect(source).toContain('userArguments[0] === "app"');
+    expect(source).toContain('userArguments[0] === "launch-prefs"');
+    expect(source).toContain('extras.push("--node", process.execPath)');
+    expect(source).toContain('extras.push("--shim", shim)');
+    expect(source).toContain('extras.push("--host-runtime", hostRuntime)');
+    expect(source).toContain('extras.push("--desktop-controller", desktopController)');
+    expect(source).toContain('extras.push("--renderer", rendererExtension)');
+    expect(source).toContain('if (launchArguments?.[0] === "launch")');
+    expect(source).toContain('launchArguments.length === 0 || launchArguments[0] === "launch"');
+    expect(source).toContain('userArguments[0] === "remote"');
+    expect(source).toContain('userArguments[0] === "broker"');
+    expect(source).toContain("brokerArguments = userArguments.slice(1)");
+    expect(source).toContain('"--node", process.execPath, "--host-runtime", hostRuntime');
+    expect(source).toContain('remoteArguments[0] === "install"');
+    expect(source).toContain('remoteArguments[0] === "uninstall"');
+    expect(source).toContain('runNativeBroker("install"');
+    expect(source).toContain('runNativeBroker("uninstall"');
+    expect(source).toContain('userArguments[0] === "delegate"');
+    expect(source).toContain('userArguments[0] === "thread"');
+    expect(source).toContain('userArguments[0] === "client"');
+    expect(source).toContain('userArguments[0] === "events"');
+    expect(source).toContain('userArguments[0] === "console"');
+    expect(source).toContain('[consoleServer, userArguments[0] === "update" ? "update" : "open"]');
+    expect(source).toContain('"--codexhost-delegation-cli"');
+    expect(source).toContain("CODEXHOST_CLI_PATH");
+    expect(source).toContain('"--codexhost-remote"');
+    expect(source).toContain('"--host-runtime", hostRuntime');
+    expect(source).toContain('stdio: ["ignore", "pipe", "inherit"]');
+    expect(source).toContain('const readyMarker = "ready\\n"');
+    expect(source).toContain("path.dirname(path.dirname(path.resolve(process.argv[1])))");
+    expect(source).not.toContain("runtime/node");
+  });
+
+  it.each(["web", "stop", "status"])("routes %s to the native service command", async (command) => {
+    const options = command === "web" ? ["--port", "4501", "--public-url", ""] : [];
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      [command, ...options],
+      [0],
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual(
+      command === "status"
+        ? ["status"]
+        : [
+            command,
+            "--node",
+            process.execPath,
+            "--host-runtime",
+            expect.stringMatching(/host-runtime\.mjs$/u),
+            "--web-runtime",
+            expect.stringMatching(/web-server\.mjs$/u),
+            ...options,
+          ],
+    );
+  });
+
+  it.each(["on", "off", "status"])(
+    "routes autostart %s with the npm entrypoint",
+    async (action) => {
+      const { result, calls } = await runGeneratedWrapperLifecycle(
+        "darwin",
+        ["autostart", action],
+        [0],
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args).toEqual(["autostart", action]);
+      expect(calls[0].npmNodePath).toBe(process.execPath);
+      expect(calls[0].npmWrapperPath).toMatch(/bin[/\\\\]codexhost\.js$/u);
+    },
+  );
+
+  it.each([
+    ["host", "info", "--refresh", "true"],
+    ["host", "--help"],
+    ["host", "-h"],
+    ["host", "help"],
+    ["project", "list", "--query", "bat"],
+    ["thread", "file", "thread-id", "--path", "outputs/result.png"],
+  ])("routes discovery, file reads and help through the npm CLI: %j", async (...args) => {
+    const { result, calls } = await runGeneratedWrapperLifecycle("darwin", args, [0]);
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual([
+      expect.stringMatching(/host-runtime\.mjs$/u),
+      "--codexhost-delegation-cli",
+      ...args,
+    ]);
+  });
+
+  it("passes background Web through without launching Desktop", async () => {
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      ["web", "--background"],
+      [0],
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args[0]).toBe("web");
+    expect(calls[0].args.at(-1)).toBe("--background");
+  });
+
+  it.each(["ensure", "stop"])(
+    "supplies native resources for independent host %s without launching Desktop",
+    async (command) => {
+      const data = path.resolve("isolated-host-data");
+      const { result, calls } = await runGeneratedWrapperLifecycle(
+        "darwin",
+        ["host", command, "--data", data],
+        [0],
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args).toEqual([
+        "host",
+        command,
+        "--node",
+        process.execPath,
+        "--host-runtime",
+        expect.stringMatching(/host-runtime\.mjs$/u),
+        "--data",
+        expect.any(String),
+        "--data",
+        data,
+      ]);
+      expect(calls[0].args).not.toContain("launch");
+    },
+  );
+
+  it.each(["darwin", "linux", "win32"])(
+    "keeps automatic Node selection compatible on %s",
+    async (platform) => {
+      const { result, calls } = await runGeneratedWrapperLifecycle(platform, ["launch"], [0]);
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].npmNodePath).toBe(process.execPath);
+      const nodeIndex = calls[0].args.indexOf("--node");
+      if (platform === "darwin") expect(nodeIndex).toBe(-1);
+      else expect(calls[0].args[nodeIndex + 1]).toBe(process.execPath);
+    },
+  );
+
+  it("preserves an explicit macOS Node override", async () => {
+    const customNode = "/custom/node";
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      ["launch", "--node", customNode],
+      [0],
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls[0].args.filter((argument) => argument === "--node")).toHaveLength(1);
+    expect(calls[0].args[calls[0].args.indexOf("--node") + 1]).toBe(customNode);
+  });
+
+  const brokerTail = [
+    "--node",
+    process.execPath,
+    "--host-runtime",
+    expect.stringMatching(/host-runtime\.mjs$/u),
+  ];
+  const brokerHarnessArguments = [
+    [],
+    ["--harness", "codebuddy"],
+    ["--harness", "workbuddy"],
+    ["--harness", "cursor-cli"],
+  ];
+
+  it.each(["install", "stop", "uninstall"])(
+    "manages every Aqua broker after a successful macOS remote %s",
+    async (command) => {
+      const { result, calls } = await runGeneratedWrapperLifecycle(
+        "darwin",
+        ["remote", command],
+        [0, 0, 0, 0, 0],
+      );
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls.slice(1).map((call) => call.args)).toEqual(
+        brokerHarnessArguments.map((harness) => ["broker", command, ...harness, ...brokerTail]),
+      );
+    },
+  );
+
+  it("keeps managing later brokers and reports the first broker failure", async () => {
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      ["remote", "install"],
+      [0, 0, 5, 6, 0],
+    );
+
+    expect(result.status).toBe(5);
+    expect(calls).toHaveLength(5);
+  });
+
+  it("reports a macOS broker status failure after remote status succeeds", async () => {
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      ["remote", "status"],
+      [0, 0, 9, 0, 0],
+    );
+
+    expect(result.status).toBe(9);
+    expect(calls).toHaveLength(5);
+    for (const call of calls.slice(1)) {
+      expect(call.args.slice(0, 2)).toEqual(["broker", "status"]);
+      expect(call.stdoutFd).toBe(2);
+    }
+  });
+
+  it("does not manage an Aqua broker for Linux remote installs", async () => {
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "linux",
+      ["remote", "install"],
+      [0],
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(["darwin", "linux"])(
+    "forwards a bare remote command on %s as usage, not as an injected option",
+    async (platform) => {
+      const { result, calls } = await runGeneratedWrapperLifecycle(platform, ["remote"], [0]);
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].args).toEqual([
+        expect.stringMatching(/host-runtime\.mjs$/u),
+        "--codexhost-remote",
+        "help",
+        "--node",
+        process.execPath,
+        "--shim",
+        expect.stringMatching(/codexhost-shim$/u),
+        "--host-runtime",
+        expect.stringMatching(/host-runtime\.mjs$/u),
+      ]);
+    },
+  );
+
+  it("does not install the Aqua broker when remote installation fails", async () => {
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      ["remote", "install"],
+      [7],
+    );
+
+    expect(result.status).toBe(7);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("injects the npm Node and Host Runtime into direct broker status", async () => {
+    const { result, calls } = await runGeneratedWrapperLifecycle(
+      "darwin",
+      ["broker", "status"],
+      [0],
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toEqual([
+      "broker",
+      "status",
+      "--node",
+      process.execPath,
+      "--host-runtime",
+      expect.stringMatching(/host-runtime\.mjs$/u),
+    ]);
+  });
+
+  it("documents background Web and uninstall commands in both npm READMEs", () => {
+    for (const readme of [
+      createNpmMetaReadme({ version: "0.1.0" }),
+      createNpmReadme({ version: "0.1.0", target: releaseTarget("windows-x64") }),
+    ]) {
+      for (const command of [
+        "codexhost web",
+        "codexhost status",
+        "codexhost autostart on",
+        "codexhost autostart off",
+        "codexhost stop",
+        `npm uninstall -g ${NPM_PACKAGE_NAME}`,
+        "tailscale serve status",
+        "tailscale serve --https=443 --set-path=/ off",
+      ])
+        expect(readme).toContain(command);
+      expect(readme).toContain("127.0.0.1:4400");
+      expect(readme).toContain("--trusted-proxy");
+      expect(readme).toContain("--public-url");
+    }
+  });
+
+  it("keeps Windows launcher supervision alive after the ready handshake", async () => {
+    const result = await runLauncherLifecycle("win32");
+    const readme = createNpmMetaReadme({ version: "0.1.0" });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(7);
+    expect(result.stderr).toContain("received Launcher ready");
+    expect(result.stderr).toContain("Launcher exited after ready");
+    expect(result.stdout).toBe(
+      "⭐ If this project helps you, please give us a Star ⭐\n" +
+        "https://github.com/BytePioneer-AI/codex-host\n" +
+        launcherStdout,
+    );
+    expect(readme).toContain("On Windows, the command remains attached until Codex Desktop exits");
+    expect(readme).toContain("process trees of completed commands");
+  });
+
+  it.each(["win32", "darwin", "linux"])(
+    "rejects mismatched platform payloads before spawning on %s",
+    async (platform) => {
+      for (const platformVersion of ["0.0.9", "0.2.0", null]) {
+        const result = await runLauncherLifecycle(platform, { platformVersion });
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stderr).toContain("platform package version mismatch");
+        expect(result.stderr).toContain(`@codexhost/cli-${platform}-x64`);
+        expect(result.stderr).toContain("expected 0.1.0");
+        expect(result.stderr).toContain(
+          `npm install -g @codexhost/cli@0.1.0 @codexhost/cli-${platform}-x64@0.1.0`,
+        );
+        expect(result.stderr).not.toContain("received Launcher ready");
+        expect(result.stdout).not.toContain("startup:");
+      }
+    },
+  );
+
+  it.each(["darwin", "linux"])("returns after the ready handshake on %s", async (platform) => {
+    const result = await runLauncherLifecycle(platform);
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("received Launcher ready");
+    expect(result.stderr).not.toContain("Launcher exited after ready");
+    expect(result.stdout).toContain("Shared Host stopped; interrupted 2 running task(s)\n");
+    expect(result.stdout).not.toContain("ready\n");
+    expect(result.stdout).toBe(
+      "⭐ If this project helps you, please give us a Star ⭐\n" +
+        "https://github.com/BytePioneer-AI/codex-host\n" +
+        launcherStdout,
+    );
+  });
+
+  it("uses a Chinese star prompt for a Chinese locale", async () => {
+    const result = await runLauncherLifecycle("darwin", { locale: "zh_CN.UTF-8" });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe(
+      "⭐ 如果这个项目对你有帮助，请给我们一个 Star ⭐\n" +
+        "https://github.com/BytePioneer-AI/codex-host\n" +
+        launcherStdout,
+    );
+  });
+
+  it("colors the star prompt on a TTY and honors NO_COLOR", async () => {
+    const colored = await runLauncherLifecycle("darwin", { tty: true });
+    const plain = await runLauncherLifecycle("darwin", { noColor: true, tty: true });
+
+    expect(colored.status, colored.stderr).toBe(0);
+    expect(colored.stdout).toBe(
+      "\u001B[33m⭐ If this project helps you, please give us a Star ⭐\u001B[0m\n" +
+        "\u001B[36mhttps://github.com/BytePioneer-AI/codex-host\u001B[0m\n" +
+        launcherStdout,
+    );
+    expect(plain.status, plain.stderr).toBe(0);
+    expect(plain.stdout).toBe(
+      "⭐ If this project helps you, please give us a Star ⭐\n" +
+        "https://github.com/BytePioneer-AI/codex-host\n" +
+        launcherStdout,
+    );
+  });
+
+  it("does not forward remote SSH bootstrap variables into a local Desktop launch", () => {
+    const source = createNpmBinLauncherSource({ version: "0.1.0" });
+    expect(source).toContain('import { homedir } from "node:os"');
+    expect(source).toContain('if (updateEnvironment.CODEXHOST_REMOTE_SSH_MANAGED === "1")');
+    expect(source).toContain("delete updateEnvironment[name]");
+    expect(source).toContain(
+      'updateEnvironment.CODEXHOST_DATA_DIR = path.join(homedir(), ".codexhost")',
+    );
+    const listStart = source.indexOf("const remoteSshBootstrapEnvironment = [");
+    const listEnd = source.indexOf("];", listStart);
+    expect(listStart).toBeGreaterThanOrEqual(0);
+    expect(listEnd).toBeGreaterThan(listStart);
+    const sanitizationSource = source.slice(listStart, listEnd);
+    for (const name of [
+      "CODEX_INSTALL_DIR",
+      "CODEXHOST_DATA_DIR",
+      "CODEXHOST_DEFAULT_AGENT",
+      "CODEXHOST_HOST_NODE_PATH",
+      "CODEXHOST_HOST_RUNTIME_PATH",
+      "CODEXHOST_REMOTE_SSH_MANAGED",
+      "CODEXHOST_STOCK_CODEX_PATH",
+    ]) {
+      expect(sanitizationSource).toContain(JSON.stringify(name));
+    }
+    expect(sanitizationSource).not.toContain("CODEXHOST_CLAUDE_COMMAND");
+  });
+
+  it.runIf(process.platform === "darwin")(
+    "locates Homebrew npm when Node and npm do not share an official prefix",
+    async () => {
+      const root = await temporaryDirectory();
+      try {
+        const { brewPrefix, cellarNode } = await createHomebrewNodeLayout(root);
+        const { userBin } = await createGlobalCodexhostInstall(brewPrefix);
+        const result = spawnCodexhost(cellarNode, userBin, ["--help"]);
+        expect(result.status).toBe(0);
+        expect(result.stderr).toBe("");
+        expect(result.stdout).toContain("usage:");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "darwin")(
+    "opens the packaged console with the npm update environment and the Launcher",
+    async () => {
+      const root = await temporaryDirectory();
+      try {
+        const { brewPrefix, cellarNode } = await createHomebrewNodeLayout(root);
+        const { userBin, packageRoot } = await createGlobalCodexhostInstall(brewPrefix);
+        const missing = spawnCodexhost(cellarNode, userBin, ["console"]);
+        expect(missing.status).toBe(1);
+        expect(missing.stderr).toContain("missing console");
+
+        await writeFile(
+          path.join(packageRoot, "app", "console-server.mjs"),
+          "console.log(JSON.stringify({ args: process.argv.slice(2), launcher: process.env.CODEXHOST_LAUNCHER_EXECUTABLE, packageRoot: process.env.CODEXHOST_NPM_PACKAGE_ROOT }));\n",
+        );
+        // Recovery must not depend on the resources used to launch Desktop.
+        for (const relative of [
+          "libexec/codexhost-shim",
+          "app/host-runtime.mjs",
+          "app/desktop-controller.mjs",
+          "app/renderer-extension.js",
+        ]) {
+          await rm(path.join(packageRoot, relative));
+        }
+        await writeExecutable(
+          path.join(packageRoot, "bin", "codexhost"),
+          '#!/bin/sh\necho "early-launcher-reached" >&2\nexit 23\n',
+        );
+        const launch = spawnCodexhost(cellarNode, userBin, []);
+        expect(launch.status).toBe(23);
+        expect(launch.stderr).toContain("early-launcher-reached");
+        const result = spawnCodexhost(cellarNode, userBin, ["console"]);
+        expect(result.status).toBe(0);
+        const reported = JSON.parse(result.stdout);
+        expect(reported.args).toEqual(["open"]);
+        const realPackageRoot = await realpath(packageRoot);
+        expect(reported.launcher).toBe(path.join(realPackageRoot, "bin", "codexhost"));
+        expect(reported.packageRoot).toBe(realPackageRoot);
+        expect(spawnCodexhost(cellarNode, userBin, ["console", "extra"]).status).toBe(1);
+        const update = spawnCodexhost(cellarNode, userBin, ["update"]);
+        expect(update.status).toBe(0);
+        expect(JSON.parse(update.stdout)).toEqual({ ...reported, args: ["update"] });
+        expect(spawnCodexhost(cellarNode, userBin, ["update", "extra"]).status).toBe(1);
+        await writeFile(path.join(packageRoot, "app", "console-server.mjs"), "process.exit(7);\n");
+        expect(spawnCodexhost(cellarNode, userBin, ["update"]).status).toBe(7);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["--version", "-v"])("prints the npm package version for %s", async (option) => {
+    const root = await temporaryDirectory();
+    const launcherPath = path.join(root, "codexhost.mjs");
+    try {
+      await writeFile(launcherPath, createNpmBinLauncherSource({ version: "1.2.3" }));
+      const result = spawnSync(process.execPath, [launcherPath, option], {
+        encoding: "utf8",
+        windowsHide: true,
+      });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("1.2.3\n");
+      expect(result.stderr).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("validates the npm package allowlist without an embedded Node runtime", async () => {
+    const root = await temporaryDirectory();
+    const target = releaseTarget("macos-arm64");
+    try {
+      await createNpmPackageFixture(root, target);
+      const paths = await validateNpmPackage({
+        packageRoot: root,
+        target,
+        root: "/repo/source",
+      });
+      expect(paths).toEqual(expectedNpmPackagePaths(target));
+      expect(paths).toContain("licenses/OpenCode-SDK-LICENSE.txt");
+      expect(paths).not.toContain("runtime/node");
+      expect(paths).toContain("bin/codexhost");
+      expect(paths).toContain("libexec/codexhost-shim");
+      expect(paths).toContain("libexec/CodexHost.app/Contents/Info.plist");
+      expect(paths).toContain("libexec/CodexHost.app/Contents/MacOS/CodexHost");
+      expect(paths).toContain("libexec/CodexHost.app/Contents/PkgInfo");
+      expect(paths).toContain("libexec/CodexHost.app/Contents/Resources/AppIcon.icns");
+      expect(paths).not.toContain("libexec/codexhost-shell");
+      expect(expectedNpmPackagePaths(releaseTarget("windows-x64"))).toContain(
+        "libexec/codexhost-node-repl.exe",
+      );
+      expect(expectedNpmPackagePaths(releaseTarget("windows-x64"))).toContain(
+        "libexec/codexhost-shell.exe",
+      );
+      expect(expectedNpmPackagePaths(releaseTarget("linux-x64"))).not.toContain(
+        "libexec/codexhost-shell",
+      );
+      expect(paths).not.toContain("libexec/codexhost-node-repl");
+      expect(paths).toContain("libexec/codexhost-updater");
+      expect(paths).toContain("app/codexhost-distribution.json");
+      await mkdir(path.join(root, "runtime"), { recursive: true });
+      await writeFile(path.join(root, "runtime/node"), "unexpected");
+      await expect(
+        validateNpmPackage({ packageRoot: root, target, root: "/repo/source" }),
+      ).rejects.toThrow("non-allowlist files: runtime/node");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("validates the architecture-neutral meta package", async () => {
+    const root = await temporaryDirectory();
+    try {
+      await createNpmMetaPackageFixture(root);
+      expect(await validateNpmMetaPackage({ packageRoot: root })).toEqual(
+        expectedNpmMetaPackagePaths(),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "runtime/node",
+    "/opt/codexhost/runtime/node",
+    "runtime/node.exe",
+    String.raw`runtime\node.exe`,
+    String.raw`runtime\\node.exe`,
+  ])("rejects a private Node runtime reference: %s", async (reference) => {
+    const root = await temporaryDirectory();
+    const target = releaseTarget("macos-arm64");
+    try {
+      await createNpmPackageFixture(root, target);
+      await writeFile(path.join(root, "README.md"), `uses ${reference} for the private runtime\n`);
+      await expect(
+        validateNpmPackage({ packageRoot: root, target, root: "/repo/source" }),
+      ).rejects.toThrow("must not embed a private Node runtime");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("allows nested Host dependency source labels without confusing node_modules with Node", async () => {
+    const root = await temporaryDirectory();
+    const target = releaseTarget("linux-x64");
+    try {
+      await createNpmPackageFixture(root, target);
+      await writeFile(
+        path.join(root, "app", "host-runtime.mjs"),
+        "// packages/host-runtime/node_modules/@deepseek-ai/cordis/lib/index.js\n",
+      );
+      expect(await validateNpmPackage({ packageRoot: root, target, root: "/repo/source" })).toEqual(
+        expectedNpmPackagePaths(target),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps all published package names under the codexhost npm org", async () => {
+    const source = await readFile(
+      path.resolve(import.meta.dirname, "../../scripts/release/prepare-npm.mjs"),
+      "utf8",
+    );
+    expect(NPM_PACKAGE_NAME).toBe("@codexhost/cli");
+    expect(Object.values(NPM_PLATFORM_PACKAGE_NAMES)).toEqual([
+      "@codexhost/cli-darwin-arm64",
+      "@codexhost/cli-darwin-x64",
+      "@codexhost/cli-win32-x64",
+      "@codexhost/cli-win32-arm64",
+      "@codexhost/cli-linux-x64",
+      "@codexhost/cli-linux-arm64",
+    ]);
+    expect(source).toContain("publishConfig");
+    expect(source).toContain('access: "public"');
+  });
+
+  it("names npm tarballs with the release target so four matrix jobs do not collide", () => {
+    expect(npmTarballFileName({ version: "0.1.0", target: releaseTarget("macos-arm64") })).toBe(
+      "codexhost-cli-0.1.0-macos-arm64.tgz",
+    );
+    expect(npmTarballFileName({ version: "0.1.0", target: releaseTarget("windows-x64") })).toBe(
+      "codexhost-cli-0.1.0-windows-x64.tgz",
+    );
+    expect(npmTarballFileName({ version: "0.1.0", target: releaseTarget("linux-x64") })).toBe(
+      "codexhost-cli-0.1.0-linux-x64.tgz",
+    );
+    expect(npmTarballFileName({ version: "0.1.0", target: releaseTarget("linux-arm64") })).toBe(
+      "codexhost-cli-0.1.0-linux-arm64.tgz",
+    );
+  });
+});

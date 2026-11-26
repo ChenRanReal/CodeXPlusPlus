@@ -1,0 +1,4355 @@
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import { describe, expect, it, vi } from "vitest";
+import { CodexTurnProjector } from "@codexhost/protocol-core";
+import {
+  harnessModelRefSchema,
+  harnessPermissionModeIdSchema,
+  harnessThinkingOptionIdSchema,
+  hostItemIdSchema,
+  hostTurnIdSchema,
+  nativeCheckpointRefSchema,
+  nativeSessionRefSchema,
+  type HarnessThinkingOptionId,
+} from "@codexhost/shared-contracts";
+
+import type {
+  HarnessOutput,
+  HarnessSession,
+  HostQuestionInteraction,
+  HostUsage,
+} from "@codexhost/harness-adapter";
+import {
+  PiAdapter,
+  type PiAdapterDependencies,
+  type PiAdapterOptions,
+  type PiTurnTransport,
+} from "../src/pi-adapter.js";
+import {
+  gotgenesRecord,
+  gotgenesId,
+  type GotgenesRecord,
+  type GotgenesObservationOwner,
+} from "../src/pi-gotgenes-subagents.js";
+import { piWorkflowSubagentId } from "../src/pi-subagent-workflow.js";
+import {
+  piSubagentId,
+  type PiSubagentInspection,
+  type PiSubagentNode,
+} from "../src/pi-subagents.js";
+import { mapPiSnapshot, type PiSessionHistory } from "../src/pi-history.js";
+import type { PiUsageObservation } from "../src/pi-usage.js";
+import { encodePiModelRef } from "../src/pi-model-catalog.js";
+import type { PiNativeCommand } from "../src/pi-slash-commands.js";
+import {
+  PiRpcFaultError,
+  type PiAutonomousTurn,
+  type PiCompactResult,
+  type PiInteractionResponse,
+  type PiRpcSessionOptions,
+  type PiSessionState,
+  type PiTurnEvent,
+  type PiTurnResult,
+} from "../src/pi-rpc-session.js";
+
+class FakePiTransport implements PiTurnTransport {
+  readonly stderrTail = "Pi could not read ~/.pi/agent/settings.json";
+  autonomousHandler: ((turn: PiAutonomousTurn) => void) | null = null;
+  readonly setAutonomousTurnHandler = vi.fn((handler: (turn: PiAutonomousTurn) => void) => {
+    this.autonomousHandler = handler;
+  });
+  usageHandler: ((observation: PiUsageObservation) => void) | null = null;
+  readonly setUsageHandler = vi.fn((handler: (observation: PiUsageObservation) => void) => {
+    this.usageHandler = handler;
+  });
+  state: PiSessionState = {
+    sessionId: "pi-session-1",
+    sessionFile: "/synthetic/pi-session.jsonl",
+    provider: "synthetic-provider",
+    modelId: "synthetic-model",
+    thinkingLevel: harnessThinkingOptionIdSchema.parse("high"),
+    contextUsage: { contextUsedTokens: 40, contextWindowTokens: 200 },
+  };
+  gotgenesHandler: ((runs: GotgenesRecord[], owner: GotgenesObservationOwner) => void) | undefined;
+  readonly setGotgenesStatusHandler = vi.fn(
+    (handler: (runs: GotgenesRecord[], owner: GotgenesObservationOwner) => void) => {
+      this.gotgenesHandler = handler;
+    },
+  );
+  subagentHandler: ((runs: PiSubagentNode[]) => void) | undefined;
+  readonly setSubagentStatusHandler = vi.fn((handler: (runs: PiSubagentNode[]) => void) => {
+    this.subagentHandler = handler;
+  });
+  readonly inspectSubagent = vi.fn(async (): Promise<PiSubagentInspection> => ({
+    kind: "pi-subagents.inspect-reply",
+    version: 1,
+    requestId: "request",
+    asyncId: "run-1",
+    status: "complete",
+    finalOutput: "child answer",
+  }));
+  readonly abort = vi.fn(async () => undefined);
+  readonly respondToInteraction = vi.fn(async (response: PiInteractionResponse) => {
+    this.event({
+      type: "interaction.closed",
+      requestId: response.requestId,
+      reason: "cancelled" in response ? "cancelled" : "responded",
+    });
+  });
+  readonly start = vi.fn(async () => undefined);
+  readonly getCommands = vi.fn(async (): Promise<PiNativeCommand[]> => []);
+  readonly supportsFastMode = vi.fn(async () => false);
+  readonly selectFastMode = vi.fn(async (enabled: boolean) => {
+    this.state = { ...this.state, fast: enabled };
+    return this.state;
+  });
+  readonly getAvailableModels = vi.fn(async () => [
+    {
+      provider: "synthetic-provider",
+      id: "synthetic-model",
+      reasoning: true,
+      api: "openai-codex-responses",
+    },
+    {
+      provider: "synthetic-provider",
+      id: "alternate-model",
+      reasoning: false,
+      api: "openai-codex-responses",
+    },
+  ]);
+  readonly getAvailableThinkingLevels = vi.fn<() => Promise<HarnessThinkingOptionId[] | null>>(
+    async () =>
+      this.state.modelId === "alternate-model"
+        ? [harnessThinkingOptionIdSchema.parse("off"), harnessThinkingOptionIdSchema.parse("low")]
+        : [
+            harnessThinkingOptionIdSchema.parse("off"),
+            harnessThinkingOptionIdSchema.parse("low"),
+            harnessThinkingOptionIdSchema.parse("high"),
+          ],
+  );
+  readonly getEntries = vi.fn(async (): Promise<PiSessionHistory> => structuredClone(this.history));
+  readonly getSessionUsage = vi.fn(async (): Promise<HostUsage | null> =>
+    this.usage === null ? null : structuredClone(this.usage),
+  );
+  readonly fork = vi.fn(async (entryId: string) => {
+    const cutoff = this.history.entries.findIndex((entry) => entry.id === entryId);
+    if (cutoff < 0) throw new Error("Unknown synthetic Fork Entry");
+    this.history.entries = this.history.entries.slice(0, cutoff);
+    this.history.leafId =
+      typeof this.history.entries.at(-1)?.id === "string"
+        ? (this.history.entries.at(-1)?.id as string)
+        : null;
+    return this.deriveState();
+  });
+  readonly clone = vi.fn(async () => this.deriveState());
+  readonly verifySessionCwd = vi.fn(async () => undefined);
+  readonly selectModel = vi.fn(async (model: { provider: string; id: string }) => {
+    this.state = {
+      ...this.state,
+      fast: false,
+      provider: model.provider,
+      modelId: model.id,
+      ...(model.id === "alternate-model"
+        ? { thinkingLevel: harnessThinkingOptionIdSchema.parse("low") }
+        : {}),
+    };
+    return this.state;
+  });
+  readonly selectThinkingOption = vi.fn(async (thinkingOptionId: HarnessThinkingOptionId) => {
+    const available = (await this.getAvailableThinkingLevels()) ?? [
+      harnessThinkingOptionIdSchema.parse("off"),
+    ];
+    const effective = available.includes(thinkingOptionId)
+      ? thinkingOptionId
+      : (available.at(-1) ?? harnessThinkingOptionIdSchema.parse("off"));
+    this.state = { ...this.state, thinkingLevel: effective };
+    return this.state;
+  });
+  readonly close = vi.fn(async () => {
+    this.fail(new Error("Fake Pi transport closed"));
+  });
+  readonly compact = vi.fn(
+    async (
+      customInstructions: string | undefined,
+      onEvent: (event: PiTurnEvent) => void,
+    ): Promise<PiCompactResult> => {
+      void customInstructions;
+      onEvent({ type: "compaction.started" });
+      onEvent({ type: "compaction.completed", outcome: "succeeded" });
+      return { outcome: "succeeded" };
+    },
+  );
+  readonly steer = vi.fn(async () => undefined);
+  readonly runTurn = vi.fn((text: string, onEvent: (event: PiTurnEvent) => void) => {
+    this.text = text;
+    this.onEvent = onEvent;
+    return new Promise<PiTurnResult>((resolve, reject) => {
+      this.resolveTurn = resolve;
+      this.rejectTurn = reject;
+    });
+  });
+  history: PiSessionHistory = { entries: [], leafId: null };
+  onEvent: ((event: PiTurnEvent) => void) | null = null;
+  assistantMessageId: string | null = null;
+  assistantMessageOrdinal = 0;
+  options: PiRpcSessionOptions | null = null;
+  rejectTurn: ((error: Error) => void) | null = null;
+  resolveTurn: ((value: PiTurnResult) => void) | null = null;
+  text: string | null = null;
+  usage: HostUsage | null = {
+    inputTokens: 20,
+    outputTokens: 10,
+    totalTokens: 30,
+    contextUsedTokens: 40,
+    contextWindowTokens: 200,
+  };
+
+  event(event: PiTurnEvent): void {
+    if (!this.onEvent) throw new Error("No active fake Pi Turn");
+    this.onEvent(event);
+  }
+
+  autonomous(turn: PiAutonomousTurn): void {
+    if (!this.autonomousHandler) throw new Error("No autonomous Pi Turn handler");
+    if (!turn.nativeTurnKey) throw new Error("Fake autonomous Turn has no native Entry");
+    this.history.entries.push(
+      {
+        id: turn.nativeTurnKey,
+        parentId: this.history.leafId,
+        type: "custom_message",
+        customType: "intercom_message",
+        content: "background result",
+        display: false,
+      },
+      {
+        id: `${turn.nativeTurnKey}-answer`,
+        parentId: turn.nativeTurnKey,
+        type: "message",
+        message: {
+          role: "assistant",
+          content: turn.result.text,
+          stopReason:
+            turn.result.status === "cancelled"
+              ? "aborted"
+              : turn.result.status === "failed"
+                ? "error"
+                : "stop",
+        },
+      },
+    );
+    this.history.leafId = `${turn.nativeTurnKey}-answer`;
+    this.autonomousHandler(turn);
+  }
+
+  delta(text: string, messageId?: string): void {
+    if (messageId) {
+      this.assistantMessageId = messageId;
+    } else if (this.assistantMessageId === null) {
+      this.assistantMessageOrdinal += 1;
+      this.assistantMessageId = `synthetic-message-${this.assistantMessageOrdinal}`;
+    }
+    if (!this.assistantMessageId) throw new Error("No fake Assistant message identity");
+    this.event({ type: "text.delta", messageId: this.assistantMessageId, delta: text });
+  }
+
+  message(text: string): void {
+    this.assistantMessageOrdinal += 1;
+    this.delta(text, `synthetic-message-${this.assistantMessageOrdinal}`);
+    this.assistantMessageId = null;
+  }
+
+  succeed(text: string, cancelled = false): void {
+    if (!this.resolveTurn || this.text === null) throw new Error("No active fake Pi Turn");
+    this.assistantMessageId = null;
+    const ordinal = this.history.entries.filter(
+      (entry) =>
+        entry.type === "message" &&
+        (entry.message as { role?: unknown } | undefined)?.role === "user",
+    ).length;
+    const userId = `synthetic-user-${ordinal + 1}`;
+    const assistantId = `synthetic-assistant-${ordinal + 1}`;
+    this.history.entries.push(
+      {
+        id: userId,
+        parentId: this.history.leafId,
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: this.text }] },
+      },
+      {
+        id: assistantId,
+        parentId: userId,
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text }],
+          stopReason: cancelled ? "aborted" : "stop",
+        },
+      },
+    );
+    this.history.leafId = assistantId;
+    this.resolveTurn({ text, cancelled });
+    this.resetTurn();
+  }
+
+  fail(error: Error): void {
+    if (!this.rejectTurn) return;
+    this.rejectTurn(error);
+    this.resetTurn();
+  }
+
+  fault(error: PiRpcFaultError): void {
+    this.fail(error);
+    this.options?.onFault?.(error);
+  }
+
+  private deriveState(): PiSessionState {
+    this.state = {
+      ...this.state,
+      sessionId: `${this.state.sessionId}-derived`,
+      sessionFile: `${this.state.sessionFile}.derived`,
+    };
+    return this.state;
+  }
+
+  private resetTurn(): void {
+    this.onEvent = null;
+    this.assistantMessageId = null;
+    this.rejectTurn = null;
+    this.resolveTurn = null;
+  }
+}
+
+function fixture(options: PiAdapterOptions = {}) {
+  const transports: FakePiTransport[] = [];
+  const dependencies: PiAdapterDependencies = {
+    createTransport: vi.fn((sessionOptions) => {
+      const transport = new FakePiTransport();
+      transport.options = sessionOptions;
+      if (sessionOptions.model) {
+        transport.state = {
+          ...transport.state,
+          provider: sessionOptions.model.provider,
+          modelId: sessionOptions.model.id,
+          thinkingLevel:
+            sessionOptions.model.id === "alternate-model"
+              ? harnessThinkingOptionIdSchema.parse("low")
+              : transport.state.thinkingLevel,
+        };
+      }
+      transports.push(transport);
+      return transport;
+    }),
+  };
+  const adapter = new PiAdapter(options, dependencies);
+  return { adapter, dependencies, transports };
+}
+
+function sourceHistory(turnCount = 2): PiSessionHistory {
+  const entries: PiSessionHistory["entries"] = [];
+  let parentId: string | null = null;
+  for (let index = 1; index <= turnCount; index += 1) {
+    const userId = `source-user-${index}`;
+    const assistantId = `source-assistant-${index}`;
+    entries.push(
+      {
+        id: userId,
+        parentId,
+        type: "message",
+        message: { role: "user", content: [{ type: "text", text: `question ${index}` }] },
+      },
+      {
+        id: assistantId,
+        parentId: userId,
+        type: "message",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: `answer ${index}` }],
+        },
+      },
+    );
+    parentId = assistantId;
+  }
+  return { entries, leafId: parentId };
+}
+
+async function openSession(
+  adapter: PiAdapter,
+  environment?: NodeJS.ProcessEnv,
+): Promise<HarnessSession> {
+  const result = await adapter.open({
+    kind: "create",
+    cwd: "/synthetic",
+    ...(environment ? { environment } : {}),
+  });
+  if (!result.ok) throw new Error(result.error.message);
+  return result.value;
+}
+
+function textTurn(id: string) {
+  return {
+    type: "turn.start" as const,
+    turnId: hostTurnIdSchema.parse(id),
+    input: [{ type: "text" as const, text: id }],
+  };
+}
+
+function cancelTurn(id: string) {
+  return { type: "turn.cancel" as const, turnId: hostTurnIdSchema.parse(id) };
+}
+
+function autonomousTurn(
+  nativeTurnKey: string,
+  result: PiAutonomousTurn["result"] = { status: "succeeded", text: "autonomous answer" },
+): PiAutonomousTurn {
+  return {
+    nativeTurnKey,
+    events: [
+      { type: "text.delta", messageId: nativeTurnKey, delta: "autonomous answer" },
+      { type: "message.completed", messageId: nativeTurnKey },
+    ],
+    result,
+  };
+}
+
+function isUsageMetering(output: HarnessOutput): boolean {
+  return (
+    output.kind === "event" &&
+    (output.event.type === "usage.request" || output.event.type === "usage.history")
+  );
+}
+
+/** Lifecycle assertions skip Host usage metering events, which have their own tests. */
+async function nextOutput(iterator: AsyncIterator<HarnessOutput>): Promise<HarnessOutput> {
+  for (;;) {
+    const result = await iterator.next();
+    if (result.done) throw new Error("Harness output stream ended unexpectedly");
+    if (!isUsageMetering(result.value)) return result.value;
+  }
+}
+
+async function nextEvent(iterator: AsyncIterator<HarnessOutput>) {
+  const output = await nextOutput(iterator);
+  if (output.kind !== "event") throw new Error("Expected a Harness event output");
+  return output.event;
+}
+
+async function nextInteraction(
+  iterator: AsyncIterator<HarnessOutput>,
+): Promise<HostQuestionInteraction> {
+  const output = await nextOutput(iterator);
+  if (output.kind !== "interaction" || output.interaction.type !== "question") {
+    throw new Error("Expected a Harness Question output");
+  }
+  return output.interaction;
+}
+
+describe("Pi adapter credential imports wiring", () => {
+  it("exposes the read-only other-logins listing through the adapter, not just the inner module", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-others-"));
+    try {
+      await writeFile(
+        path.join(directory, "auth.json"),
+        JSON.stringify({ anthropic: { type: "oauth", access: "a-secret" } }),
+      );
+      const adapter = new PiAdapter({ environment: { PI_CODING_AGENT_DIR: directory } });
+      expect(await adapter.credentialImports.listOthers?.()).toEqual([
+        { provider: "anthropic", type: "oauth" },
+      ]);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Pi HarnessAdapter Session", () => {
+  it("publishes native progress as commentary once without making it the Assistant answer", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("progress-turn"));
+    const projector = new CodexTurnProjector({
+      threadId: "pi-thread",
+      turnId: hostTurnIdSchema.parse("progress-turn"),
+      cwd: "/synthetic",
+      startedAtMs: 0,
+    });
+    const transport = transports[0];
+    if (!transport) throw new Error("Missing transport");
+    transport.delta("Actual answer", "final-message");
+    transport.event({
+      type: "message.completed",
+      messageId: "final-message",
+      phase: "final_answer",
+    });
+    const notice = {
+      type: "progress.message" as const,
+      itemId: hostItemIdSchema.parse("pi-notice-stable"),
+      text: "Pi notification\n\nProcess completed",
+    };
+    transport.event(notice);
+    transport.event(notice);
+    transport.succeed("Actual answer");
+    const completed = [];
+    const projectedCompleted: unknown[] = [];
+    for (;;) {
+      const event = await nextEvent(iterator);
+      if (event.type === "item.completed" && event.snapshot.item.type === "agentMessage")
+        completed.push(event.snapshot.item);
+      if (
+        [
+          "turn.started",
+          "item.started",
+          "item.updated",
+          "item.completed",
+          "turn.completed",
+        ].includes(event.type)
+      ) {
+        for (const frame of projector.project(event as Parameters<CodexTurnProjector["project"]>[0])
+          .messages) {
+          if (frame.method === "item/completed") projectedCompleted.push(frame.params);
+        }
+      }
+      if (event.type === "turn.completed") break;
+    }
+    expect(completed.filter((item) => item.itemId === notice.itemId)).toEqual([
+      { type: "agentMessage", itemId: notice.itemId, text: notice.text, phase: "commentary" },
+    ]);
+    expect(completed.find((item) => item.text === "Actual answer")).toHaveProperty(
+      "phase",
+      "final_answer",
+    );
+    expect(projectedCompleted).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          item: expect.objectContaining({ text: "Actual answer", phase: "final_answer" }),
+        }),
+        expect.objectContaining({
+          item: expect.objectContaining({ text: notice.text, phase: "commentary" }),
+        }),
+      ]),
+    );
+    await session.close();
+  });
+
+  it("routes gotgenes service states to native cards and reads a running child's real transcript", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "pi-gotgenes-live-"));
+    const file = path.join(directory, "child.jsonl");
+    const { adapter, transports } = fixture();
+    try {
+      await writeFile(
+        file,
+        [
+          {
+            type: "session",
+            version: 3,
+            id: "child-session",
+            parentSession: "pi-session-1",
+            cwd: "/synthetic",
+          },
+          {
+            type: "message",
+            id: "child-user",
+            parentId: null,
+            message: { role: "user", content: "Inspect", timestamp: 1 },
+          },
+          {
+            type: "message",
+            id: "child-answer",
+            parentId: "child-user",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Live child evidence" }],
+              stopReason: "stop",
+              timestamp: 2,
+            },
+          },
+        ]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n") + "\n",
+      );
+      const session = await openSession(adapter);
+      const output = session.outputs[Symbol.asyncIterator]();
+      await session.execute(textTurn("gotgenes-turn"));
+      const transport = transports[0];
+      if (!transport) throw new Error("Missing transport");
+      transport.event({
+        type: "tool.started",
+        callId: "call",
+        toolName: "subagent",
+        arguments: { description: "Review changes" },
+      });
+      const native = {
+        id: "real-child-id",
+        type: "Explore",
+        description: "Review changes",
+        status: "running",
+        isBackground: true,
+        outputFile: file,
+        toolUses: 2,
+      };
+      const running = gotgenesRecord(native);
+      if (!running) throw new Error("Invalid native fixture");
+      transport.gotgenesHandler?.([running], "requested");
+      transport.event({
+        type: "tool.completed",
+        callId: "call",
+        toolName: "subagent",
+        isError: false,
+        result: {
+          details: {
+            agentId: native.id,
+            displayName: "Explore",
+            subagentType: "Explore",
+            description: native.description,
+            status: "background",
+            modelName: "provider/model",
+          },
+        },
+      });
+      const parent = nativeSessionRefSchema.parse({
+        harnessId: "pi",
+        nativeSessionId: "pi-session-1",
+        formatVersion: 1,
+        locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+      });
+      const read = await adapter.subagents.readSnapshot({
+        parent,
+        nativeSubagentId: gotgenesId(native.id),
+        cwd: "/synthetic",
+      });
+      expect(read).toMatchObject({ ok: true });
+      expect(JSON.stringify(read)).toContain("Live child evidence");
+      expect(transport.inspectSubagent).not.toHaveBeenCalled();
+      const completed = gotgenesRecord({ ...native, status: "completed", result: "Done" });
+      if (!completed) throw new Error("Invalid native fixture");
+      transport.gotgenesHandler?.([completed], "requested");
+      transport.succeed("Parent done");
+      const events = [];
+      for (;;) {
+        const event = await nextEvent(output);
+        events.push(event);
+        if (event.type === "turn.completed") break;
+      }
+      expect(
+        events.filter(
+          (event) => event.type === "item.started" && event.item.type === "subagentDelegation",
+        ),
+      ).toHaveLength(1);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "item.completed",
+          snapshot: {
+            item: expect.objectContaining({
+              type: "subagentDelegation",
+              subagents: [
+                expect.objectContaining({
+                  description: "Review changes",
+                  status: "completed",
+                  model: "provider/model",
+                  resultSummary: "Done",
+                }),
+              ],
+            }),
+            outcome: { status: "succeeded" },
+          },
+        }),
+      );
+      expect(transports).toHaveLength(1);
+    } finally {
+      await adapter.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("maps synchronous workflow partial results and reads the final child through the live parent", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const output = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("workflow-turn"));
+    const transport = transports[0];
+    if (!transport) throw new Error("Missing transport");
+    const details = (state: string) => ({
+      mode: "workflow",
+      runId: "parent-call",
+      workflowChildren: {
+        version: 1,
+        parentToolCallId: "parent-call",
+        workflowRunId: "parent-call",
+        inventoryComplete: state !== "running",
+        workflowState: state,
+        children: [{ childId: "review", agent: "delegate", state }],
+      },
+      results: [{ workflowKey: "review", finalOutput: "child failed validation", exitCode: 1 }],
+    });
+    transport.event({
+      type: "tool.started",
+      callId: "parent-call",
+      toolName: "subagent",
+      arguments: { async: false, workflowScript: "..." },
+    });
+    transport.event({
+      type: "tool.updated",
+      callId: "parent-call",
+      output: { details: details("running") },
+    });
+    transport.event({
+      type: "tool.completed",
+      callId: "parent-call",
+      toolName: "subagent",
+      isError: true,
+      result: { details: details("failed") },
+    });
+    transport.succeed("review failed");
+    const events = [];
+    for (;;) {
+      const event = await nextEvent(output);
+      events.push(event);
+      if (event.type === "turn.completed") break;
+    }
+    expect(
+      events.filter(
+        (event) => event.type === "item.started" && event.item.type === "subagentDelegation",
+      ),
+    ).toHaveLength(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "item.completed",
+        snapshot: {
+          item: expect.objectContaining({
+            type: "subagentDelegation",
+            subagents: [expect.objectContaining({ status: "failed" })],
+          }),
+          outcome: { status: "succeeded" },
+        },
+      }),
+    );
+    transport.history.entries.push({
+      id: "workflow-result",
+      parentId: transport.history.leafId,
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "subagent",
+        toolCallId: "parent-call",
+        isError: true,
+        details: details("failed"),
+      },
+    });
+    transport.history.leafId = "workflow-result";
+    const parent = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "pi-session-1",
+      formatVersion: 1,
+      locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+    });
+    const read = await adapter.subagents.readSnapshot({
+      parent,
+      nativeSubagentId: piWorkflowSubagentId({ workflowRunId: "parent-call", childId: "review" }),
+      cwd: "/synthetic",
+    });
+    expect(read).toMatchObject({ ok: true });
+    expect(JSON.stringify(read)).toContain("child failed validation");
+    expect(transport.inspectSubagent).not.toHaveBeenCalled();
+    expect(transports).toHaveLength(1);
+    await adapter.close();
+  });
+
+  it("projects asynchronous child cards and preserves running children after parent cancellation", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const output = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("subagent-turn"));
+    const transport = transports[0];
+    if (!transport) throw new Error("Missing transport");
+    transport.subagentHandler?.([
+      { id: "run-1", kind: "subagent", label: "reviewer", state: "running" },
+    ]);
+    transport.event({
+      type: "tool.started",
+      callId: "call",
+      toolName: "subagent",
+      arguments: { agent: "reviewer", task: "review", async: true },
+    });
+    transport.event({
+      type: "tool.completed",
+      callId: "call",
+      toolName: "subagent",
+      isError: false,
+      result: {
+        details: { mode: "single", asyncId: "run-1", asyncDir: "/tmp/run-1", results: [] },
+      },
+    });
+    transport.succeed("launched", true);
+    const events = [];
+    for (;;) {
+      const event = await nextEvent(output);
+      events.push(event);
+      if (event.type === "turn.completed") break;
+    }
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "item.completed",
+        snapshot: {
+          item: expect.objectContaining({
+            type: "subagentDelegation",
+            subagents: [expect.objectContaining({ status: "running" })],
+          }),
+          outcome: { status: "succeeded" },
+        },
+      }),
+    );
+    transport.subagentHandler?.([
+      { id: "run-1", kind: "subagent", label: "reviewer", state: "complete" },
+    ]);
+    for (;;) {
+      const event = await nextEvent(output);
+      if (event.type === "subagent.state.changed") {
+        expect(event.status).toBe("completed");
+        break;
+      }
+    }
+    await adapter.close();
+  });
+
+  it("restores child cards whose status artifact records the parent's session file", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "pi-adapter-subagent-"));
+    const { adapter, transports } = fixture();
+    try {
+      const asyncDir = path.join(dir, "run-1");
+      await mkdir(asyncDir);
+      await writeFile(
+        path.join(asyncDir, "status.json"),
+        JSON.stringify({
+          lifecycleArtifactVersion: 3,
+          runId: "run-1",
+          sessionId: "/synthetic/pi-session.jsonl",
+          mode: "single",
+          state: "complete",
+          steps: [{ agent: "reviewer", status: "completed" }],
+        }),
+      );
+      const session = await openSession(adapter);
+      await session.readSnapshot();
+      const transport = transports[0];
+      if (!transport) throw new Error("Missing transport");
+      transport.history = {
+        leafId: "result",
+        entries: [
+          {
+            id: "user",
+            parentId: null,
+            type: "message",
+            message: { role: "user", content: [{ type: "text", text: "review" }] },
+          },
+          {
+            id: "assistant",
+            parentId: "user",
+            type: "message",
+            message: {
+              role: "assistant",
+              stopReason: "toolUse",
+              content: [
+                {
+                  type: "toolCall",
+                  id: "call",
+                  name: "subagent",
+                  arguments: { agent: "reviewer", task: "review", async: true },
+                },
+              ],
+            },
+          },
+          {
+            id: "result",
+            parentId: "assistant",
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolCallId: "call",
+              toolName: "subagent",
+              isError: false,
+              content: [{ type: "text", text: "launched" }],
+              details: { mode: "single", asyncId: "run-1", asyncDir },
+            },
+          },
+        ],
+      };
+      const snapshot = await session.readSnapshot();
+      expect(snapshot).toMatchObject({ ok: true });
+      if (!snapshot.ok) throw new Error(snapshot.error.message);
+      expect(snapshot.value.turns.flatMap((turn) => turn.items)).toContainEqual(
+        expect.objectContaining({
+          item: expect.objectContaining({
+            type: "subagentDelegation",
+            subagents: [expect.objectContaining({ status: "completed" })],
+          }),
+        }),
+      );
+    } finally {
+      await adapter.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a live parent's child without opening another Pi process and rejects a different cwd", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    await session.readSnapshot();
+    const parent = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "pi-session-1",
+      formatVersion: 1,
+      locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+    });
+    const nativeSubagentId = piSubagentId({ runId: "run-1" });
+    const result = await adapter.subagents.readSnapshot({
+      parent,
+      nativeSubagentId,
+      cwd: "/synthetic",
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      value: { turns: [{ items: [{ item: { text: "child answer" } }] }] },
+    });
+    expect(transports).toHaveLength(1);
+    expect(
+      await adapter.subagents.readSnapshot({ parent, nativeSubagentId, cwd: "/foreign" }),
+    ).toMatchObject({ ok: false });
+    expect(transports[0]?.inspectSubagent).toHaveBeenCalledTimes(1);
+    await adapter.close();
+  });
+
+  it("reports a missing executable as not installed", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.start.mockRejectedValueOnce(
+        Object.assign(new Error("spawn pi ENOENT"), { code: "ENOENT" }),
+      );
+      transports.push(transport);
+      return transport;
+    });
+
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "notInstalled",
+      error: { code: "notInstalled", retryable: false, stage: "startup" },
+    });
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("inspects the native catalog through an ephemeral transport and closes it", async () => {
+    const { adapter, dependencies, transports } = fixture();
+
+    await expect(adapter.inspect({ cwd: "/synthetic", refresh: true })).resolves.toMatchObject({
+      status: "ready",
+      catalog: {
+        models: [
+          { label: "synthetic-provider / alternate-model" },
+          { label: "synthetic-provider / synthetic-model" },
+        ],
+        defaultModel: encodePiModelRef({
+          provider: "synthetic-provider",
+          id: "synthetic-model",
+        }),
+        thinkingOptions: [
+          { id: "off", label: "Off" },
+          { id: "minimal", label: "Minimal" },
+          { id: "low", label: "Low" },
+          { id: "medium", label: "Medium" },
+          { id: "high", label: "High" },
+          { id: "xhigh", label: "Extra High" },
+          { id: "max", label: "Max" },
+        ],
+        defaultThinkingOptionId: "high",
+      },
+      capabilities: {
+        configuration: { selectModel: true, selectThinkingOption: true },
+        history: { fork: true, forkAcrossCwd: true, rollbackLastTurn: true },
+        autonomousTurns: { observe: true },
+      },
+    });
+    expect(dependencies.createTransport).toHaveBeenCalledOnce();
+    expect(transports[0]?.getAvailableModels).toHaveBeenCalledOnce();
+    expect(transports[0]?.getAvailableThinkingLevels).toHaveBeenCalledOnce();
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("inspects an effective Model that Pi does not list as available", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce(() => {
+      const transport = new FakePiTransport();
+      transport.state = {
+        ...transport.state,
+        provider: "synthetic-provider",
+        modelId: "retired-model",
+        modelReasoning: true,
+      };
+      transports.push(transport);
+      return transport;
+    });
+
+    const inspection = await adapter.inspect({ cwd: "/synthetic", refresh: true });
+    if (inspection.status !== "ready") throw new Error(inspection.error.message);
+    expect(inspection.catalog.models.map(({ label }) => label)).toEqual([
+      "synthetic-provider / alternate-model",
+      "synthetic-provider / retired-model",
+      "synthetic-provider / synthetic-model",
+    ]);
+    expect(inspection.catalog.defaultModel).toEqual(
+      encodePiModelRef({ provider: "synthetic-provider", id: "retired-model" }),
+    );
+    expect(
+      inspection.catalog.models.find((model) => model.label.endsWith("retired-model"))
+        ?.supportedThinkingOptionIds,
+    ).toContain("high");
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("infers reasoning for an unlisted effective Model when modelReasoning is omitted but thinking is active", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce(() => {
+      const transport = new FakePiTransport();
+      transport.state = {
+        ...transport.state,
+        provider: "synthetic-provider",
+        modelId: "unlisted-model",
+        thinkingLevel: harnessThinkingOptionIdSchema.parse("high"),
+      };
+      transports.push(transport);
+      return transport;
+    });
+
+    const inspection = await adapter.inspect({ cwd: "/synthetic", refresh: true });
+    if (inspection.status !== "ready") throw new Error(inspection.error.message);
+    const unlisted = inspection.catalog.models.find((model) =>
+      model.label.endsWith("unlisted-model"),
+    );
+    expect(unlisted?.supportedThinkingOptionIds).toContain("high");
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it.each(
+    ["openai-codex-responses", "openai-responses"].flatMap((api) =>
+      [false, true].map((liveSelection) => ({ api, liveSelection })),
+    ),
+  )("supports Fast ($api, uncached: $liveSelection)", async ({ api, liveSelection }) => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "pi-fast-adapter-"));
+    let fastAvailable = true;
+    const transports: FakePiTransport[] = [];
+    const adapter = new PiAdapter(
+      { environment: { HOME: home } },
+      {
+        createTransport: () => {
+          const transport = new FakePiTransport();
+          transport.state.modelId = "synthetic-GPT-model";
+          transport.getAvailableModels.mockResolvedValue([
+            { provider: "synthetic-provider", id: "synthetic-GPT-model", reasoning: true, api },
+            { provider: "synthetic-provider", id: "alternate-model", reasoning: false, api },
+          ]);
+          transport.supportsFastMode.mockImplementation(async () => fastAvailable);
+          transport.getCommands.mockResolvedValue([
+            {
+              name: "codexhost-fast-mode",
+              description: "Internal Fast command",
+              source: "extension",
+            },
+          ]);
+          transports.push(transport);
+          return transport;
+        },
+      },
+    );
+    try {
+      const inspection = await adapter.inspect({ cwd: home });
+      if (inspection.status !== "ready") throw new Error("Inspection failed");
+      const base = encodePiModelRef({
+        provider: "synthetic-provider",
+        id: "synthetic-GPT-model",
+      });
+      const fast = inspection.catalog.models.find((model) => model.ref.id === base.id)?.fastModel;
+      if (!fast) throw new Error("Missing Fast choice");
+      expect(
+        inspection.catalog.models.find((model) => model.label.endsWith("alternate-model"))
+          ?.fastModel,
+      ).toBeUndefined();
+      await adapter.inspect({ cwd: home });
+      expect(transports).toHaveLength(1);
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: liveSelection ? path.join(home, "uninspected-project") : home,
+        model: liveSelection ? base : fast,
+      });
+      if (!opened.ok) throw new Error("Create failed");
+      const session = opened.value;
+      await session.readSnapshot();
+      if (liveSelection) {
+        expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+          ok: true,
+        });
+      }
+      // Capability checks must reuse the running Session, not spawn an inspection process.
+      expect(transports).toHaveLength(2);
+      const snapshot = await session.readSnapshot();
+      expect(snapshot).toMatchObject({ ok: true, value: { state: { effectiveModel: fast } } });
+      const live = transports[1];
+      if (!live) throw new Error("Missing live transport");
+      expect(live.selectFastMode).toHaveBeenCalledWith(true);
+      expect(JSON.stringify(await session.commands?.list())).not.toContain("codexhost-fast-mode");
+      expect(live.selectModel).not.toHaveBeenCalled();
+      expect(await session.execute({ type: "model.select", model: base })).toMatchObject({
+        ok: true,
+      });
+      expect(live.selectFastMode).toHaveBeenLastCalledWith(false);
+      live.selectFastMode.mockClear();
+      if (liveSelection) {
+        live.supportsFastMode.mockResolvedValueOnce(false);
+        expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+          ok: false,
+        });
+        // A different workspace need not expose the Model advertised by the picker's catalog.
+        live.getAvailableModels.mockResolvedValueOnce([]);
+        expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+          ok: false,
+        });
+        expect(live.selectFastMode).not.toHaveBeenCalled();
+
+        let finishInspection!: () => void;
+        live.getAvailableModels.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishInspection = () => resolve([]);
+            }),
+        );
+        const selecting = session.execute({ type: "model.select", model: fast });
+        await vi.waitFor(() => expect(finishInspection).toBeDefined());
+        expect(await session.execute({ type: "model.select", model: base })).toMatchObject({
+          ok: false,
+          error: { code: "sessionBusy" },
+        });
+        finishInspection();
+        expect(await selecting).toMatchObject({ ok: false });
+        expect(transports).toHaveLength(2);
+      }
+      live.getAvailableThinkingLevels.mockRejectedValueOnce(new Error("Thinking discovery failed"));
+      expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+        ok: false,
+      });
+      expect(live.selectFastMode).not.toHaveBeenCalled();
+      expect(live.state.fast).toBe(false);
+      expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+        ok: true,
+      });
+      expect(live.selectModel).not.toHaveBeenCalled();
+      expect(live.state.thinkingLevel).toBe("high");
+      const invalid = encodePiModelRef({
+        provider: "synthetic-provider",
+        id: "alternate-model",
+        fast: true,
+      });
+      expect(await session.execute({ type: "model.select", model: invalid })).toMatchObject({
+        ok: false,
+      });
+      expect(
+        await session.execute({
+          type: "model.select",
+          model: encodePiModelRef({ provider: "synthetic-provider", id: "alternate-model" }),
+        }),
+      ).toMatchObject({ ok: true });
+      expect(live.state.fast).toBe(false);
+      const resumed = await adapter.open({
+        kind: "resume",
+        cwd: home,
+        model: fast,
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "pi",
+          nativeSessionId: "pi-session-1",
+          locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+          formatVersion: 1,
+        }),
+      });
+      expect(resumed).toMatchObject({
+        ok: true,
+        value: { initialState: { effectiveModel: fast } },
+      });
+      fastAvailable = false;
+      await adapter.inspect({ cwd: home, refresh: true });
+      const restoredWithoutSupport = await adapter.open({
+        kind: "resume",
+        cwd: home,
+        model: fast,
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "pi",
+          nativeSessionId: "pi-session-1",
+          locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+          formatVersion: 1,
+        }),
+      });
+      expect(restoredWithoutSupport).toMatchObject({
+        ok: true,
+        value: { initialState: { effectiveModel: base } },
+      });
+      expect(await adapter.open({ kind: "create", cwd: home, model: fast })).toMatchObject({
+        ok: false,
+        error: { code: "unsupported" },
+      });
+    } finally {
+      await adapter.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("caches successful inspection by cwd, coalesces requests, and honors refresh", async () => {
+    const { adapter, dependencies } = fixture();
+
+    const first = adapter.inspect({ cwd: "/synthetic" });
+    const concurrent = adapter.inspect({ cwd: "/synthetic" });
+    await expect(Promise.all([first, concurrent])).resolves.toEqual([
+      expect.objectContaining({ status: "ready" }),
+      expect.objectContaining({ status: "ready" }),
+    ]);
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+    });
+    expect(dependencies.createTransport).toHaveBeenCalledTimes(1);
+
+    await expect(adapter.inspect({ cwd: "/synthetic", refresh: true })).resolves.toMatchObject({
+      status: "ready",
+    });
+    await expect(adapter.inspect({ cwd: "/other" })).resolves.toMatchObject({ status: "ready" });
+    expect(dependencies.createTransport).toHaveBeenCalledTimes(3);
+    await adapter.close();
+  });
+
+  it("does not publish Thinking support from an older cwd after a refresh", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const pending = Promise.withResolvers<null>();
+    const stale = adapter.inspect({ cwd: "/synthetic" });
+    transports[0]?.getAvailableThinkingLevels.mockReturnValueOnce(pending.promise);
+
+    const refreshed = await adapter.inspect({ cwd: "/other", refresh: true });
+    expect(refreshed).toMatchObject({
+      status: "ready",
+      capabilities: { configuration: { selectThinkingOption: true } },
+    });
+    pending.resolve(null);
+    await expect(stale).resolves.toMatchObject({
+      status: "ready",
+      capabilities: { configuration: { selectThinkingOption: false } },
+    });
+    await expect(adapter.inspect({ cwd: "/other" })).resolves.toBe(refreshed);
+    await expect(adapter.open({ kind: "create", cwd: "/other" })).resolves.toMatchObject({
+      ok: true,
+      value: { capabilities: { configuration: { selectThinkingOption: true } } },
+    });
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+      capabilities: { configuration: { selectThinkingOption: true } },
+    });
+    expect(dependencies.createTransport).toHaveBeenCalledTimes(3);
+    await adapter.close();
+  });
+
+  it("falls back inspect cwd when Host omits cwd or supplies the filesystem root", async () => {
+    const { adapter, dependencies } = fixture();
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/");
+
+    try {
+      await expect(adapter.inspect({ cwd: "/", refresh: true })).resolves.toMatchObject({
+        status: "ready",
+      });
+      await expect(adapter.inspect({ refresh: true })).resolves.toMatchObject({
+        status: "ready",
+      });
+    } finally {
+      cwdSpy.mockRestore();
+    }
+
+    const inspectCwds = vi
+      .mocked(dependencies.createTransport)
+      .mock.calls.map((call) => call[0]?.cwd);
+    expect(inspectCwds).toHaveLength(2);
+    for (const inspectCwd of inspectCwds) {
+      expect(inspectCwd).toEqual(expect.any(String));
+      expect(inspectCwd).not.toBe("/");
+      expect(path.resolve(inspectCwd as string)).not.toBe(path.parse(inspectCwd as string).root);
+      expect(path.isAbsolute(inspectCwd as string)).toBe(true);
+    }
+    await adapter.close();
+  });
+
+  it("does not translate execution policy into Pi permission options", async () => {
+    const { adapter, dependencies } = fixture();
+    const opened = await adapter.open({
+      kind: "create",
+      cwd: "/synthetic",
+      executionPolicy: "unattended-full-access",
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    await opened.value.execute(textTurn("permission-turn"));
+    expect(dependencies.createTransport).toHaveBeenCalledWith(
+      expect.not.objectContaining({ unattendedFullAccess: expect.anything() }),
+    );
+    await adapter.close();
+  });
+
+  it("passes per-Session delegation environment to the native transport", async () => {
+    const { adapter, dependencies } = fixture();
+    const session = await openSession(adapter, {
+      CODEXHOST_CLI_PATH: "/opt/codexhost",
+      CODEXHOST_RUNTIME_ENDPOINT: "http://127.0.0.1:43123",
+      CODEXHOST_RUNTIME_TOKEN: "token",
+      CODEXHOST_THREAD_ID: "thread-1",
+    });
+    await session.execute(textTurn("environment-turn"));
+    expect(dependencies.createTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        environment: expect.objectContaining({
+          CODEXHOST_CLI_PATH: "/opt/codexhost",
+          CODEXHOST_RUNTIME_ENDPOINT: "http://127.0.0.1:43123",
+          CODEXHOST_RUNTIME_TOKEN: "token",
+          CODEXHOST_THREAD_ID: "thread-1",
+        }),
+      }),
+    );
+    await adapter.close();
+  });
+
+  it("assigns unified Draft Thinking options from Model reasoning metadata", async () => {
+    const { adapter, dependencies, transports } = fixture();
+
+    const inspection = await adapter.inspect({ cwd: "/synthetic" });
+    if (inspection.status !== "ready") throw new Error(inspection.error.message);
+    expect(inspection.catalog.models).toEqual([
+      expect.objectContaining({
+        label: "synthetic-provider / alternate-model",
+        supportedThinkingOptionIds: ["off"],
+      }),
+      expect.objectContaining({
+        label: "synthetic-provider / synthetic-model",
+        supportedThinkingOptionIds: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      }),
+    ]);
+    expect(dependencies.createTransport).toHaveBeenCalledWith(
+      expect.not.objectContaining({ model: expect.anything() }),
+    );
+    expect(transports[0]?.selectModel).not.toHaveBeenCalled();
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("keeps Model inspection ready when Thinking RPC discovery is unsupported", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.getAvailableThinkingLevels.mockResolvedValueOnce(null);
+      transports.push(transport);
+      return transport;
+    });
+
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+      catalog: { thinkingOptions: [] },
+      capabilities: {
+        configuration: { selectModel: true, selectThinkingOption: false },
+      },
+    });
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("closes the ephemeral transport when inspection fails", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.getAvailableModels.mockRejectedValueOnce(new Error("synthetic catalog failure"));
+      transports.push(transport);
+      return transport;
+    });
+
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "error",
+      error: {
+        code: "unavailable",
+        message: "synthetic catalog failure",
+        stage: "model-catalog",
+        stderrTail: "Pi could not read ~/.pi/agent/settings.json",
+      },
+    });
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+    });
+    expect(dependencies.createTransport).toHaveBeenCalledTimes(2);
+    await adapter.close();
+  });
+
+  it("resumes a persisted Pi Session and reads its active-branch Snapshot", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.state = {
+        ...transport.state,
+        sessionId: "source-session",
+        sessionFile: "/synthetic/source.jsonl",
+      };
+      transport.history = sourceHistory();
+      transports.push(transport);
+      return transport;
+    });
+    const nativeRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      locator: { sessionFile: "/synthetic/source.jsonl" },
+      formatVersion: 1,
+    });
+
+    const opened = await adapter.open({ kind: "resume", cwd: "/synthetic", nativeRef });
+    if (!opened.ok) throw new Error(opened.error.message);
+    expect(dependencies.createTransport).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionFile: "/synthetic/source.jsonl" }),
+    );
+    expect(opened.value.initialUsage).toEqual({
+      inputTokens: 20,
+      outputTokens: 10,
+      totalTokens: 30,
+      contextUsedTokens: 40,
+      contextWindowTokens: 200,
+    });
+    expect(opened.value.initialState).toMatchObject({
+      nativeRef: { nativeSessionId: "source-session" },
+      effectiveThinkingOptionId: "high",
+      availableThinkingOptions: [
+        { id: "off", label: "Off" },
+        { id: "low", label: "Low" },
+        { id: "high", label: "High" },
+      ],
+    });
+    await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+      ok: true,
+      value: {
+        state: {
+          nativeRef: { nativeSessionId: "source-session" },
+          effectiveThinkingOptionId: "high",
+        },
+        turns: [
+          { nativeTurnRef: { nativeTurnKey: "source-user-1" } },
+          { nativeTurnRef: { nativeTurnKey: "source-user-2" } },
+        ],
+      },
+    });
+    await opened.value.close();
+    await adapter.close();
+  });
+
+  it("resumes an import-discovered locator, projects history, and continues the same native session", async () => {
+    const cwd = await realpath(
+      await mkdtemp(path.join(os.tmpdir(), "codexhost-pi-import-resume-")),
+    );
+    const sessionFile = path.join(cwd, "original.jsonl");
+    const history = sourceHistory();
+    const { adapter, dependencies, transports } = fixture({
+      environment: { PI_CODING_AGENT_SESSION_DIR: cwd },
+    });
+    try {
+      await writeFile(
+        sessionFile,
+        [{ type: "session", version: 3, id: "import-source", cwd }, ...history.entries]
+          .map((entry) => JSON.stringify(entry))
+          .join("\n") + "\n",
+      );
+      const source = await adapter.sessionImport.resolveCandidate("import-source");
+      if (!source.ok) throw new Error(source.error.message);
+      expect(dependencies.createTransport).not.toHaveBeenCalled();
+      vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+        const transport = new FakePiTransport();
+        transport.options = options;
+        transport.state = { ...transport.state, sessionId: "import-source", sessionFile };
+        transport.history = structuredClone(history);
+        transports.push(transport);
+        return transport;
+      });
+      const opened = await adapter.open({
+        kind: "resume",
+        cwd: source.value.candidate.cwd,
+        nativeRef: source.value.nativeRef,
+      });
+      if (!opened.ok) throw new Error(opened.error.message);
+      expect(dependencies.createTransport).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionFile, cwd }),
+      );
+      expect(await opened.value.readSnapshot()).toMatchObject({
+        ok: true,
+        value: {
+          turns: [
+            { nativeTurnRef: { nativeTurnKey: "source-user-1" } },
+            { nativeTurnRef: { nativeTurnKey: "source-user-2" } },
+          ],
+        },
+      });
+      const iterator = opened.value.outputs[Symbol.asyncIterator]();
+      expect(await opened.value.execute(textTurn("continue-imported"))).toMatchObject({ ok: true });
+      transports[0]?.succeed("continued answer");
+      let terminal = await nextEvent(iterator);
+      while (terminal.type !== "turn.completed") terminal = await nextEvent(iterator);
+      expect(await opened.value.readSnapshot()).toMatchObject({
+        ok: true,
+        value: {
+          state: { nativeRef: source.value.nativeRef },
+          turns: [{}, {}, { input: [{ type: "text", text: "continue-imported" }] }],
+        },
+      });
+      await opened.value.close();
+    } finally {
+      await adapter.close();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { operation: "fork" as const, key: "source-user-1", nextHuman: false, ok: false },
+    { operation: "fork" as const, key: "custom-1", nextHuman: false, ok: true },
+    { operation: "fork" as const, key: "custom-1", nextHuman: true, ok: true },
+    { operation: "rollbackLastTurn" as const, key: "custom-1", nextHuman: false, ok: false },
+    { operation: "rollbackLastTurn" as const, key: "custom-1", nextHuman: true, ok: true },
+  ])(
+    "uses only exact native boundaries: $operation $key, following human=$nextHuman",
+    async ({ operation, key, nextHuman, ok }) => {
+      const { adapter, dependencies, transports } = fixture();
+      const history = sourceHistory(1);
+      history.entries.push(
+        {
+          id: "custom-1",
+          parentId: history.leafId,
+          type: "custom_message",
+          customType: "intercom_message",
+          content: "background result",
+          display: false,
+        },
+        {
+          id: "custom-answer",
+          parentId: "custom-1",
+          type: "message",
+          message: { role: "assistant", content: "follow-up", stopReason: "stop" },
+        },
+      );
+      history.leafId = "custom-answer";
+      if (nextHuman) {
+        history.entries.push(
+          {
+            id: "next-user",
+            parentId: history.leafId,
+            type: "message",
+            message: { role: "user", content: "next" },
+          },
+          {
+            id: "next-answer",
+            parentId: "next-user",
+            type: "message",
+            message: { role: "assistant", content: "next answer", stopReason: "stop" },
+          },
+        );
+        history.leafId = "next-answer";
+      }
+      const original = structuredClone(history);
+      vi.mocked(dependencies.createTransport).mockImplementationOnce(() => {
+        const transport = new FakePiTransport();
+        transport.state = { ...transport.state, sessionId: "startup-copy" };
+        transport.history = structuredClone(history);
+        transports.push(transport);
+        return transport;
+      });
+      const sourceRef = nativeSessionRefSchema.parse({
+        harnessId: "pi",
+        nativeSessionId: "source-session",
+        locator: { sessionFile: "/synthetic/source.jsonl" },
+        formatVersion: 1,
+      });
+      const opened = await adapter.open(
+        operation === "fork"
+          ? {
+              kind: "fork",
+              cwd: "/synthetic",
+              sourceRef,
+              checkpoint: nativeCheckpointRefSchema.parse({
+                harnessId: "pi",
+                nativeSessionId: "source-session",
+                checkpointId: key,
+                formatVersion: 1,
+              }),
+            }
+          : { kind: "rollbackLastTurn", cwd: "/synthetic", sourceRef },
+      );
+      expect(opened.ok).toBe(ok);
+      const transport = transports[0];
+      if (opened.ok) {
+        const snapshot = await opened.value.readSnapshot();
+        expect(snapshot).toMatchObject({
+          ok: true,
+          value: {
+            turns: [
+              { nativeTurnRef: { nativeTurnKey: "source-user-1" } },
+              { nativeTurnRef: { nativeTurnKey: "custom-1" } },
+            ],
+          },
+        });
+        if (nextHuman) expect(transport?.fork).toHaveBeenCalledWith("next-user");
+        else expect(transport?.fork).not.toHaveBeenCalled();
+        await opened.value.close();
+      } else {
+        expect(opened.error.code).toBe(operation === "fork" ? "checkpointNotFound" : "unsupported");
+        expect(transport?.fork).not.toHaveBeenCalled();
+        expect(transport?.close).toHaveBeenCalled();
+      }
+      expect(history).toEqual(original);
+      await adapter.close();
+    },
+  );
+
+  it("rolls back the last Pi Turn and restores current Model and Thinking", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const inputHistory = sourceHistory(2);
+    const unchangedInputHistory = structuredClone(inputHistory);
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.state = {
+        ...transport.state,
+        sessionId: "rollback-startup-session",
+        sessionFile: "/synthetic/rollback-startup.jsonl",
+      };
+      transport.history = structuredClone(inputHistory);
+      transport.fork.mockImplementationOnce(async (entryId) => {
+        const cutoff = transport.history.entries.findIndex((entry) => entry.id === entryId);
+        transport.history.entries = transport.history.entries.slice(0, cutoff);
+        transport.history.leafId = "source-assistant-1";
+        transport.state = {
+          ...transport.state,
+          sessionId: "rollback-final-session",
+          sessionFile: "/synthetic/rollback-final.jsonl",
+          modelId: "alternate-model",
+          thinkingLevel: harnessThinkingOptionIdSchema.parse("low"),
+        };
+        return transport.state;
+      });
+      transports.push(transport);
+      return transport;
+    });
+    const sourceRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      locator: { sessionFile: "/synthetic/source.jsonl" },
+      formatVersion: 1,
+    });
+
+    const opened = await adapter.open({
+      kind: "rollbackLastTurn",
+      cwd: "/synthetic",
+      sourceRef,
+      environment: { CODEXHOST_THREAD_ID: "edited-thread" },
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    expect(dependencies.createTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        forkSessionFile: "/synthetic/source.jsonl",
+        environment: { CODEXHOST_THREAD_ID: "edited-thread" },
+      }),
+    );
+    expect(transports[0]?.fork).toHaveBeenCalledWith("source-user-2");
+    expect(transports[0]?.selectModel).toHaveBeenCalledWith({
+      provider: "synthetic-provider",
+      id: "synthetic-model",
+    });
+    expect(transports[0]?.selectThinkingOption).toHaveBeenCalledWith("high");
+    expect(transports[0]?.verifySessionCwd).toHaveBeenCalledWith("/synthetic");
+    expect(opened.value.initialState).toMatchObject({
+      nativeRef: { nativeSessionId: "rollback-final-session" },
+      effectiveModel: encodePiModelRef({
+        provider: "synthetic-provider",
+        id: "synthetic-model",
+      }),
+      effectiveThinkingOptionId: "high",
+    });
+    await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+      ok: true,
+      value: { turns: [{ nativeTurnRef: { nativeTurnKey: "source-user-1" } }] },
+    });
+    expect(inputHistory).toEqual(unchangedInputHistory);
+    await opened.value.close();
+    await adapter.close();
+  });
+
+  it("rolls the only Pi Turn back to an empty continuable Session", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.state = {
+        ...transport.state,
+        sessionId: "rollback-startup-session",
+        sessionFile: "/synthetic/rollback-startup.jsonl",
+      };
+      transport.history = sourceHistory(1);
+      transports.push(transport);
+      return transport;
+    });
+    const sourceRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      locator: { sessionFile: "/synthetic/source.jsonl" },
+      formatVersion: 1,
+    });
+
+    const opened = await adapter.open({
+      kind: "rollbackLastTurn",
+      cwd: "/synthetic",
+      sourceRef,
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    expect(transports[0]?.fork).toHaveBeenCalledWith("source-user-1");
+    await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+      ok: true,
+      value: { turns: [] },
+    });
+
+    const iterator = opened.value.outputs[Symbol.asyncIterator]();
+    await expect(opened.value.execute(textTurn("edited"))).resolves.toMatchObject({ ok: true });
+    transports[0]?.succeed("edited answer");
+    let terminal = await nextEvent(iterator);
+    while (terminal.type !== "turn.completed") terminal = await nextEvent(iterator);
+    await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+      ok: true,
+      value: { turns: [{ input: [{ type: "text", text: "edited" }] }] },
+    });
+    await opened.value.close();
+    await adapter.close();
+  });
+
+  it("forks a middle Pi Turn into a target cwd before the next User Entry", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.state = {
+        ...transport.state,
+        sessionId: "target-startup-session",
+        sessionFile: "/synthetic-worktree/target.jsonl",
+      };
+      transport.history = sourceHistory();
+      transports.push(transport);
+      return transport;
+    });
+    const sourceRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      locator: { sessionFile: "/synthetic/source.jsonl" },
+      formatVersion: 1,
+    });
+    const checkpoint = nativeCheckpointRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      checkpointId: "source-user-1",
+      formatVersion: 1,
+    });
+
+    const opened = await adapter.open({
+      kind: "fork",
+      cwd: "/synthetic-worktree",
+      sourceRef,
+      checkpoint,
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    expect(dependencies.createTransport).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: "/synthetic-worktree",
+        forkSessionFile: "/synthetic/source.jsonl",
+      }),
+    );
+    expect(transports[0]?.options).not.toHaveProperty("sessionFile");
+    expect(transports[0]?.fork).toHaveBeenCalledWith("source-user-2");
+    expect(transports[0]?.clone).not.toHaveBeenCalled();
+    expect(transports[0]?.verifySessionCwd).toHaveBeenCalledWith("/synthetic-worktree");
+    expect(opened.value.initialState).toMatchObject({
+      nativeRef: { nativeSessionId: "target-startup-session-derived" },
+    });
+    await expect(opened.value.readSnapshot()).resolves.toMatchObject({
+      ok: true,
+      value: { turns: [{ nativeTurnRef: { nativeTurnKey: "source-user-1" } }] },
+    });
+    await opened.value.close();
+    await adapter.close();
+  });
+
+  it("uses the native target-cwd clone for a tail and fails closed for an unknown Checkpoint", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementation((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.state = {
+        ...transport.state,
+        sessionId: `target-startup-session-${transports.length + 1}`,
+        sessionFile: `/synthetic-worktree/target-${transports.length + 1}.jsonl`,
+      };
+      transport.history = sourceHistory();
+      transports.push(transport);
+      return transport;
+    });
+    const sourceRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      locator: { sessionFile: "/synthetic/source.jsonl" },
+      formatVersion: 1,
+    });
+    const terminalCheckpoint = nativeCheckpointRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      checkpointId: "source-user-2",
+      formatVersion: 1,
+    });
+    const cloned = await adapter.open({
+      kind: "fork",
+      cwd: "/synthetic-worktree",
+      sourceRef,
+      checkpoint: terminalCheckpoint,
+    });
+    if (!cloned.ok) throw new Error(cloned.error.message);
+    expect(transports[0]?.clone).not.toHaveBeenCalled();
+    expect(transports[0]?.fork).not.toHaveBeenCalled();
+    expect(transports[0]?.verifySessionCwd).toHaveBeenCalledWith("/synthetic-worktree");
+    expect(cloned.value.initialState).toMatchObject({
+      nativeRef: { nativeSessionId: "target-startup-session-1" },
+    });
+    await expect(cloned.value.readSnapshot()).resolves.toMatchObject({
+      ok: true,
+      value: { turns: [{}, {}] },
+    });
+    await cloned.value.close();
+
+    const missingCheckpoint = nativeCheckpointRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      checkpointId: "missing",
+      formatVersion: 1,
+    });
+    await expect(
+      adapter.open({
+        kind: "fork",
+        cwd: "/synthetic-worktree",
+        sourceRef,
+        checkpoint: missingCheckpoint,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "checkpointNotFound" } });
+    expect(transports[1]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("closes a Pi Fork startup that does not create a distinct Native Session", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.state = {
+        ...transport.state,
+        sessionId: "source-session",
+        sessionFile: "/synthetic/source.jsonl",
+      };
+      transport.history = sourceHistory();
+      transports.push(transport);
+      return transport;
+    });
+    const sourceRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      locator: { sessionFile: "/synthetic/source.jsonl" },
+      formatVersion: 1,
+    });
+    const checkpoint = nativeCheckpointRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "source-session",
+      checkpointId: "source-user-2",
+      formatVersion: 1,
+    });
+
+    await expect(
+      adapter.open({
+        kind: "fork",
+        cwd: "/synthetic-worktree",
+        sourceRef,
+        checkpoint,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "nativeFailure" } });
+    expect(transports[0]?.close).toHaveBeenCalledOnce();
+    await adapter.close();
+  });
+
+  it("does not manufacture a Permission Mode capability", async () => {
+    const { adapter, dependencies } = fixture();
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+      capabilities: { configuration: { selectPermissionMode: false } },
+    });
+    await expect(
+      adapter.open({
+        kind: "create",
+        cwd: "/synthetic",
+        permissionModeId: harnessPermissionModeIdSchema.parse("default"),
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "unsupported" } });
+    const session = await openSession(adapter);
+    expect(session.capabilities.configuration.selectPermissionMode).toBe(false);
+    await expect(
+      session.execute({
+        type: "permissionMode.select",
+        permissionModeId: harnessPermissionModeIdSchema.parse("default"),
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "unsupported" } });
+    expect(dependencies.createTransport).toHaveBeenCalledOnce();
+    await session.close();
+  });
+
+  it("projects an autonomous Turn with the same identity and Checkpoint as history", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    expect(session.capabilities.autonomousTurns).toEqual({ observe: true });
+
+    await session.execute(textTurn("bootstrap"));
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    expect(transport.setAutonomousTurnHandler).toHaveBeenCalledOnce();
+    expect(transport.setAutonomousTurnHandler.mock.invocationCallOrder[0]).toBeLessThan(
+      transport.start.mock.invocationCallOrder[0] as number,
+    );
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transport.succeed("bootstrap answer");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    transport.autonomous(autonomousTurn("pi-autonomous-response"));
+
+    const autonomousStarted = await nextEvent(iterator);
+    expect(autonomousStarted).toMatchObject({
+      type: "turn.autonomous.started",
+      input: [],
+    });
+    if (autonomousStarted.type !== "turn.autonomous.started") {
+      throw new Error("Autonomous Pi Turn did not start");
+    }
+    const turnId = autonomousStarted.turnId;
+    expect(await nextEvent(iterator)).toEqual({ type: "turn.started", turnId });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.started",
+      turnId,
+      item: { type: "agentMessage", text: "" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      turnId,
+      update: { type: "text.append", text: "autonomous answer" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      turnId,
+      snapshot: { item: { type: "agentMessage", text: "autonomous answer" } },
+    });
+    const completed = await nextEvent(iterator);
+    expect(completed).toMatchObject({
+      type: "turn.completed",
+      turnId,
+      nativeTurnRef: {
+        harnessId: "pi",
+        nativeSessionId: "pi-session-1",
+        nativeTurnKey: "pi-autonomous-response",
+      },
+      outcome: { status: "succeeded" },
+    });
+    expect(completed).toHaveProperty("outcome.checkpoint.checkpointId", "pi-autonomous-response");
+    const snapshot = await session.readSnapshot();
+    expect(snapshot).toMatchObject({
+      ok: true,
+      value: {
+        turns: [
+          { nativeTurnRef: { nativeTurnKey: "synthetic-user-1" } },
+          {
+            nativeTurnRef: { nativeTurnKey: "pi-autonomous-response" },
+            input: [],
+            checkpoint: { checkpointId: "pi-autonomous-response" },
+          },
+        ],
+      },
+    });
+    if (snapshot.ok) expect(snapshot.value.turns[0]).not.toHaveProperty("checkpoint");
+    await session.close();
+  });
+
+  it("binds autonomous observation for an already-started resumed transport", async () => {
+    const { adapter, transports } = fixture();
+    const sourceRef = nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "pi-session-1",
+      locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+      formatVersion: 1,
+    });
+    const opened = await adapter.open({ kind: "resume", cwd: "/synthetic", nativeRef: sourceRef });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const iterator = opened.value.outputs[Symbol.asyncIterator]();
+    const transport = transports[0];
+    if (!transport) throw new Error("Started fake transport was not created");
+    expect(transport.start).toHaveBeenCalledOnce();
+    expect(transport.setAutonomousTurnHandler).toHaveBeenCalledOnce();
+
+    transport.autonomous(autonomousTurn("resumed-autonomous"));
+    expect(await nextEvent(iterator)).toMatchObject({ type: "turn.autonomous.started", input: [] });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      nativeTurnRef: { nativeTurnKey: "resumed-autonomous" },
+      outcome: { status: "succeeded" },
+    });
+    await opened.value.close();
+    await adapter.close();
+  });
+
+  it("uses persisted autonomous boundaries for cancellation and failure", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("bootstrap-outcomes"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    transport.succeed("ready");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    for (const [key, result, expectedStatus] of [
+      [
+        "autonomous-cancelled",
+        { status: "cancelled", text: "autonomous answer", reason: "native aborted" },
+        "cancelled",
+      ],
+      [
+        "autonomous-failed",
+        { status: "failed", text: "autonomous answer", error: new Error("native failed") },
+        "failed",
+      ],
+    ] as const) {
+      transport.autonomous(autonomousTurn(key, result));
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      const completed = await nextEvent(iterator);
+      expect(completed).toMatchObject({
+        type: "turn.completed",
+        nativeTurnRef: { nativeTurnKey: key },
+        outcome: { status: expectedStatus },
+      });
+      expect(completed).toHaveProperty("outcome.checkpoint.checkpointId", key);
+    }
+    await session.close();
+  });
+
+  it("publishes a deferred autonomous completion after the prior user Turn finishes its identity read", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("USER_STEER_MARKER"));
+    const transport = transports[0];
+    if (!transport) throw new Error("Missing transport");
+    let release = (): void => undefined;
+    let reading = false;
+    transport.getEntries.mockImplementationOnce(async () => {
+      reading = true;
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return structuredClone(transport.history);
+    });
+    transport.succeed("USER_RESPONSE_MARKER");
+    // RPC replays synchronously before the requested promise's .then can mark settling.
+    const child = gotgenesRecord({
+      id: "next-run-child",
+      type: "Explore",
+      description: "Autonomous child",
+      status: "completed",
+      isBackground: true,
+      toolUses: 1,
+    });
+    if (!child) throw new Error("Invalid child fixture");
+    transport.gotgenesHandler?.([child], "autonomous");
+    await vi.waitFor(() => expect(reading).toBe(true));
+    const autonomous = autonomousTurn("deferred-entry", {
+      status: "succeeded",
+      text: "AUTONOMOUS_MARKER",
+    });
+    transport.autonomous({
+      ...autonomous,
+      events: [
+        {
+          type: "tool.started",
+          callId: "new-call",
+          toolName: "subagent",
+          arguments: { description: "Autonomous child" },
+        },
+        {
+          type: "tool.completed",
+          callId: "new-call",
+          toolName: "subagent",
+          isError: false,
+          result: {
+            details: {
+              agentId: "next-run-child",
+              displayName: "Explore",
+              subagentType: "Explore",
+              description: "Autonomous child",
+              status: "background",
+            },
+          },
+        },
+        ...autonomous.events,
+      ],
+    });
+    release();
+    const events = [];
+    while (events.filter((event) => event.type === "turn.completed").length < 2)
+      events.push(await nextEvent(iterator));
+    const completions = events.filter((event) => event.type === "turn.completed");
+    expect(completions[0]).toMatchObject({
+      turnId: "USER_STEER_MARKER",
+      nativeTurnRef: { nativeTurnKey: "synthetic-user-1" },
+      outcome: { status: "succeeded" },
+    });
+    expect(completions[0]?.outcome).not.toHaveProperty("checkpoint");
+    expect(completions[1]).toMatchObject({
+      nativeTurnRef: { nativeTurnKey: "deferred-entry" },
+      outcome: { status: "succeeded" },
+    });
+    const userMessages = events.filter(
+      (event) => event.type === "item.completed" && event.turnId === "USER_STEER_MARKER",
+    );
+    expect(JSON.stringify(userMessages)).toContain("USER_RESPONSE_MARKER");
+    expect(JSON.stringify(userMessages)).not.toContain("AUTONOMOUS_MARKER");
+    expect(events.some((event) => event.type === "session.faulted")).toBe(false);
+    const cards = events.filter(
+      (event) => event.type === "item.started" && event.item.type === "subagentDelegation",
+    );
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({ turnId: completions[1]?.turnId });
+    expect(cards[0]).not.toMatchObject({ turnId: "USER_STEER_MARKER" });
+    expect(cards[0]).toMatchObject({
+      item: { subagents: [{ description: "Autonomous child", status: "completed" }] },
+    });
+    await adapter.close();
+  });
+
+  it("faults instead of merging an autonomous callback with a requested Host Turn", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("overlap"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    transport.autonomous(autonomousTurn("overlap-autonomous"));
+
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { outcome: { status: "failed", error: { code: "protocolError" } } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "failed", error: { message: expect.stringContaining("overlapped") } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.faulted",
+      error: { code: "protocolError", message: expect.stringContaining("overlapped") },
+    });
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    await session.close();
+  });
+
+  it("starts lazily and emits an ordered successful text lifecycle", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    expect(dependencies.createTransport).not.toHaveBeenCalled();
+    await expect(session.execute(textTurn("turn-1"))).resolves.toEqual({
+      ok: true,
+      value: { turnId: "turn-1" },
+    });
+    const transport = transports[0];
+    expect(transport?.start).toHaveBeenCalledOnce();
+    expect((await nextEvent(iterator)).type).toBe("session.state.changed");
+    expect((await nextEvent(iterator)).type).toBe("turn.started");
+    expect((await nextEvent(iterator)).type).toBe("item.started");
+
+    transport?.delta("hello");
+    transport?.delta(" world");
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "text.append", text: "hello" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "text.append", text: " world" },
+    });
+    transport?.succeed("hello world");
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { text: "hello world" }, outcome: { status: "succeeded" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      observedForTurnId: "turn-1",
+      usage: { totalTokens: 30, contextUsedTokens: 40, contextWindowTokens: 200 },
+    });
+
+    await session.close();
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("exposes Pi compact as a command whose native events drive the standard UI lifecycle", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    const commands = session.commands;
+    if (!commands) throw new Error("Pi Session did not expose commands");
+    await expect(commands.list()).resolves.toMatchObject({
+      ok: true,
+      value: { commands: [{ id: "pi.compact", invocation: "/compact" }] },
+    });
+    await expect(
+      commands.execute({
+        turnId: hostTurnIdSchema.parse("manual-compact"),
+        commandId: "pi.compact",
+        arguments: { text: "Keep implementation details" },
+      }),
+    ).resolves.toEqual({ ok: true, value: { turnId: "manual-compact" } });
+
+    expect((await nextEvent(iterator)).type).toBe("session.state.changed");
+    expect(await nextEvent(iterator)).toEqual({
+      type: "turn.started",
+      turnId: "manual-compact",
+    });
+    const started = await nextEvent(iterator);
+    if (started.type !== "item.started" || started.item.type !== "contextCompaction") {
+      throw new Error("Manual compaction did not start a Context Compaction Item");
+    }
+    expect(started).toMatchObject({
+      type: "item.started",
+      turnId: "manual-compact",
+      item: { type: "contextCompaction" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      turnId: "manual-compact",
+      snapshot: {
+        item: { type: "contextCompaction", itemId: started.item.itemId },
+        outcome: { status: "succeeded" },
+      },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      observedForTurnId: "manual-compact",
+    });
+    expect(await nextEvent(iterator)).toEqual({
+      type: "turn.completed",
+      turnId: "manual-compact",
+      outcome: { status: "succeeded" },
+    });
+    expect(transports[0]?.compact).toHaveBeenCalledWith(
+      "Keep implementation details",
+      expect.any(Function),
+    );
+    await session.close();
+  });
+
+  it("publishes native context compaction before continuing the Assistant reply", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("compaction"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    transport.event({ type: "compaction.started" });
+    const started = await nextEvent(iterator);
+    if (started.type !== "item.started" || started.item.type !== "contextCompaction") {
+      throw new Error("Context Compaction Item did not start");
+    }
+    expect(started.item).toMatchObject({ type: "contextCompaction" });
+    transport.usage = {
+      totalTokens: 35,
+      contextUsedTokens: 12,
+      contextWindowTokens: 200,
+    };
+    transport.event({ type: "compaction.completed", outcome: "succeeded" });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: {
+        item: { type: "contextCompaction", itemId: started.item.itemId },
+        outcome: { status: "succeeded" },
+      },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      observedForTurnId: "compaction",
+      usage: { contextUsedTokens: 12, contextWindowTokens: 200 },
+    });
+
+    transport.delta("continued");
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "text.append", text: "continued" },
+    });
+    transport.succeed("continued");
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "agentMessage", text: "continued" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    await session.close();
+  });
+
+  it("keeps native response Item identities across live output, history, and cold replay", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    const liveIds: string[][] = [];
+    for (const ordinal of [1, 2]) {
+      const turnId = hostTurnIdSchema.parse(`native-identity-${ordinal}`);
+      const projector = new CodexTurnProjector({
+        threadId: "pi-thread",
+        turnId,
+        cwd: "/workspace",
+        startedAtMs: 0,
+      });
+      const visibleMessageIds = new Set<string>();
+      await session.execute(textTurn(turnId));
+      const transport = transports[0];
+      if (!transport) throw new Error("Fake transport was not created");
+      const responseId = `resp-native-${ordinal}`;
+      transport.event({
+        type: "reasoning.delta",
+        messageId: responseId,
+        nativeMessageIdentity: { responseId: responseId },
+        delta: "same reasoning",
+      });
+      transport.event({ type: "reasoning.completed", messageId: responseId });
+      transport.event({
+        type: "text.delta",
+        messageId: responseId,
+        nativeMessageIdentity: { responseId: responseId },
+        delta: "same answer",
+      });
+      transport.succeed("same answer");
+      const entry = transport.history.entries.at(-1);
+      if (!entry) throw new Error("Fake history has no Assistant entry");
+      entry.message = {
+        role: "assistant",
+        responseId,
+        stopReason: "stop",
+        content: [
+          { type: "thinking", thinking: "same reasoning" },
+          { type: "text", text: "same answer" },
+        ],
+      };
+      const ids: string[] = [];
+      for (;;) {
+        const event = await nextEvent(iterator);
+        if (
+          event.type === "turn.started" ||
+          event.type === "item.started" ||
+          event.type === "item.updated" ||
+          event.type === "item.completed" ||
+          event.type === "turn.completed"
+        ) {
+          for (const message of projector.project(event).messages) {
+            const params = message.params;
+            const item =
+              params && typeof params === "object" && !Array.isArray(params) ? params.item : null;
+            if (
+              item &&
+              typeof item === "object" &&
+              !Array.isArray(item) &&
+              item.type === "agentMessage" &&
+              typeof item.id === "string"
+            )
+              visibleMessageIds.add(item.id);
+          }
+        }
+        if (
+          event.type === "item.completed" &&
+          (event.snapshot.item.type === "agentMessage" ||
+            event.snapshot.item.type === "reasoning") &&
+          event.snapshot.item.text.length > 0
+        )
+          ids.push(event.snapshot.item.itemId);
+        if (event.type === "turn.completed") break;
+      }
+      expect(visibleMessageIds.size).toBe(1);
+      liveIds.push(ids);
+    }
+    const snapshot = await session.readSnapshot();
+    if (!snapshot.ok) throw new Error(snapshot.error.message);
+    const projectedIds = snapshot.value.turns.map((turn) =>
+      turn.items.map(({ item }) => item.itemId),
+    );
+    expect(projectedIds).toEqual(liveIds);
+    expect(new Set(liveIds.flat()).size).toBe(4);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    const cold = mapPiSnapshot(JSON.parse(JSON.stringify(transport.history)), {
+      sessionId: transport.state.sessionId,
+      model: null,
+    });
+    expect(cold.turns.map((turn) => turn.items.map(({ item }) => item.itemId))).toEqual(liveIds);
+    await session.close();
+  });
+
+  it.each(["text", "reasoning"] as const)(
+    "keeps native response lifecycles distinct after a %s-only preceding message",
+    async (firstKind) => {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const iterator = session.outputs[Symbol.asyncIterator]();
+      const turnId = hostTurnIdSchema.parse("native-boundaries");
+      const projector = new CodexTurnProjector({
+        threadId: "pi-thread",
+        turnId,
+        cwd: "/workspace",
+        startedAtMs: 0,
+      });
+      await session.execute(textTurn(turnId));
+      const transport = transports[0];
+      if (!transport) throw new Error("Fake transport was not created");
+      transport.event({
+        type: firstKind === "text" ? "text.delta" : "reasoning.delta",
+        messageId: "response-a",
+        nativeMessageIdentity: { responseId: "response-a" },
+        delta: "first",
+      });
+      for (const [type, delta] of [
+        ["reasoning.delta", "think "],
+        ["text.delta", "answer"],
+        ["reasoning.delta", "more"],
+      ] as const) {
+        transport.event({
+          type,
+          messageId: "response-b",
+          nativeMessageIdentity: { responseId: "response-b" },
+          delta,
+        });
+      }
+      transport.succeed("answer");
+      const startedIds: string[] = [];
+      const completed: { type: string; text: string }[] = [];
+      const visibleIds = new Set<string>();
+      for (;;) {
+        const event = await nextEvent(iterator);
+        if (event.type === "item.started") startedIds.push(event.item.itemId);
+        if (
+          event.type === "item.completed" &&
+          (event.snapshot.item.type === "agentMessage" ||
+            event.snapshot.item.type === "reasoning") &&
+          event.snapshot.item.text.length > 0
+        )
+          completed.push({ type: event.snapshot.item.type, text: event.snapshot.item.text });
+        if (
+          event.type === "turn.started" ||
+          event.type === "item.started" ||
+          event.type === "item.updated" ||
+          event.type === "item.completed" ||
+          event.type === "turn.completed"
+        ) {
+          for (const message of projector.project(event).messages) {
+            const params = message.params;
+            const item =
+              params && typeof params === "object" && !Array.isArray(params) ? params.item : null;
+            if (
+              item &&
+              typeof item === "object" &&
+              !Array.isArray(item) &&
+              item.type === "agentMessage" &&
+              typeof item.id === "string"
+            )
+              visibleIds.add(item.id);
+          }
+        }
+        if (event.type === "turn.completed") break;
+      }
+      expect(new Set(startedIds).size).toBe(startedIds.length);
+      expect(completed).toEqual([
+        { type: firstKind === "text" ? "agentMessage" : "reasoning", text: "first" },
+        { type: "reasoning", text: "think more" },
+        { type: "agentMessage", text: "answer" },
+      ]);
+      expect(visibleIds.size).toBe(firstKind === "text" ? 2 : 1);
+      await session.close();
+    },
+  );
+
+  it.each(["succeeded", "cancelled", "failed"] as const)(
+    "closes a native reasoning-only response when the Turn is %s without an empty wire message",
+    async (status) => {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const iterator = session.outputs[Symbol.asyncIterator]();
+      const turnId = hostTurnIdSchema.parse("native-reasoning-terminal");
+      const projector = new CodexTurnProjector({
+        threadId: "pi-thread",
+        turnId,
+        cwd: "/workspace",
+        startedAtMs: 0,
+      });
+      await session.execute(textTurn(turnId));
+      const transport = transports[0];
+      if (!transport) throw new Error("Fake transport was not created");
+      transport.event({
+        type: "reasoning.delta",
+        messageId: "response",
+        nativeMessageIdentity: { responseId: "response" },
+        delta: "thinking",
+      });
+      if (status === "failed") transport.fail(new Error("native failure"));
+      else transport.succeed("", status === "cancelled");
+      let reasoningOutcome: string | undefined;
+      const wireMessageIds: string[] = [];
+      for (;;) {
+        const event = await nextEvent(iterator);
+        if (event.type === "item.completed" && event.snapshot.item.type === "reasoning") {
+          reasoningOutcome = event.snapshot.outcome.status;
+        }
+        if (
+          event.type === "turn.started" ||
+          event.type === "item.started" ||
+          event.type === "item.updated" ||
+          event.type === "item.completed" ||
+          event.type === "turn.completed"
+        ) {
+          for (const message of projector.project(event).messages) {
+            const params = message.params;
+            const item =
+              params && typeof params === "object" && !Array.isArray(params) ? params.item : null;
+            if (
+              item &&
+              typeof item === "object" &&
+              !Array.isArray(item) &&
+              item.type === "agentMessage" &&
+              typeof item.id === "string"
+            )
+              wireMessageIds.push(item.id);
+          }
+        }
+        if (event.type === "turn.completed") {
+          expect(event.outcome.status).toBe(status);
+          break;
+        }
+      }
+      expect(reasoningOutcome).toBe(status);
+      expect(wireMessageIds).toEqual([]);
+      await session.close();
+    },
+  );
+
+  it("keeps Assistant messages separate across interleaved Tool calls", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("message-boundaries"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const firstStarted = await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport || firstStarted.type !== "item.started") {
+      throw new Error("Fake transport or first Agent Item was not created");
+    }
+
+    transport.message("first");
+    transport.event({ type: "tool.started", callId: "call-1", toolName: "read", arguments: {} });
+    transport.event({
+      type: "tool.completed",
+      callId: "call-1",
+      toolName: "read",
+      result: { content: [{ type: "text", text: "one" }] },
+      isError: false,
+    });
+    transport.message("second");
+    transport.event({ type: "tool.started", callId: "call-2", toolName: "read", arguments: {} });
+    transport.event({
+      type: "tool.completed",
+      callId: "call-2",
+      toolName: "read",
+      result: { content: [{ type: "text", text: "two" }] },
+      isError: false,
+    });
+    transport.message("third");
+    transport.succeed("firstsecondthird");
+
+    const events = [];
+    for (let index = 0; index < 13; index += 1) events.push(await nextEvent(iterator));
+    expect(
+      events.map((event) => {
+        if (event.type === "item.started") return `start:${event.item.type}`;
+        if (event.type === "item.updated" && event.update.type === "text.append") {
+          return `text:${event.update.text}`;
+        }
+        if (event.type === "item.completed") {
+          const item = event.snapshot.item;
+          return `complete:${item.type}${item.type === "agentMessage" ? `:${item.text}` : ""}`;
+        }
+        return event.type;
+      }),
+    ).toEqual([
+      "text:first",
+      "complete:agentMessage:first",
+      "start:toolExecution",
+      "complete:toolExecution",
+      "start:agentMessage",
+      "text:second",
+      "complete:agentMessage:second",
+      "start:toolExecution",
+      "complete:toolExecution",
+      "start:agentMessage",
+      "text:third",
+      "complete:agentMessage:third",
+      "turn.completed",
+    ]);
+    const agentIds = [
+      firstStarted.item.itemId,
+      ...events.flatMap((event) =>
+        event.type === "item.started" && event.item.type === "agentMessage"
+          ? [event.item.itemId]
+          : [],
+      ),
+    ];
+    expect(new Set(agentIds).size).toBe(3);
+    await session.close();
+  });
+
+  it("keeps visible reasoning in distinct per-message Item lifecycles", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("reasoning"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    transport.event({ type: "reasoning.delta", messageId: "reasoning-1", delta: "first " });
+    const firstStarted = await nextEvent(iterator);
+    expect(firstStarted).toMatchObject({ type: "item.started", item: { type: "reasoning" } });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "text.append", text: "first " },
+    });
+    transport.event({ type: "reasoning.delta", messageId: "reasoning-1", delta: "analysis" });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "text.append", text: "analysis" },
+    });
+    transport.event({ type: "reasoning.completed", messageId: "reasoning-1" });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "reasoning", text: "first analysis" } },
+    });
+
+    transport.event({
+      type: "reasoning.delta",
+      messageId: "reasoning-2",
+      delta: "second analysis",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "agentMessage", text: "" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.started",
+      item: { type: "agentMessage", text: "" },
+    });
+    const secondStarted = await nextEvent(iterator);
+    expect(secondStarted).toMatchObject({ type: "item.started", item: { type: "reasoning" } });
+    expect(
+      firstStarted.type === "item.started" && secondStarted.type === "item.started"
+        ? firstStarted.item.itemId === secondStarted.item.itemId
+        : true,
+    ).toBe(false);
+    await nextEvent(iterator);
+    transport.event({ type: "reasoning.completed", messageId: "reasoning-2" });
+    await nextEvent(iterator);
+    transport.delta("answer", "reasoning-2");
+    await nextEvent(iterator);
+    transport.succeed("answer");
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "agentMessage", text: "answer" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    await session.close();
+  });
+
+  it("fails active Reasoning and Agent Items when native reconciliation fails", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("reasoning-conflict"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    transport.event({
+      type: "reasoning.delta",
+      messageId: "reasoning-conflict",
+      delta: "visible",
+    });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transport.fail(new Error("reasoning conflict"));
+
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "reasoning" }, outcome: { status: "failed" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "agentMessage" }, outcome: { status: "failed" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "failed", error: { message: "reasoning conflict" } },
+    });
+    await session.close();
+  });
+
+  it("declares an empty complete usage history for a created Session", async () => {
+    const { adapter } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    expect((await iterator.next()).value).toEqual({
+      kind: "event",
+      event: { type: "usage.history", complete: true },
+    });
+    await session.close();
+    await adapter.close();
+  });
+
+  it("replays every native request on resume, then meters live assistant messages", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.history = {
+        leafId: "second",
+        entries: [
+          {
+            type: "message",
+            id: "first",
+            parentId: null,
+            message: {
+              role: "assistant",
+              model: "synthetic-model",
+              responseId: "resp-first",
+              usage: { input: 10, output: 2, cacheRead: 30, cacheWrite: 0 },
+            },
+          },
+          {
+            type: "message",
+            id: "second",
+            parentId: null,
+            message: {
+              role: "assistant",
+              model: "synthetic-model",
+              responseId: "resp-abandoned-branch",
+              usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+            },
+          },
+        ],
+      };
+      transports.push(transport);
+      return transport;
+    });
+    const opened = await adapter.open({
+      kind: "resume",
+      cwd: "/synthetic",
+      nativeRef: nativeSessionRefSchema.parse({
+        harnessId: "pi",
+        nativeSessionId: "pi-session-1",
+        locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+        formatVersion: 1,
+      }),
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const iterator = opened.value.outputs[Symbol.asyncIterator]();
+    const events = [];
+    for (let index = 0; index < 3; index += 1) events.push((await iterator.next()).value);
+    expect(events).toEqual([
+      {
+        kind: "event",
+        event: {
+          type: "usage.request",
+          request: {
+            requestId: "resp-first",
+            historical: true,
+            model: "synthetic-model",
+            inputTokens: 40,
+            cachedInputTokens: 30,
+            cacheWriteInputTokens: 0,
+            outputTokens: 2,
+          },
+        },
+      },
+      {
+        kind: "event",
+        event: expect.objectContaining({
+          type: "usage.request",
+          request: expect.objectContaining({ requestId: "resp-abandoned-branch" }),
+        }),
+      },
+      { kind: "event", event: { type: "usage.history", complete: true } },
+    ]);
+
+    const transport = transports[0];
+    if (!transport?.usageHandler) throw new Error("Usage handler was not bound");
+    transport.usageHandler({
+      message: {
+        role: "assistant",
+        model: "synthetic-model",
+        responseId: "resp-live",
+        usage: { input: 1, output: 4, cacheRead: 0, cacheWrite: 0 },
+      },
+      startedAtMs: 100,
+      completedAtMs: 300,
+    });
+    transport.usageHandler({
+      message: { role: "assistant", responseId: "resp-broken" },
+      startedAtMs: null,
+      completedAtMs: 400,
+    });
+    expect((await iterator.next()).value).toMatchObject({
+      event: {
+        type: "usage.request",
+        request: { requestId: "resp-live", startedAtMs: 100, completedAtMs: 300 },
+      },
+    });
+    expect((await iterator.next()).value).toEqual({
+      kind: "event",
+      event: { type: "usage.history", complete: false },
+    });
+    await opened.value.close();
+    await adapter.close();
+  });
+
+  it("publishes Usage after the first Assistant message while the Turn remains active", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("usage-during-turn"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    transport.delta("working", "assistant-usage");
+    await nextEvent(iterator);
+    transport.event({ type: "message.completed", messageId: "assistant-usage" });
+
+    await vi.waitFor(() => expect(transport.getSessionUsage).toHaveBeenCalledOnce());
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      observedForTurnId: "usage-during-turn",
+      usage: { contextUsedTokens: 40, contextWindowTokens: 200 },
+    });
+    expect(transport.resolveTurn).not.toBeNull();
+
+    transport.succeed("working");
+    await session.close();
+  });
+
+  it("retains reliable Usage when a later refresh fails", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    expect(session.initialUsage).toBeNull();
+
+    await session.execute(textTurn("usage-1"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.succeed("first");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      usage: { totalTokens: 30 },
+    });
+
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    transport.getSessionUsage.mockRejectedValueOnce(new Error("synthetic Telemetry failure"));
+    await session.execute(textTurn("usage-2"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transport.succeed("second");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await vi.waitFor(() => expect(transport.getSessionUsage).toHaveBeenCalledTimes(2));
+    await session.close();
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("drops an older overlapping Usage refresh for the same Session generation", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("usage-overlap"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    let resolveOld!: (usage: HostUsage) => void;
+    transport.getSessionUsage.mockImplementationOnce(
+      () => new Promise<HostUsage>((resolve) => (resolveOld = resolve)),
+    );
+    transport.event({ type: "message.completed", messageId: "assistant-old" });
+    await vi.waitFor(() => expect(transport.getSessionUsage).toHaveBeenCalledOnce());
+
+    transport.usage = {
+      totalTokens: 50,
+      contextUsedTokens: 45,
+      contextWindowTokens: 200,
+    };
+    transport.event({ type: "message.completed", messageId: "assistant-new" });
+    await vi.waitFor(() => expect(transport.getSessionUsage).toHaveBeenCalledTimes(2));
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      usage: { totalTokens: 50 },
+    });
+
+    resolveOld({ totalTokens: 999, contextUsedTokens: 199, contextWindowTokens: 200 });
+    await Promise.resolve();
+    await Promise.resolve();
+    transport.succeed("done");
+    await vi.waitFor(() => expect(transport.getEntries).toHaveBeenCalledTimes(2));
+    await session.close();
+
+    const remaining: HarnessOutput[] = [];
+    for (;;) {
+      const result = await iterator.next();
+      if (result.done) break;
+      remaining.push(result.value);
+    }
+    expect(
+      remaining.some(
+        (output) =>
+          output.kind === "event" &&
+          output.event.type === "session.usage.changed" &&
+          output.event.usage?.totalTokens === 999,
+      ),
+    ).toBe(false);
+  });
+
+  it("drops an older Usage refresh after the effective Model changes", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("usage-generation"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    let resolveOld!: (usage: HostUsage) => void;
+    transport.getSessionUsage.mockImplementationOnce(
+      () => new Promise<HostUsage>((resolve) => (resolveOld = resolve)),
+    );
+    transport.succeed("done");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await vi.waitFor(() => expect(transport.getSessionUsage).toHaveBeenCalledOnce());
+
+    const alternate = encodePiModelRef({
+      provider: "synthetic-provider",
+      id: "alternate-model",
+    });
+    transport.usage = {
+      totalTokens: 5,
+      contextUsedTokens: 8,
+      contextWindowTokens: 400,
+    };
+    const selecting = session.execute({ type: "model.select", model: alternate });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: { effectiveModel: alternate },
+    });
+    await expect(selecting).resolves.toMatchObject({ ok: true });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      usage: { totalTokens: 5, contextWindowTokens: 400 },
+    });
+
+    resolveOld({ totalTokens: 999, contextUsedTokens: 199, contextWindowTokens: 200 });
+    await Promise.resolve();
+    await session.close();
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it.each([false, true])(
+    "applies a create Model before the first Turn (collision: %s)",
+    async (collision) => {
+      const native = { provider: "synthetic-provider/project", id: "alternate-model" };
+      const transport = new FakePiTransport();
+      transport.getAvailableModels.mockResolvedValue([
+        { ...native, reasoning: true, api: "openai-responses" },
+        ...(collision
+          ? [
+              {
+                provider: "synthetic-provider",
+                id: "project/alternate-model",
+                reasoning: true,
+                api: "openai-responses",
+              },
+            ]
+          : []),
+      ]);
+      const adapter = new PiAdapter({}, { createTransport: () => transport });
+      const model = harnessModelRefSchema.parse({
+        id: collision
+          ? `pi-model-v1.${Buffer.from(JSON.stringify([native.provider, native.id])).toString("base64url")}`
+          : "synthetic-provider/project/alternate-model",
+      });
+      const opened = await adapter.open({ kind: "create", cwd: "/synthetic", model });
+      if (!opened.ok) throw new Error(opened.error.message);
+      const session = opened.value;
+      const iterator = session.outputs[Symbol.asyncIterator]();
+
+      await expect(session.execute(textTurn("selected-first"))).resolves.toMatchObject({
+        ok: true,
+      });
+      expect(transport.selectModel).toHaveBeenCalledWith(native);
+      expect(await nextEvent(iterator)).toMatchObject({
+        type: "session.state.changed",
+        state: {
+          effectiveModel: model,
+          effectiveThinkingOptionId: "low",
+          availableThinkingOptions: [
+            { id: "off", label: "Off" },
+            { id: "low", label: "Low" },
+          ],
+        },
+      });
+      expect((await nextEvent(iterator)).type).toBe("turn.started");
+      expect((await nextEvent(iterator)).type).toBe("item.started");
+      transport.succeed("done");
+      await adapter.close();
+    },
+  );
+
+  it("applies create Thinking and publishes Pi-corrected readback before the first Turn", async () => {
+    const { adapter, transports } = fixture();
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+      capabilities: { configuration: { selectThinkingOption: true } },
+    });
+    const model = encodePiModelRef({
+      provider: "synthetic-provider",
+      id: "alternate-model",
+    });
+    const requestedThinking = harnessThinkingOptionIdSchema.parse("xhigh");
+    const opened = await adapter.open({
+      kind: "create",
+      cwd: "/synthetic",
+      model,
+      thinkingOptionId: requestedThinking,
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const iterator = opened.value.outputs[Symbol.asyncIterator]();
+
+    await expect(opened.value.execute(textTurn("selected-thinking"))).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(transports[1]?.selectThinkingOption).toHaveBeenCalledWith(requestedThinking);
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: {
+        effectiveModel: model,
+        effectiveThinkingOptionId: "low",
+        availableThinkingOptions: [
+          { id: "off", label: "Off" },
+          { id: "low", label: "Low" },
+        ],
+      },
+    });
+    expect((await nextEvent(iterator)).type).toBe("turn.started");
+    expect((await nextEvent(iterator)).type).toBe("item.started");
+    transports[1]?.succeed("done");
+    await opened.value.close();
+  });
+
+  it("selects Models while idle or running with state-before-result ordering", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("first"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.succeed("first");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    const alternate = encodePiModelRef({
+      provider: "synthetic-provider",
+      id: "alternate-model",
+    });
+    const selecting = session.execute({ type: "model.select", model: alternate });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: {
+        effectiveModel: alternate,
+        effectiveThinkingOptionId: "low",
+        availableThinkingOptions: [
+          { id: "off", label: "Off" },
+          { id: "low", label: "Low" },
+        ],
+      },
+    });
+    await expect(selecting).resolves.toEqual({ ok: true, value: { completed: true } });
+    expect(await nextEvent(iterator)).toEqual({ type: "session.usage.changed", usage: null });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      usage: { totalTokens: 30 },
+    });
+
+    await session.execute(textTurn("active"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await expect(
+      session.execute({
+        type: "model.select",
+        model: encodePiModelRef({ provider: "synthetic-provider", id: "synthetic-model" }),
+      }),
+    ).resolves.toEqual({ ok: true, value: { completed: true } });
+    expect(transports[0]?.selectModel).toHaveBeenCalledTimes(2);
+    await expect(session.execute(textTurn("duplicate-active"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "sessionBusy" },
+    });
+    transports[0]?.succeed("active");
+    await session.close();
+  });
+
+  it("selects Thinking while idle or running with corrected state-before-result ordering", async () => {
+    const { adapter, transports } = fixture();
+    await expect(adapter.inspect({ cwd: "/synthetic" })).resolves.toMatchObject({
+      status: "ready",
+      capabilities: { configuration: { selectThinkingOption: true } },
+    });
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("start-thinking"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[1]?.succeed("start-thinking");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    const xhigh = harnessThinkingOptionIdSchema.parse("xhigh");
+    const selecting = session.execute({
+      type: "thinking.select",
+      thinkingOptionId: xhigh,
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: {
+        effectiveThinkingOptionId: "high",
+        availableThinkingOptions: [
+          { id: "off", label: "Off" },
+          { id: "low", label: "Low" },
+          { id: "high", label: "High" },
+        ],
+      },
+    });
+    await expect(selecting).resolves.toEqual({ ok: true, value: { completed: true } });
+
+    await session.execute(textTurn("active-thinking"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await expect(
+      session.execute({
+        type: "thinking.select",
+        thinkingOptionId: harnessThinkingOptionIdSchema.parse("off"),
+      }),
+    ).resolves.toEqual({ ok: true, value: { completed: true } });
+    expect(transports[1]?.selectThinkingOption).toHaveBeenCalledTimes(2);
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: { effectiveThinkingOptionId: "off" },
+    });
+    transports[1]?.succeed("active-thinking");
+    await session.close();
+  });
+
+  it("rejects Turn acceptance while native Model selection is pending", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("start"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.succeed("start");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    let releaseSelection!: () => void;
+    const selectionGate = new Promise<void>((resolve) => {
+      releaseSelection = resolve;
+    });
+    transport.selectModel.mockImplementationOnce(async (model) => {
+      await selectionGate;
+      transport.state = {
+        ...transport.state,
+        provider: model.provider,
+        modelId: model.id,
+        thinkingLevel: harnessThinkingOptionIdSchema.parse("low"),
+      };
+      return transport.state;
+    });
+    const model = encodePiModelRef({ provider: "synthetic-provider", id: "alternate-model" });
+    const selecting = session.execute({ type: "model.select", model });
+
+    await expect(session.execute(textTurn("racing"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "sessionBusy" },
+    });
+    releaseSelection();
+    await expect(selecting).resolves.toEqual({ ok: true, value: { completed: true } });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: { effectiveModel: model },
+    });
+    await session.close();
+  });
+
+  it("publishes actual readback on mismatch and faults uncertain selection state", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("start"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.succeed("start");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+
+    transport.selectModel.mockImplementationOnce(async () => transport.state);
+    const requested = encodePiModelRef({
+      provider: "synthetic-provider",
+      id: "alternate-model",
+    });
+    const mismatch = session.execute({ type: "model.select", model: requested });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: {
+        effectiveModel: encodePiModelRef({
+          provider: "synthetic-provider",
+          id: "synthetic-model",
+        }),
+      },
+    });
+    await expect(mismatch).resolves.toMatchObject({
+      ok: false,
+      error: { code: "nativeFailure", message: "Pi did not activate the requested Model" },
+    });
+
+    transport.selectModel.mockRejectedValueOnce(
+      new PiRpcFaultError("protocolError", "synthetic uncertain Model state"),
+    );
+    await expect(
+      session.execute({ type: "model.select", model: requested }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: { code: "protocolError" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.faulted",
+      error: { code: "protocolError" },
+    });
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("rejects startup before Turn acceptance without lifecycle events", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.start.mockRejectedValueOnce(new Error("synthetic startup failure"));
+      transports.push(transport);
+      return transport;
+    });
+
+    const result = await session.execute(textTurn("rejected"));
+    expect(result).toMatchObject({ ok: false, error: { code: "unavailable" } });
+    expect((await nextEvent(iterator)).type).toBe("session.faulted");
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("completes an accepted failed Turn and remains reusable", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("turn-1"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    const nativeMessage = '503: {"message":"Service temporarily unavailable","type":"api_error"}';
+    transports[0]?.fail(new Error(nativeMessage));
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: {
+        outcome: { status: "failed", error: { code: "nativeFailure", message: nativeMessage } },
+      },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: {
+        status: "failed",
+        error: { code: "nativeFailure", message: nativeMessage },
+      },
+    });
+
+    await expect(session.execute(textTurn("turn-2"))).resolves.toMatchObject({ ok: true });
+    expect(transports[0]?.start).toHaveBeenCalledOnce();
+    transports[0]?.succeed("second");
+    await session.close();
+  });
+
+  it("maps interleaved Bash, Generic Tool, bounded output, and reliable Edit Patch", async () => {
+    const { adapter, transports } = fixture({ toolOutputLimit: 10 });
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("tools"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+
+    transport?.event({
+      type: "tool.started",
+      callId: "bash-1",
+      toolName: "bash",
+      arguments: { command: "printf complete" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.started",
+      item: { type: "commandExecution", command: "printf complete" },
+    });
+    transport?.event({
+      type: "tool.started",
+      callId: "custom-1",
+      toolName: "custom",
+      arguments: { value: 1 },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.started",
+      item: { type: "toolExecution", toolName: "custom" },
+    });
+    transport?.event({
+      type: "tool.updated",
+      callId: "bash-1",
+      output: { content: [{ type: "text", text: "abc" }] },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "output.append", text: "abc" },
+    });
+    transport?.event({
+      type: "tool.updated",
+      callId: "bash-1",
+      output: { content: [{ type: "text", text: "abcdef" }] },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "output.append", text: "def" },
+    });
+    transport?.event({
+      type: "tool.updated",
+      callId: "bash-1",
+      output: { content: [{ type: "text", text: "abcdefghijklmnop" }] },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: { type: "output.append", text: "ghij" },
+    });
+    transport?.event({
+      type: "tool.updated",
+      callId: "custom-1",
+      output: { content: [{ type: "text", text: "0123456789overflow" }] },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: {
+        type: "output.replace",
+        output: { content: [{ text: "0123456789" }], truncated: true },
+      },
+    });
+    transport?.event({
+      type: "tool.completed",
+      callId: "bash-1",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "abcdefghijklmnop" }], exitCode: 0 },
+      isError: false,
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: {
+        item: {
+          type: "commandExecution",
+          output: "abcdefghij",
+          outputTruncated: true,
+          exitCode: 0,
+        },
+        outcome: { status: "succeeded" },
+      },
+    });
+    transport?.event({
+      type: "tool.completed",
+      callId: "custom-1",
+      toolName: "custom",
+      result: { content: [{ type: "text", text: "custom done" }] },
+      isError: true,
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { outcome: { status: "failed" } },
+    });
+
+    transport?.event({
+      type: "tool.started",
+      callId: "edit-1",
+      toolName: "edit",
+      arguments: { path: "sample.txt" },
+    });
+    await nextEvent(iterator);
+    transport?.event({
+      type: "tool.completed",
+      callId: "edit-1",
+      toolName: "edit",
+      result: {
+        content: [{ type: "text", text: "edited" }],
+        details: {
+          patch: "--- a/sample.txt\n+++ b/sample.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        },
+      },
+      isError: false,
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "toolExecution", toolName: "edit" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.started",
+      item: {
+        type: "fileChange",
+        changes: [
+          { path: "sample.txt", kind: "update", unifiedDiff: expect.stringContaining("@@") },
+        ],
+      },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "fileChange" }, outcome: { status: "succeeded" } },
+    });
+
+    transport?.event({
+      type: "tool.started",
+      callId: "edit-numbered-1",
+      toolName: "edit",
+      arguments: {
+        i: "Adding tiny test marker",
+        input: "[docs/archive/README.md#6F1B]\nPUT >3:\n+",
+      },
+    });
+    await nextEvent(iterator);
+    transport?.event({
+      type: "tool.completed",
+      callId: "edit-numbered-1",
+      toolName: "edit",
+      result: {
+        content: [{ type: "text", text: "edited" }],
+        details: {
+          diff: " 1|# Archive\n 2|\n 3|Current documents.\n+4|\n+5|test-marker",
+          path: "docs/archive/README.md",
+          oldText: "# Archive\n\nCurrent documents.\n",
+          newText: "# Archive\n\nCurrent documents.\n\ntest-marker\n",
+        },
+      },
+      isError: false,
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "toolExecution", toolName: "edit" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.started",
+      item: {
+        type: "fileChange",
+        changes: [{ path: "docs/archive/README.md", kind: "update" }],
+      },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "fileChange" }, outcome: { status: "succeeded" } },
+    });
+
+    transport?.delta("finished");
+    await nextEvent(iterator);
+    transport?.succeed("finished");
+    await nextEvent(iterator);
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    await session.close();
+  });
+
+  it("does not infer File Change for Write or an Edit without a valid Patch", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("no-patch"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+
+    for (const [callId, toolName] of [
+      ["write-1", "write"],
+      ["edit-1", "edit"],
+    ] as const) {
+      transport?.event({ type: "tool.started", callId, toolName, arguments: {} });
+      await nextEvent(iterator);
+      transport?.event({
+        type: "tool.completed",
+        callId,
+        toolName,
+        result: { content: [{ type: "text", text: "done" }] },
+        isError: false,
+      });
+      expect(await nextEvent(iterator)).toMatchObject({
+        type: "item.completed",
+        snapshot: { item: { type: "toolExecution", toolName } },
+      });
+    }
+    transport?.succeed("");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await session.close();
+  });
+
+  it("maps a user Extension Tool-associated Pi select Question and returns the exact native answer", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("question"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+
+    transport?.event({
+      type: "tool.started",
+      callId: "question-tool",
+      toolName: "user_question_tool",
+      arguments: {},
+    });
+    const toolStarted = await nextEvent(iterator);
+    if (toolStarted.type !== "item.started") throw new Error("Question Tool did not start");
+    transport?.event({
+      type: "interaction.requested",
+      request: {
+        requestId: "native-question",
+        method: "select",
+        title: "Continue?",
+        options: ["continue", "stop"],
+        timeoutMs: 5_000,
+      },
+    });
+    const interaction = await nextInteraction(iterator);
+    expect(interaction).toMatchObject({
+      type: "question",
+      turnId: "question",
+      itemId: toolStarted.item.itemId,
+      title: "Pi",
+      questions: [
+        {
+          id: "answer",
+          type: "choice",
+          prompt: "Continue?",
+          options: [
+            { value: "continue", label: "continue" },
+            { value: "stop", label: "stop" },
+          ],
+        },
+      ],
+    });
+    await expect(
+      session.execute({
+        type: "interaction.respond",
+        interactionId: interaction.interactionId,
+        response: { type: "question", answers: { answer: ["continue"] } },
+      }),
+    ).resolves.toEqual({ ok: true, value: { accepted: true } });
+    expect(transport?.respondToInteraction).toHaveBeenCalledWith({
+      requestId: "native-question",
+      value: "continue",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      interactionId: interaction.interactionId,
+      reason: "responded",
+    });
+
+    transport?.event({
+      type: "tool.completed",
+      callId: "question-tool",
+      toolName: "user_question_tool",
+      result: { content: [{ type: "text", text: "answered" }] },
+      isError: false,
+    });
+    await nextEvent(iterator);
+    transport?.succeed("");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await session.close();
+  });
+
+  it.each(["custom", "select-dismissed", "input-dismissed"] as const)(
+    "keeps a questionnaire Tool active across sequential native prompts with a %s response",
+    async (answer) => {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const iterator = session.outputs[Symbol.asyncIterator]();
+      const turnId = hostTurnIdSchema.parse("questionnaire");
+      const projector = new CodexTurnProjector({
+        threadId: "pi-thread",
+        turnId,
+        cwd: "/workspace",
+        startedAtMs: 0,
+      });
+      await session.execute(textTurn(turnId));
+      await nextEvent(iterator);
+      const turnStarted = await nextEvent(iterator);
+      if (turnStarted.type !== "turn.started") throw new Error("Turn did not start");
+      projector.project(turnStarted);
+      const userStarted = await nextEvent(iterator);
+      if (userStarted.type !== "item.started") throw new Error("User Item did not start");
+      projector.project(userStarted);
+      const transport = transports[0];
+      if (!transport) throw new Error("Pi Transport did not start");
+
+      // A user Extension Tool owns both prompts; selecting Custom opens native input.
+      transport.event({
+        type: "tool.started",
+        callId: "questionnaire-tool",
+        toolName: "questionnaire",
+        arguments: {},
+      });
+      const toolStarted = await nextEvent(iterator);
+      if (toolStarted.type !== "item.started") throw new Error("Questionnaire did not start");
+      expect(toolStarted.item.type).toBe("toolExecution");
+      expect(projector.project(toolStarted).messages).toMatchObject([
+        {
+          method: "item/started",
+          params: { item: { id: toolStarted.item.itemId, tool: "questionnaire" } },
+        },
+      ]);
+
+      transport.event({
+        type: "interaction.requested",
+        request: {
+          requestId: "native-select",
+          method: "select",
+          title: "Choose a destination",
+          options: ["Preview (recommended)", "Custom…"],
+        },
+      });
+      const select = await nextInteraction(iterator);
+      expect(select).toMatchObject({
+        itemId: toolStarted.item.itemId,
+        turnId,
+        questions: [{ type: "choice", allowOther: false, multiple: false }],
+      });
+      const openedSelect = projector.projectQuestion(
+        select,
+        hostItemIdSchema.parse("unused-select"),
+      );
+      expect(openedSelect.messages).toEqual([]);
+      expect(openedSelect.questionRequest.request).toMatchObject({
+        method: "item/tool/requestUserInput",
+        params: {
+          itemId: toolStarted.item.itemId,
+          turnId,
+          questions: [
+            {
+              id: "answer",
+              question: "Choose a destination",
+              options: [{ label: "Preview (recommended)" }, { label: "Custom…" }],
+            },
+          ],
+        },
+      });
+      await expect(
+        session.execute({
+          type: "interaction.respond",
+          interactionId: select.interactionId,
+          response: openedSelect.questionRequest.parseResponse({
+            answers: answer === "select-dismissed" ? {} : { answer: { answers: ["Custom…"] } },
+          }),
+        }),
+      ).resolves.toEqual({ ok: true, value: { accepted: true } });
+      expect(transport.respondToInteraction).toHaveBeenNthCalledWith(1, {
+        requestId: "native-select",
+        ...(answer === "select-dismissed" ? { cancelled: true } : { value: "Custom…" }),
+      });
+      const selectClosed = await nextEvent(iterator);
+      if (selectClosed.type !== "interaction.closed") throw new Error("Select did not close");
+      expect(selectClosed).toMatchObject({
+        interactionId: select.interactionId,
+        reason: answer === "select-dismissed" ? "cancelled" : "responded",
+      });
+      expect(projector.project(selectClosed).messages).toEqual([]);
+
+      if (answer !== "select-dismissed") {
+        transport.event({
+          type: "interaction.requested",
+          request: {
+            requestId: "native-input",
+            method: "input",
+            title: "Enter a custom destination",
+            placeholder: "Destination",
+          },
+        });
+        const input = await nextInteraction(iterator);
+        expect(input.interactionId).not.toBe(select.interactionId);
+        expect(input).toMatchObject({
+          itemId: toolStarted.item.itemId,
+          turnId,
+          questions: [{ type: "text", multiline: false, placeholder: "Destination" }],
+        });
+        const openedInput = projector.projectQuestion(
+          input,
+          hostItemIdSchema.parse("unused-input"),
+        );
+        expect(openedInput.messages).toEqual([]);
+        expect(openedInput.questionRequest.request).toMatchObject({
+          method: "item/tool/requestUserInput",
+          params: {
+            itemId: toolStarted.item.itemId,
+            turnId,
+            questions: [{ id: "answer", question: "Enter a custom destination", options: null }],
+          },
+        });
+        const customValue = "  Custom destination / 東京  ";
+        await expect(
+          session.execute({
+            type: "interaction.respond",
+            interactionId: input.interactionId,
+            response: openedInput.questionRequest.parseResponse({
+              answers: answer === "input-dismissed" ? {} : { answer: { answers: [customValue] } },
+            }),
+          }),
+        ).resolves.toEqual({ ok: true, value: { accepted: true } });
+        expect(transport.respondToInteraction).toHaveBeenNthCalledWith(2, {
+          requestId: "native-input",
+          ...(answer === "input-dismissed" ? { cancelled: true } : { value: customValue }),
+        });
+        const inputClosed = await nextEvent(iterator);
+        if (inputClosed.type !== "interaction.closed") throw new Error("Input did not close");
+        expect(inputClosed).toMatchObject({
+          interactionId: input.interactionId,
+          reason: answer === "input-dismissed" ? "cancelled" : "responded",
+        });
+        expect(projector.project(inputClosed).messages).toEqual([]);
+      }
+      expect(transport.respondToInteraction).toHaveBeenCalledTimes(
+        answer === "select-dismissed" ? 1 : 2,
+      );
+      expect(() =>
+        projector.project({ type: "turn.completed", turnId, outcome: { status: "succeeded" } }),
+      ).toThrow("active Items");
+
+      // Dismissing a prompt does not cancel or complete its owning Tool or Turn.
+      transport.event({
+        type: "tool.completed",
+        callId: "questionnaire-tool",
+        toolName: "questionnaire",
+        result: { content: [{ type: "text", text: "Questionnaire finished" }] },
+        isError: false,
+      });
+      const toolCompleted = await nextEvent(iterator);
+      if (toolCompleted.type !== "item.completed")
+        throw new Error("Questionnaire did not complete");
+      expect(toolCompleted.snapshot).toMatchObject({
+        item: { itemId: toolStarted.item.itemId, type: "toolExecution", toolName: "questionnaire" },
+        outcome: { status: "succeeded" },
+      });
+      expect(projector.project(toolCompleted).messages).toMatchObject([
+        { method: "item/completed", params: { item: { id: toolStarted.item.itemId } } },
+      ]);
+      transport.succeed("");
+      const userCompleted = await nextEvent(iterator);
+      if (userCompleted.type !== "item.completed") throw new Error("User Item did not complete");
+      projector.project(userCompleted);
+      const turnCompleted = await nextEvent(iterator);
+      if (turnCompleted.type !== "turn.completed") throw new Error("Turn did not complete");
+      expect(projector.project(turnCompleted).completedTurn).toMatchObject({ status: "completed" });
+      await session.close();
+    },
+  );
+
+  it.each(["yes", "no", "dismissed"] as const)(
+    "projects an active bash confirm Question with a %s response through a synthetic lifecycle",
+    async (answer) => {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const iterator = session.outputs[Symbol.asyncIterator]();
+      const turnId = hostTurnIdSchema.parse("bash-confirm");
+      const projector = new CodexTurnProjector({
+        threadId: "pi-thread",
+        turnId,
+        cwd: "/workspace",
+        startedAtMs: 0,
+      });
+      await session.execute(textTurn(turnId));
+      await nextEvent(iterator);
+      const turnStarted = await nextEvent(iterator);
+      if (turnStarted.type !== "turn.started") throw new Error("Turn did not start");
+      projector.project(turnStarted);
+      const userStarted = await nextEvent(iterator);
+      if (userStarted.type !== "item.started") throw new Error("User Item did not start");
+      projector.project(userStarted);
+      const transport = transports[0];
+
+      // Pi starts bash before the guard's tool_call hook requests confirmation.
+      transport?.event({
+        type: "tool.started",
+        callId: "bash-tool",
+        toolName: "bash",
+        arguments: { command: "printf complete" },
+      });
+      const commandStarted = await nextEvent(iterator);
+      if (commandStarted.type !== "item.started") throw new Error("Command did not start");
+      expect(commandStarted.item.type).toBe("commandExecution");
+      projector.project(commandStarted);
+      transport?.event({
+        type: "interaction.requested",
+        request: {
+          requestId: "native-confirm",
+          method: "confirm",
+          title: "Confirm",
+          message: "Proceed?",
+        },
+      });
+      const interaction = await nextInteraction(iterator);
+      expect(transport?.respondToInteraction).not.toHaveBeenCalled();
+      const syntheticItemId = hostItemIdSchema.parse("synthetic-confirm");
+      const opened = projector.projectQuestion(interaction, syntheticItemId);
+      expect(interaction).not.toHaveProperty("itemId");
+      expect(opened.questionRequest.request).toMatchObject({
+        method: "item/tool/requestUserInput",
+        params: { itemId: syntheticItemId, turnId },
+      });
+      expect(opened.messages).toMatchObject([
+        { method: "item/started", params: { item: { id: syntheticItemId, tool: "question" } } },
+      ]);
+
+      await expect(
+        session.execute({
+          type: "interaction.respond",
+          interactionId: interaction.interactionId,
+          response:
+            answer === "dismissed"
+              ? { type: "question", answers: {}, cancelled: true }
+              : { type: "question", answers: { answer: [answer] } },
+        }),
+      ).resolves.toEqual({ ok: true, value: { accepted: true } });
+      expect(transport?.respondToInteraction).toHaveBeenCalledExactlyOnceWith({
+        requestId: "native-confirm",
+        ...(answer === "dismissed" ? { cancelled: true } : { confirmed: answer === "yes" }),
+      });
+      const closed = await nextEvent(iterator);
+      if (closed.type !== "interaction.closed") throw new Error("Question did not close");
+      expect(closed).toMatchObject({
+        interactionId: interaction.interactionId,
+        reason: answer === "dismissed" ? "cancelled" : "responded",
+      });
+      expect(projector.project(closed).messages).toMatchObject([
+        { method: "item/completed", params: { item: { id: syntheticItemId } } },
+      ]);
+
+      transport?.event({
+        type: "tool.completed",
+        callId: "bash-tool",
+        toolName: "bash",
+        result: { content: [{ type: "text", text: "complete" }], exitCode: 0 },
+        isError: false,
+      });
+      const commandCompleted = await nextEvent(iterator);
+      if (commandCompleted.type !== "item.completed") throw new Error("Command did not complete");
+      expect(commandCompleted.snapshot).toMatchObject({
+        item: { type: "commandExecution", itemId: commandStarted.item.itemId, exitCode: 0 },
+        outcome: { status: "succeeded" },
+      });
+      expect(projector.project(commandCompleted).messages).toMatchObject([
+        {
+          method: "item/completed",
+          params: { item: { id: commandStarted.item.itemId, type: "commandExecution" } },
+        },
+      ]);
+      transport?.succeed("");
+      const userCompleted = await nextEvent(iterator);
+      if (userCompleted.type !== "item.completed") throw new Error("User Item did not complete");
+      projector.project(userCompleted);
+      const turnCompleted = await nextEvent(iterator);
+      if (turnCompleted.type !== "turn.completed") throw new Error("Turn did not complete");
+      expect(projector.project(turnCompleted).completedTurn).toMatchObject({ status: "completed" });
+      await session.close();
+    },
+  );
+
+  it("maps confirm, input, and editor Questions without inferring Approval", async () => {
+    for (const request of [
+      {
+        requestId: "confirm",
+        method: "confirm" as const,
+        title: "Confirm",
+        message: "Proceed?",
+      },
+      {
+        requestId: "input",
+        method: "input" as const,
+        title: "Value",
+        placeholder: "type",
+      },
+      {
+        requestId: "editor",
+        method: "editor" as const,
+        title: "Edit",
+        prefill: "line 1\nline 2",
+      },
+    ]) {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const iterator = session.outputs[Symbol.asyncIterator]();
+      await session.execute(textTurn(`question-${request.method}`));
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      transports[0]?.event({ type: "interaction.requested", request });
+      const interaction = await nextInteraction(iterator);
+      expect(interaction.type).toBe("question");
+      expect(JSON.stringify(interaction)).not.toContain("approval");
+      expect(interaction.itemId).toBeUndefined();
+      if (request.method === "confirm") {
+        expect(interaction.questions[0]).toMatchObject({
+          type: "choice",
+          prompt: "Proceed?",
+        });
+        await session.execute({
+          type: "interaction.respond",
+          interactionId: interaction.interactionId,
+          response: { type: "question", answers: { answer: ["yes"] } },
+        });
+        expect(transports[0]?.respondToInteraction).toHaveBeenCalledWith({
+          requestId: "confirm",
+          confirmed: true,
+        });
+      } else {
+        expect(interaction.questions[0]).toMatchObject({
+          type: "text",
+          multiline: request.method === "editor",
+        });
+        await session.execute({
+          type: "interaction.respond",
+          interactionId: interaction.interactionId,
+          response: { type: "question", answers: { answer: ["value"] } },
+        });
+        expect(transports[0]?.respondToInteraction).toHaveBeenCalledWith({
+          requestId: request.requestId,
+          value: "value",
+        });
+      }
+      await nextEvent(iterator);
+      transports[0]?.succeed("");
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      await session.close();
+    }
+  });
+
+  it("rejects invalid and duplicate Pi Question responses", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("invalid-question"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.event({
+      type: "interaction.requested",
+      request: {
+        requestId: "native-question",
+        method: "select",
+        title: "Choose",
+        options: ["known"],
+      },
+    });
+    const interaction = await nextInteraction(iterator);
+    await expect(
+      session.execute({
+        type: "interaction.respond",
+        interactionId: interaction.interactionId,
+        response: { type: "question", answers: { answer: ["unknown"] } },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
+    await session.execute({
+      type: "interaction.respond",
+      interactionId: interaction.interactionId,
+      response: { type: "question", answers: {}, cancelled: true },
+    });
+    await nextEvent(iterator);
+    await expect(
+      session.execute({
+        type: "interaction.respond",
+        interactionId: interaction.interactionId,
+        response: { type: "question", answers: {}, cancelled: true },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidState" } });
+    transports[0]?.succeed("");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await session.close();
+  });
+
+  it("requests Abort idempotently, cancels active Items, and continues in the same Session", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("cancelled"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    transport?.event({
+      type: "tool.started",
+      callId: "long-1",
+      toolName: "long_tool",
+      arguments: {},
+    });
+    await nextEvent(iterator);
+    transport?.event({
+      type: "interaction.requested",
+      request: {
+        requestId: "cancel-question",
+        method: "select",
+        title: "Continue?",
+        options: ["yes", "no"],
+      },
+    });
+    const cancelledInteraction = await nextInteraction(iterator);
+
+    await expect(session.execute(cancelTurn("cancelled"))).resolves.toEqual({
+      ok: true,
+      value: { cancellationRequested: true },
+    });
+    await expect(session.execute(cancelTurn("cancelled"))).resolves.toEqual({
+      ok: true,
+      value: { cancellationRequested: true },
+    });
+    expect(transport?.abort).toHaveBeenCalledOnce();
+    transport?.event({
+      type: "interaction.closed",
+      requestId: "cancel-question",
+      reason: "cancelled",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      interactionId: cancelledInteraction.interactionId,
+      reason: "cancelled",
+    });
+    transport?.event({
+      type: "tool.completed",
+      callId: "long-1",
+      toolName: "long_tool",
+      result: { content: [{ type: "text", text: "cancelled" }] },
+      isError: true,
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { outcome: { status: "cancelled" } },
+    });
+    transport?.succeed("", true);
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { item: { type: "agentMessage" }, outcome: { status: "cancelled" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+
+    await expect(session.execute(textTurn("continued"))).resolves.toMatchObject({ ok: true });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transport?.delta("continued");
+    await nextEvent(iterator);
+    transport?.succeed("continued");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    expect(transport?.start).toHaveBeenCalledOnce();
+    await session.close();
+  });
+
+  it("treats a rejected native Turn as cancelled after Abort was accepted", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("cancelled rejection"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+
+    await expect(session.execute(cancelTurn("cancelled rejection"))).resolves.toEqual({
+      ok: true,
+      value: { cancellationRequested: true },
+    });
+    transport?.fail(Object.assign(new Error("This operation was aborted"), { name: "AbortError" }));
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { outcome: { status: "cancelled" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+
+    await expect(session.execute(textTurn("continued after cancellation"))).resolves.toMatchObject({
+      ok: true,
+    });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transport?.succeed("continued");
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await session.close();
+  });
+
+  it("fails the Turn and faults the Session when Abort is rejected", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("cancel failure"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    transport?.abort.mockRejectedValueOnce(new Error("synthetic Abort rejection"));
+
+    await expect(session.execute(cancelTurn("cancel failure"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "nativeFailure" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { outcome: { status: "failed" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "failed" },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "session.faulted" });
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    expect(transport?.close).toHaveBeenCalledOnce();
+    await session.close();
+  });
+
+  it("rejects a concurrent Turn while transport startup is reserved", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const session = await openSession(adapter);
+    let releaseStart!: () => void;
+    const startGate = new Promise<undefined>((resolve) => {
+      releaseStart = () => resolve(undefined);
+    });
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.start.mockImplementationOnce(() => startGate);
+      transports.push(transport);
+      return transport;
+    });
+
+    const first = session.execute(textTurn("first"));
+    const second = session.execute(textTurn("second"));
+    releaseStart();
+    await expect(first).resolves.toMatchObject({ ok: true });
+    await expect(second).resolves.toMatchObject({ ok: false, error: { code: "sessionBusy" } });
+    transports[0]?.succeed("done");
+    await session.close();
+  });
+
+  it("finishes the active lifecycle before faulting the Session", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("faulted"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.event({
+      type: "interaction.requested",
+      request: {
+        requestId: "fault-question",
+        method: "input",
+        title: "Value",
+      },
+    });
+    await nextInteraction(iterator);
+
+    transports[0]?.fault(new PiRpcFaultError("processExited", "synthetic process exit"));
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      reason: "cancelled",
+    });
+    expect((await nextEvent(iterator)).type).toBe("item.completed");
+    expect((await nextEvent(iterator)).type).toBe("turn.completed");
+    expect((await nextEvent(iterator)).type).toBe("session.faulted");
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("fails an active Turn once when close cannot prove cancellation settlement", async () => {
+    const { adapter, transports } = fixture({ closeTimeoutMs: 5 });
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("closing"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transports[0]?.event({
+      type: "interaction.requested",
+      request: {
+        requestId: "close-question",
+        method: "editor",
+        title: "Value",
+      },
+    });
+    await nextInteraction(iterator);
+
+    await session.close();
+    expect(transports[0]?.abort).toHaveBeenCalledOnce();
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      reason: "cancelled",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: { outcome: { status: "failed" } },
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "failed" },
+    });
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("starts the native transport without injecting a codexhost Extension", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const session = await openSession(adapter);
+    expect(dependencies.createTransport).not.toHaveBeenCalled();
+
+    await session.execute(textTurn("native-capabilities-only"));
+    expect(transports[0]?.options).toMatchObject({ cwd: "/synthetic" });
+    expect(transports[0]?.options).not.toHaveProperty("extensionPath");
+    transports[0]?.succeed("done");
+    await session.close();
+  });
+
+  it("does not create a transport for unused prewarm and closes idempotently", async () => {
+    const { adapter, dependencies } = fixture();
+    const session = await openSession(adapter);
+
+    await expect(Promise.all([session.close(), session.close()])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+    expect(dependencies.createTransport).not.toHaveBeenCalled();
+    await expect(Promise.all([adapter.close(), adapter.close()])).resolves.toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+});

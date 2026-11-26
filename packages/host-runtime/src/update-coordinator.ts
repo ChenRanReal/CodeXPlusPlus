@@ -1,0 +1,301 @@
+import type {
+  UpdateCheckResult,
+  UpdateStartResult,
+  UpdateStatus,
+  UpdateStatusResult,
+} from "@codexhost/shared-contracts";
+import {
+  acquireUpdateOperationLock,
+  cleanupTerminalUpdateState,
+  compareSemanticVersions,
+  createBackgroundUpdateManager,
+  createNpmReleaseAvailability,
+  discoverActiveUpdateStatus,
+  discoverRecentCompletedUpdateStatus,
+  fetchLatestGitHubRelease,
+  fetchLatestGitHubReleaseWithGitHubCli,
+  recoverUpdateOperationLock,
+  resolveInstalledUpdateContext,
+  readRuntimeMetadata,
+  selectInstallerReleaseArtifact,
+  type BackgroundUpdateManager,
+  type BackgroundUpdateStatus,
+  type CodexhostLatestRelease,
+  type InstalledUpdateContext,
+  type NpmReleaseAvailability,
+} from "@codexhost/update-manager";
+
+const ERROR_MAX_LENGTH = 500;
+
+export interface HostUpdateCoordinator {
+  check(signal?: AbortSignal): Promise<UpdateCheckResult>;
+  start(): Promise<UpdateStartResult>;
+  status(): Promise<UpdateStatusResult>;
+}
+
+export interface CreateHostUpdateCoordinatorOptions {
+  hostRuntimePath: string;
+  environment?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  architecture?: string;
+  manager?: BackgroundUpdateManager;
+  fetchLatest?(signal?: AbortSignal): Promise<CodexhostLatestRelease>;
+  npmRelease?: NpmReleaseAvailability;
+}
+
+function boundedError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, ERROR_MAX_LENGTH) || "Update operation failed";
+}
+
+function publicStatus(status: BackgroundUpdateStatus): UpdateStatus {
+  return {
+    version: status.version,
+    installation: status.installation,
+    phase: status.phase,
+    updatedAt: status.updatedAt,
+    ...(status.downloadedBytes === undefined ? {} : { downloadedBytes: status.downloadedBytes }),
+    ...(status.totalBytes === undefined ? {} : { totalBytes: status.totalBytes }),
+    error: status.error?.slice(0, ERROR_MAX_LENGTH) ?? null,
+    ...(status.serviceStopOutput === undefined
+      ? {}
+      : { serviceStopOutput: status.serviceStopOutput }),
+  };
+}
+
+export function createHostUpdateCoordinator(
+  options: CreateHostUpdateCoordinatorOptions,
+): HostUpdateCoordinator {
+  const platform = options.platform ?? process.platform;
+  const manager = options.manager ?? createBackgroundUpdateManager({ platform });
+  const npmRelease = options.npmRelease ?? createNpmReleaseAvailability();
+  let contextPromise: Promise<InstalledUpdateContext> | undefined;
+  const installedContext = (): Promise<InstalledUpdateContext> => {
+    contextPromise ??= resolveInstalledUpdateContext({
+      hostRuntimePath: options.hostRuntimePath,
+      ...(options.environment ? { environment: options.environment } : {}),
+      ...(options.platform ? { platform: options.platform } : {}),
+      ...(options.architecture ? { architecture: options.architecture } : {}),
+    });
+    return contextPromise;
+  };
+  const fetchLatest: (signal?: AbortSignal) => Promise<CodexhostLatestRelease> =
+    options.fetchLatest ??
+    (async (signal?: AbortSignal) => {
+      const timeoutSignal = AbortSignal.timeout(15_000);
+      const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+      const authenticated = await fetchLatestGitHubReleaseWithGitHubCli({
+        ...(options.environment ? { environment: options.environment } : {}),
+        platform,
+        signal: requestSignal,
+      });
+      return authenticated ?? fetchLatestGitHubRelease({ signal: requestSignal });
+    });
+  let candidate: CodexhostLatestRelease | null = null;
+
+  let currentStatusPath: string | null = null;
+
+  async function latestStatus(context: InstalledUpdateContext): Promise<UpdateStatus | null> {
+    if (!currentStatusPath) {
+      const active = await discoverActiveUpdateStatus(context.common.stateDirectory);
+      if (!active) {
+        const completed = await discoverRecentCompletedUpdateStatus(context.common.stateDirectory);
+        return completed ? publicStatus(completed.status) : null;
+      }
+      currentStatusPath = active.statusPath;
+    }
+    const status = await manager.readStatus(currentStatusPath);
+    return status ? publicStatus(status) : null;
+  }
+
+  /**
+   * Whether this installation can install the release now. `error` is set when that cannot
+   * be determined or never will be; `false` without an error means the release is not yet in
+   * the npm registry this installation updates from, and is offered once it is.
+   */
+  async function installable(
+    context: InstalledUpdateContext,
+    release: CodexhostLatestRelease,
+  ): Promise<{ available: boolean; error: string | null }> {
+    if (context.installation.kind === "npm") {
+      const npm = context.installation.options;
+      try {
+        const available = await npmRelease.installable({
+          nodePath: npm.nodePath,
+          npmCliPath: npm.npmCliPath,
+          packageRoot: npm.packageRoot,
+          version: release.version,
+        });
+        return { available, error: null };
+      } catch (error) {
+        return { available: false, error: boundedError(error) };
+      }
+    }
+    try {
+      selectInstallerReleaseArtifact(release, context.metadata.target);
+      return { available: true, error: null };
+    } catch {
+      return {
+        available: false,
+        error: "The latest GitHub Release has no verified asset for this installation",
+      };
+    }
+  }
+
+  return Object.freeze({
+    async check(signal?: AbortSignal): Promise<UpdateCheckResult> {
+      let context: InstalledUpdateContext;
+      try {
+        context = await installedContext();
+        await recoverUpdateOperationLock(context.common.stateDirectory);
+        await cleanupTerminalUpdateState(context.common.stateDirectory);
+      } catch (error) {
+        const runtime = await readRuntimeMetadata(
+          options.hostRuntimePath,
+          options.environment,
+        ).catch(() => null);
+        return {
+          currentVersion: runtime?.distribution === "development" ? runtime.version : "0.0.0",
+          installation: null,
+          latestVersion: null,
+          updateAvailable: false,
+          installationAvailable: false,
+          releaseNotes: null,
+          releaseNotesUrl: null,
+          status: null,
+          error: boundedError(error),
+        };
+      }
+      const status = await latestStatus(context);
+      try {
+        const release = await fetchLatest(signal);
+        candidate = release;
+        const updateAvailable =
+          compareSemanticVersions(context.metadata.version, release.version) < 0;
+        const { available: installationAvailable, error } = updateAvailable
+          ? await installable(context, release)
+          : { available: false, error: null };
+        return {
+          currentVersion: context.metadata.version,
+          installation: context.installation.kind,
+          latestVersion: release.version,
+          updateAvailable,
+          installationAvailable,
+          releaseNotes: release.releaseNotes,
+          releaseNotesUrl: release.releaseNotesUrl,
+          status,
+          error,
+        };
+      } catch (error) {
+        return {
+          currentVersion: context.metadata.version,
+          installation: context.installation.kind,
+          latestVersion: null,
+          updateAvailable: false,
+          installationAvailable: false,
+          releaseNotes: null,
+          releaseNotesUrl: null,
+          status,
+          error: boundedError(error),
+        };
+      }
+    },
+
+    async start(): Promise<UpdateStartResult> {
+      const context = await installedContext();
+      await recoverUpdateOperationLock(context.common.stateDirectory);
+      const lock = await acquireUpdateOperationLock(context.common.stateDirectory);
+      if (!lock) {
+        const existing = await latestStatus(context);
+        if (existing) return { status: existing };
+        throw new Error("Another update operation is already active");
+      }
+
+      currentStatusPath = null;
+      let resolvePrepared!: (info: {
+        version: string;
+        installation: BackgroundUpdateStatus["installation"];
+        statusPath: string;
+      }) => void;
+      let rejectPrepared!: (error: unknown) => void;
+      const preparedReady = new Promise<{
+        version: string;
+        installation: BackgroundUpdateStatus["installation"];
+        statusPath: string;
+      }>((resolve, reject) => {
+        resolvePrepared = resolve;
+        rejectPrepared = reject;
+      });
+
+      try {
+        const release = await fetchLatest();
+        if (
+          compareSemanticVersions(context.metadata.version, release.version) >= 0 ||
+          (candidate && candidate.version !== release.version)
+        ) {
+          throw new Error("The selected update is no longer the current GitHub Release");
+        }
+        const onPrepared = async (info: {
+          version: string;
+          installation: BackgroundUpdateStatus["installation"];
+          statusPath: string;
+        }): Promise<void> => {
+          await lock.setStatusPath(info.statusPath);
+          currentStatusPath = info.statusPath;
+          resolvePrepared(info);
+        };
+        const prepareAndStart = async (): Promise<void> => {
+          try {
+            let prepared;
+            if (context.installation.kind === "npm") {
+              prepared = await manager.prepareNpm({
+                ...context.installation.options,
+                version: release.version,
+                onPrepared,
+              });
+            } else {
+              const artifact = selectInstallerReleaseArtifact(
+                release,
+                context.metadata.target,
+              ).source;
+              const installation = context.installation;
+              const options = { version: release.version, artifact, onPrepared };
+              prepared =
+                installation.kind === "windows-installer"
+                  ? await manager.prepareWindowsInstaller({ ...installation.options, ...options })
+                  : installation.kind === "macos-dmg"
+                    ? await manager.prepareMacOsDmg({ ...installation.options, ...options })
+                    : await manager.prepareLinuxArchive({ ...installation.options, ...options });
+            }
+            // The Launcher starts the Updater on macOS and Windows. On Windows the
+            // Host Runtime runs in the Shim's kill-on-close Job, so an Updater it
+            // started would be killed together with the Desktop it waits for.
+            if (!context.common.serviceManaged && platform !== "darwin" && platform !== "win32")
+              await manager.start(prepared, (pid) => lock.transferTo(pid));
+          } catch (error) {
+            await lock.release();
+            rejectPrepared(error);
+          }
+        };
+        void prepareAndStart();
+        const prepared = await preparedReady;
+        const status = await manager.readStatus(prepared.statusPath);
+        if (!status) throw new Error("Background update did not create status");
+        return { status: publicStatus(status) };
+      } catch (error) {
+        await lock.release();
+        throw error;
+      }
+    },
+
+    async status(): Promise<UpdateStatusResult> {
+      try {
+        const context = await installedContext();
+        await recoverUpdateOperationLock(context.common.stateDirectory);
+        return { status: await latestStatus(context) };
+      } catch {
+        return { status: null };
+      }
+    },
+  });
+}

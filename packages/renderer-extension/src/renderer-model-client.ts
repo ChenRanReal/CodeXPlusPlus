@@ -1,0 +1,1013 @@
+import {
+  HOST_EXTENSIONS_RPC,
+  hostExtensionsRpcSchemas,
+  type HostExtensionsRpcParams,
+  type HostExtensionsRpcResult,
+  SKILLS_LIST_METHOD,
+  SKILLS_CHANGED_METHOD,
+  skillsListParamsSchema,
+  skillsListResultSchema,
+  skillsChangedParamsSchema,
+  type SkillsListParams,
+  type SkillsListResult,
+  type SkillsChangedParams,
+  DELEGATION_READ_METHOD,
+  delegationReadParamsSchema,
+  type DelegationReadParams,
+  REMOTE_SSH_SETUP_METHOD,
+  remoteSshSetupResultSchema,
+  remoteSshSetupParamsSchema,
+  type RemoteSshSetupParams,
+  type RemoteSshSetupResult,
+  RUNTIME_STATUS_METHOD,
+  REMOTE_UPDATE_METHOD,
+  runtimeStatusSchema,
+  type RuntimeStatus,
+} from "@codexhost/shared-contracts";
+import {
+  type HarnessInstallationParams,
+  type HarnessInstallationState,
+  HARNESS_DISPLAY_GET_METHOD,
+  HARNESS_DISPLAY_CHANGED_METHOD,
+  HARNESS_DISPLAY_CAPABILITIES_METHOD,
+  harnessDisplayCapabilitiesSchema,
+  HARNESS_DISPLAY_SET_METHOD,
+  harnessDisplaySettingsSchema,
+  type HarnessDisplaySet,
+  type HarnessDisplaySettings,
+  CONSOLE_OPEN_METHOD,
+  WEB_OPEN_METHOD,
+  webOpenParamsSchema,
+  webOpenResultSchema,
+  type WebOpenResult,
+  consoleOpenParamsSchema,
+  consoleOpenResultSchema,
+  type ConsoleOpenResult,
+  HARNESS_LAUNCH_SETTINGS_GET_METHOD,
+  HARNESS_LAUNCH_SETTINGS_SET_METHOD,
+  harnessLaunchSettingsGetSchema,
+  harnessLaunchSettingsSetSchema,
+  harnessLaunchSettingsSchema,
+  type HarnessLaunchSettings,
+  type HarnessLaunchSettingsGet,
+  type HarnessLaunchSettingsSet,
+  IDLE_RELEASE_SETTINGS_METHOD,
+  LOADED_SESSIONS_METHOD,
+  loadedSessionsSchema,
+  type LoadedSession,
+  idleReleaseSettingsSchema,
+  type IdleReleaseSettings,
+  harnessAccountInspectParamsSchema,
+  harnessAccountInspectResultSchema,
+  harnessAccountSourceListResultSchema,
+  type HarnessAccountInspectParams,
+  type HarnessAccountInspectResult,
+  type HarnessAccountSourceListResult,
+  harnessAccountListParamsSchema,
+  harnessAccountListResultSchema,
+  type HarnessAccountListParams,
+  type HarnessAccountListResult,
+  codexAccountUsageParamsSchema,
+  codexAccountUsageResultSchema,
+  type CodexAccountUsageParams,
+  type CodexAccountUsageResult,
+  codexAccountChangedSchema,
+  codexAccountListResultSchema,
+  externalThreadForkParamsSchema,
+  externalThreadForkResultSchema,
+  harnessCommandCatalogSchema,
+  harnessCommandsInspectParamsSchema,
+  harnessConfigurationStateSchema,
+  harnessInspectParamsSchema,
+  harnessInspectionSchema,
+  harnessPluginListResultSchema,
+  type HarnessPluginListResult,
+  harnessWebUiOpenParamsSchema,
+  harnessWebUiOpenResultSchema,
+  harnessModelSelectionStateSchema,
+  hostThreadIdSchema,
+  threadInspectionParamsSchema,
+  threadInspectionSchema,
+  threadCommandExecuteParamsSchema,
+  threadCommandExecuteResultSchema,
+  threadCommandsInspectParamsSchema,
+  threadModelSelectParamsSchema,
+  threadPermissionModeSelectParamsSchema,
+  threadThinkingSelectParamsSchema,
+  threadOwnershipListParamsSchema,
+  threadOwnershipListResultSchema,
+  threadUsageInspectionParamsSchema,
+  threadUsageInspectionSchema,
+  RELEASE_ANNOUNCEMENT_ACKNOWLEDGE_METHOD,
+  RELEASE_ANNOUNCEMENT_GET_METHOD,
+  releaseAnnouncementAcknowledgeParamsSchema,
+  releaseAnnouncementGetParamsSchema,
+  releaseAnnouncementGetResultSchema,
+  type ReleaseAnnouncementAcknowledgeParams,
+  type ReleaseAnnouncementGetParams,
+  type ReleaseAnnouncementGetResult,
+  updateCheckResultSchema,
+  updateEmptyParamsSchema,
+  updateStartResultSchema,
+  updateStatusResultSchema,
+  type ExternalThreadForkParams,
+  type ExternalThreadForkResult,
+  type CodexAccountChanged,
+  type CodexAccountListResult,
+  type HarnessCommandCatalog,
+  type HarnessCommandsInspectParams,
+  type HarnessConfigurationState,
+  type HarnessInspection,
+  type HarnessInspectParams,
+  type HarnessWebUiOpenParams,
+  type HarnessModelSelectionState,
+  type ThreadInspection,
+  type ThreadInspectionParams,
+  type ThreadCommandExecuteParams,
+  type ThreadCommandExecuteResult,
+  type ThreadCommandsInspectParams,
+  type ThreadModelSelectParams,
+  type ThreadPermissionModeSelectParams,
+  type ThreadThinkingSelectParams,
+  type ThreadOwnershipListParams,
+  type ThreadOwnershipListResult,
+  type ThreadUsageInspection,
+  type ThreadUsageInspectionParams,
+  type UpdateCheckResult,
+  type UpdateStartResult,
+  type UpdateStatusResult,
+} from "@codexhost/shared-contracts";
+import { runRendererInstallation } from "./renderer-installation-client.js";
+
+import {
+  createRendererRequestSender,
+  isUnsupportedMethod,
+  RendererMethodUnavailableError,
+  type RendererRequestOptions,
+} from "./renderer-request-sender.js";
+import {
+  usesIndependentNativeInference,
+  readNativeCodexThread,
+  verifyNativeCodexThread,
+} from "./renderer-native-thread.js";
+import {
+  HARNESS_PREFERENCES_GET_METHOD,
+  HARNESS_PREFERENCES_PATCH_METHOD,
+  HARNESS_PREFERENCES_CHANGED_METHOD,
+  harnessPreferenceSnapshotSchema,
+  harnessPreferencePatchSchema,
+  harnessPreferenceGetSchema,
+  type HarnessPreferenceSnapshot,
+  type HarnessPreferencePatch,
+} from "@codexhost/shared-contracts";
+import {
+  createRendererSessionImportClient,
+  type RendererSessionImportClient,
+} from "./renderer-session-import-client.js";
+
+export const HARNESS_INSPECT_METHOD = "codexhost/harness/inspect";
+export const HARNESS_PLUGIN_LIST_METHOD = "codexhost/harness/plugins/list";
+import {
+  CREDENTIAL_IMPORTS_METHOD,
+  credentialImportsParamsSchema,
+  credentialImportsResultSchema,
+  type CredentialImportsRequest,
+  type CredentialImportsResult,
+} from "@codexhost/shared-contracts";
+
+export const HARNESS_ACCOUNT_SOURCES_METHOD = "codexhost/harness/accounts/sources";
+export const HARNESS_ACCOUNT_INSPECT_METHOD = "codexhost/harness/accounts/inspect";
+export const HARNESS_WEB_UI_OPEN_METHOD = "codexhost/harness/web-ui/open";
+export const THREAD_FORK_METHOD = "codexhost/thread/fork";
+export const THREAD_INSPECT_METHOD = "codexhost/thread/inspect";
+export const HARNESS_COMMANDS_INSPECT_METHOD = "codexhost/harness/commands/inspect";
+export const THREAD_COMMANDS_INSPECT_METHOD = "codexhost/thread/commands/inspect";
+export const THREAD_COMMAND_EXECUTE_METHOD = "codexhost/thread/command/execute";
+export const THREAD_MODEL_SELECT_METHOD = "codexhost/thread/model/select";
+export const THREAD_THINKING_SELECT_METHOD = "codexhost/thread/thinking/select";
+export const THREAD_PERMISSION_MODE_SELECT_METHOD = "codexhost/thread/permission-mode/select";
+export const THREAD_OWNERSHIP_LIST_METHOD = "codexhost/thread/ownership/list";
+export const THREAD_USAGE_INSPECT_METHOD = "codexhost/thread/usage/inspect";
+export const THREAD_USAGE_UPDATED_METHOD = "codexhost/thread/usage/updated";
+export const THREAD_TOKEN_USAGE_UPDATED_METHOD = "thread/tokenUsage/updated";
+/**
+ * Desktop filters custom usage notifications before native manager callbacks;
+ * renderer-host-clients also observes their raw per-Host window messages.
+ * Native Token updates and Turn completion remain fallback refresh signals,
+ * including for account quota after a reply.
+ */
+export const TURN_COMPLETED_METHOD = "turn/completed";
+const THREAD_USAGE_REFRESH_METHODS = [
+  THREAD_TOKEN_USAGE_UPDATED_METHOD,
+  THREAD_USAGE_UPDATED_METHOD,
+  TURN_COMPLETED_METHOD,
+] as const;
+export const UPDATE_CHECK_METHOD = "codexhost/update/check";
+export const UPDATE_START_METHOD = "codexhost/update/start";
+export const UPDATE_STATUS_METHOD = "codexhost/update/status";
+export const CODEX_ACCOUNT_LIST_METHOD = "codexhost/account/list";
+export const CODEX_ACCOUNT_REFRESH_METHOD = "codexhost/account/refresh";
+export const CODEX_ACCOUNT_CHANGED_METHOD = "codexhost/account/changed";
+
+import {
+  THREAD_TREE_SNAPSHOT_METHOD,
+  THREAD_TREE_UNWATCH_METHOD,
+  THREAD_TREE_WATCH_METHOD,
+  threadTreeWatchResultSchema,
+  type ThreadTreeSnapshot,
+} from "@codexhost/shared-contracts";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function notifiedThreadId(notification: unknown): ThreadUsageInspectionParams["threadId"] | null {
+  if (
+    !isRecord(notification) ||
+    !(THREAD_USAGE_REFRESH_METHODS as readonly unknown[]).includes(notification.method)
+  ) {
+    return null;
+  }
+  const params = notification.params;
+  if (!isRecord(params)) return null;
+  const parsed = hostThreadIdSchema.safeParse(params.threadId);
+  return parsed.success ? parsed.data : null;
+}
+
+interface RequestManagerCandidate {
+  addNotificationCallback?: (
+    method: string | readonly string[],
+    callback: (notification: unknown) => void,
+  ) => () => void;
+  sendRequest?: (method: string, params: unknown, options?: unknown) => Promise<unknown> | unknown;
+  requestClient?: RequestManagerCandidate;
+}
+
+function notificationTarget(manager: RequestManagerCandidate): RequestManagerCandidate | null {
+  if (typeof manager.addNotificationCallback === "function") return manager;
+  const nested = manager.requestClient;
+  return nested && typeof nested.addNotificationCallback === "function" ? nested : null;
+}
+
+/** Target of a native inference route check: an existing Thread or a new draft's workspace. */
+export type NativeInferenceTarget = ThreadInspectionParams | { cwd: string };
+
+export interface RendererModelClient extends Partial<RendererSessionImportClient> {
+  watchThreadTree?(receive: (snapshot: ThreadTreeSnapshot) => void): () => void;
+  hasDesktopThread?(id: string): Promise<boolean>;
+  getHarnessPreferences?(scope?: string): Promise<HarnessPreferenceSnapshot>;
+  patchHarnessPreferences?(input: HarnessPreferencePatch): Promise<HarnessPreferenceSnapshot>;
+  subscribeHarnessPreferences?(listener: () => void): () => void;
+  installation?(input: HarnessInstallationParams): Promise<HarnessInstallationState>;
+  getHarnessDisplayCapabilities?(): Promise<{ events: boolean }>;
+  subscribeHarnessDisplaySettings?(listener: () => void): () => void;
+  getHarnessDisplaySettings?(): Promise<HarnessDisplaySettings>;
+  setHarnessDisplaySettings?(input: HarnessDisplaySet): Promise<HarnessDisplaySettings>;
+  getHarnessLaunchSettings?(input: HarnessLaunchSettingsGet): Promise<HarnessLaunchSettings>;
+  setHarnessLaunchSettings?(input: HarnessLaunchSettingsSet): Promise<HarnessLaunchSettings>;
+  setIdleReleaseSettings?(settings: IdleReleaseSettings): Promise<IdleReleaseSettings>;
+  listLoadedSessions?(): Promise<LoadedSession[]>;
+  /** Use the local Host client, independent of the active Composer. */
+  listHostExtensions?(): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.list>>;
+  snapshotHostExtensions?(): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.snapshot>>;
+  subscribeHostExtensionsChanged?(listener: () => void): () => void;
+  listHostExtensionCatalog?(
+    input?: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.catalog>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.catalog>>;
+  installHostExtension?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.install>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.install>>;
+  updateHostExtension?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.update>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.update>>;
+  enableHostExtension?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.enable>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.enable>>;
+  disableHostExtension?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.disable>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.disable>>;
+  uninstallHostExtension?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.uninstall>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.uninstall>>;
+  recoverHostExtensions?(
+    input?: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.recover>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.recover>>;
+  readHostExtensionAsset?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.asset>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.asset>>;
+  getHostExtensionSettings?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.settingsGet>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.settingsGet>>;
+  setHostExtensionSettings?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.settingsSet>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.settingsSet>>;
+  invokeHostExtensionBackend?(
+    input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.backendInvoke>,
+  ): Promise<HostExtensionsRpcResult<typeof HOST_EXTENSIONS_RPC.backendInvoke>>;
+  currentHostId?(composer?: Element): string | null;
+  knownHostIds?(): readonly string[];
+  listHarnessPlugins?(): Promise<HarnessPluginListResult>;
+  listSkills?(params: SkillsListParams): Promise<SkillsListResult>;
+  subscribeSkillsChanged?(listener: (params: SkillsChangedParams) => void): () => void;
+  clientForHost?(hostId: string): RendererModelClient | null;
+  forkThread(input: ExternalThreadForkParams): Promise<ExternalThreadForkResult>;
+  inspectHarness(
+    input: HarnessInspectParams,
+    options?: RendererRequestOptions,
+  ): Promise<HarnessInspection>;
+  openHarnessWebUi?(input: HarnessWebUiOpenParams): Promise<void>;
+  inspectThread(input: ThreadInspectionParams): Promise<ThreadInspection>;
+  /**
+   * Checks whether native Codex inference bypasses the Codex quota. An existing
+   * Thread uses its own provider and workspace; a new draft passes the
+   * workspace Desktop picked for it so project `.codex/config.toml` applies.
+   */
+  usesIndependentNativeInference?(input?: NativeInferenceTarget): Promise<boolean>;
+  inspectHarnessCommands(input: HarnessCommandsInspectParams): Promise<HarnessCommandCatalog>;
+  inspectThreadCommands(input: ThreadCommandsInspectParams): Promise<HarnessCommandCatalog>;
+  executeThreadCommand(input: ThreadCommandExecuteParams): Promise<ThreadCommandExecuteResult>;
+  listThreadOwnership(input: ThreadOwnershipListParams): Promise<ThreadOwnershipListResult>;
+  inspectThreadUsage(input: ThreadUsageInspectionParams): Promise<ThreadUsageInspection>;
+  subscribeThreadUsage?(listener: (update: ThreadUsageInspection) => void): () => void;
+  selectThreadModel(input: ThreadModelSelectParams): Promise<HarnessModelSelectionState>;
+  selectThreadThinking(input: ThreadThinkingSelectParams): Promise<HarnessModelSelectionState>;
+  selectThreadPermissionMode(
+    input: ThreadPermissionModeSelectParams,
+  ): Promise<HarnessConfigurationState>;
+  setupSsh?(input: RemoteSshSetupParams): Promise<RemoteSshSetupResult>;
+  readDelegationThread?(input: DelegationReadParams): Promise<unknown>;
+  runtimeStatus?(): Promise<RuntimeStatus>;
+  updateRemote?(version: string): Promise<RuntimeStatus>;
+  checkUpdate(): Promise<UpdateCheckResult | null>;
+  startUpdate(): Promise<UpdateStartResult>;
+  readUpdateStatus(): Promise<UpdateStatusResult>;
+  getReleaseAnnouncement?(
+    input?: ReleaseAnnouncementGetParams,
+  ): Promise<ReleaseAnnouncementGetResult | null>;
+  acknowledgeReleaseAnnouncement?(input: ReleaseAnnouncementAcknowledgeParams): Promise<void>;
+  openConsole?(): Promise<ConsoleOpenResult>;
+  openWeb?(): Promise<WebOpenResult>;
+  inspectCodexAccountUsage?(input: CodexAccountUsageParams): Promise<CodexAccountUsageResult>;
+  listHarnessAccountSources?(): Promise<HarnessAccountSourceListResult>;
+  inspectHarnessAccount?(input: HarnessAccountInspectParams): Promise<HarnessAccountInspectResult>;
+  listHarnessAccounts?(input?: HarnessAccountListParams): Promise<HarnessAccountListResult>;
+  credentialImports?(
+    request: CredentialImportsRequest,
+    targetHarnessId?: string,
+  ): Promise<CredentialImportsResult>;
+  listCodexAccounts(): Promise<CodexAccountListResult>;
+  refreshCodexAccounts(): Promise<CodexAccountListResult>;
+  subscribeCodexAccounts?(listener: (state: CodexAccountChanged) => void): () => void;
+}
+
+export function createThreadUsageSubscriptionRelay(): {
+  connect(client: Pick<RendererModelClient, "subscribeThreadUsage"> | null): void;
+  subscribe(listener: (update: ThreadUsageInspection) => void): () => void;
+  dispose(): void;
+} {
+  const listeners = new Set<(update: ThreadUsageInspection) => void>();
+  let removeNotificationCallback: (() => void) | null = null;
+  let connectedClient: Pick<RendererModelClient, "subscribeThreadUsage"> | null = null;
+  let generation = 0;
+  const disconnect = (): void => {
+    generation += 1;
+    removeNotificationCallback?.();
+    removeNotificationCallback = null;
+    connectedClient = null;
+  };
+  return {
+    connect(client) {
+      if (client === connectedClient && removeNotificationCallback) return;
+      disconnect();
+      if (!client || listeners.size === 0) return;
+      connectedClient = client;
+      const subscriptionGeneration = generation;
+      try {
+        removeNotificationCallback =
+          client.subscribeThreadUsage?.((update) => {
+            if (subscriptionGeneration !== generation) return;
+            for (const listener of listeners) listener(update);
+          }) ?? null;
+      } catch {
+        disconnect();
+      }
+    },
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size > 0) return;
+        disconnect();
+      };
+    },
+    dispose() {
+      disconnect();
+      listeners.clear();
+    },
+  };
+}
+
+export function createRendererModelClient(
+  candidates: readonly RequestManagerCandidate[],
+): RendererModelClient | null {
+  const managers = candidates.filter(
+    (
+      candidate,
+    ): candidate is RequestManagerCandidate &
+      Required<Pick<RequestManagerCandidate, "sendRequest">> =>
+      typeof candidate.sendRequest === "function",
+  );
+  const source = managers[0];
+  if (managers.length !== 1 || !source) return null;
+  const manager = {
+    sendRequest: createRendererRequestSender((method, params, options) =>
+      options === undefined
+        ? source.sendRequest(method, params)
+        : source.sendRequest(method, params, options),
+    ),
+  };
+
+  const extensionListeners = new Set<() => void>();
+  const extensionsChanged = <T>(result: T): T => {
+    for (const listener of [...extensionListeners]) {
+      try {
+        listener();
+      } catch {
+        // A renderer subscriber must not invalidate a successful Host mutation.
+      }
+    }
+    return result;
+  };
+
+  const watchThreadTree = (receive: (snapshot: ThreadTreeSnapshot) => void) => {
+    let closed = false;
+    let subscriptionId: string | undefined;
+    let revision = -1;
+    const unwatch = (id: string) =>
+      void manager
+        .sendRequest(THREAD_TREE_UNWATCH_METHOD, { subscriptionId: id })
+        .catch(() => undefined);
+    const remove = notificationTarget(source)?.addNotificationCallback?.(
+      THREAD_TREE_SNAPSHOT_METHOD,
+      (message) => {
+        const result = threadTreeWatchResultSchema.safeParse(
+          isRecord(message) ? message.params : undefined,
+        );
+        if (
+          !closed &&
+          result.success &&
+          subscriptionId === result.data.subscriptionId &&
+          result.data.snapshot.revision > revision
+        ) {
+          revision = result.data.snapshot.revision;
+          receive(result.data.snapshot);
+        }
+      },
+    );
+    if (remove)
+      void manager
+        .sendRequest(THREAD_TREE_WATCH_METHOD, {})
+        .then((value) => {
+          const result = threadTreeWatchResultSchema.parse(value);
+          if (closed) {
+            unwatch(result.subscriptionId);
+            return;
+          }
+          subscriptionId = result.subscriptionId;
+          revision = result.snapshot.revision;
+          receive(result.snapshot);
+        })
+        .catch(() => remove());
+    return () => {
+      if (closed) return;
+      closed = true;
+      remove?.();
+      if (subscriptionId) unwatch(subscriptionId);
+    };
+  };
+
+  const inspectHarness = async (
+    input: HarnessInspectParams,
+    options?: RendererRequestOptions,
+  ): Promise<HarnessInspection> => {
+    const params = harnessInspectParamsSchema.parse(input);
+    let result: unknown;
+    try {
+      result = await manager.sendRequest(HARNESS_INSPECT_METHOD, params, options);
+    } catch (error) {
+      // Older Hosts only accept the base inspection parameters.
+      if ((!params.purpose && !params.credentialAccess) || !isInvalidParams(error)) throw error;
+      const full = { ...params };
+      delete full.purpose;
+      delete full.credentialAccess;
+      result = await manager.sendRequest(HARNESS_INSPECT_METHOD, full, options);
+    }
+    return harnessInspectionSchema.parse(result);
+  };
+  const inspectHarnessCommands = async (
+    input: HarnessCommandsInspectParams,
+  ): Promise<HarnessCommandCatalog> => {
+    const params = harnessCommandsInspectParamsSchema.parse(input);
+    const result = await manager.sendRequest(HARNESS_COMMANDS_INSPECT_METHOD, params);
+    return harnessCommandCatalogSchema.parse(result);
+  };
+  const inspectThreadCommands = async (
+    input: ThreadCommandsInspectParams,
+  ): Promise<HarnessCommandCatalog> => {
+    const params = threadCommandsInspectParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_COMMANDS_INSPECT_METHOD, params);
+    return harnessCommandCatalogSchema.parse(result);
+  };
+  const executeThreadCommand = async (
+    input: ThreadCommandExecuteParams,
+  ): Promise<ThreadCommandExecuteResult> => {
+    const params = threadCommandExecuteParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_COMMAND_EXECUTE_METHOD, params);
+    return threadCommandExecuteResultSchema.parse(result);
+  };
+  const inspectThreadUsage = async (
+    input: ThreadUsageInspectionParams,
+  ): Promise<ThreadUsageInspection> => {
+    const params = threadUsageInspectionParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_USAGE_INSPECT_METHOD, params);
+    return threadUsageInspectionSchema.parse(result);
+  };
+  const selectThreadModel = async (
+    input: ThreadModelSelectParams,
+  ): Promise<HarnessModelSelectionState> => {
+    const params = threadModelSelectParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_MODEL_SELECT_METHOD, params);
+    return harnessModelSelectionStateSchema.parse(result);
+  };
+  const selectThreadThinking = async (
+    input: ThreadThinkingSelectParams,
+  ): Promise<HarnessModelSelectionState> => {
+    const params = threadThinkingSelectParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_THINKING_SELECT_METHOD, params);
+    return harnessModelSelectionStateSchema.parse(result);
+  };
+  const selectThreadPermissionMode = async (
+    input: ThreadPermissionModeSelectParams,
+  ): Promise<HarnessConfigurationState> => {
+    const params = threadPermissionModeSelectParamsSchema.parse(input);
+    const result = await manager.sendRequest(THREAD_PERMISSION_MODE_SELECT_METHOD, params);
+    return harnessConfigurationStateSchema.parse(result);
+  };
+
+  return Object.freeze({
+    async usesIndependentNativeInference(input?: NativeInferenceTarget): Promise<boolean> {
+      if (!input) return false;
+      if ("threadId" in input) {
+        const thread = await readNativeCodexThread(
+          manager.sendRequest,
+          threadInspectionParamsSchema.parse(input).threadId,
+        );
+        if (!thread.cwd) return false;
+        return usesIndependentNativeInference(
+          await manager.sendRequest("config/read", {
+            includeLayers: false,
+            cwd: thread.cwd,
+          }),
+          thread.modelProvider,
+        );
+      }
+      const cwd = typeof input.cwd === "string" && input.cwd.trim().length > 0 ? input.cwd : null;
+      if (!cwd) return false;
+      return usesIndependentNativeInference(
+        await manager.sendRequest("config/read", {
+          includeLayers: false,
+          cwd,
+        }),
+      );
+    },
+    async getHarnessPreferences(scope = "external") {
+      return harnessPreferenceSnapshotSchema.parse(
+        await manager.sendRequest(
+          HARNESS_PREFERENCES_GET_METHOD,
+          harnessPreferenceGetSchema.parse({ scope }),
+        ),
+      );
+    },
+    async patchHarnessPreferences(input: HarnessPreferencePatch) {
+      return harnessPreferenceSnapshotSchema.parse(
+        await manager.sendRequest(
+          HARNESS_PREFERENCES_PATCH_METHOD,
+          harnessPreferencePatchSchema.parse(input),
+        ),
+      );
+    },
+    watchThreadTree,
+    async hasDesktopThread(threadId: string) {
+      const result = await manager.sendRequest("thread/read", { threadId, includeTurns: false });
+      return isRecord(result) && isRecord(result.thread) && result.thread.id === threadId;
+    },
+    subscribeHarnessPreferences(listener: () => void) {
+      return (
+        notificationTarget(source)?.addNotificationCallback?.(
+          HARNESS_PREFERENCES_CHANGED_METHOD,
+          listener,
+        ) ?? (() => {})
+      );
+    },
+    async installation(input: HarnessInstallationParams): Promise<HarnessInstallationState> {
+      return runRendererInstallation(manager.sendRequest, input);
+    },
+    async getHarnessDisplayCapabilities() {
+      if (!notificationTarget(source)) return { events: false };
+      return harnessDisplayCapabilitiesSchema.parse(
+        await manager.sendRequest(HARNESS_DISPLAY_CAPABILITIES_METHOD, {}),
+      );
+    },
+    subscribeHarnessDisplaySettings(listener: () => void) {
+      return (
+        notificationTarget(source)?.addNotificationCallback?.(
+          HARNESS_DISPLAY_CHANGED_METHOD,
+          listener,
+        ) ?? (() => {})
+      );
+    },
+    async getHarnessDisplaySettings() {
+      return harnessDisplaySettingsSchema.parse(
+        await manager.sendRequest(HARNESS_DISPLAY_GET_METHOD, {}),
+      );
+    },
+    async setHarnessDisplaySettings(input: HarnessDisplaySet) {
+      return harnessDisplaySettingsSchema.parse(
+        await manager.sendRequest(HARNESS_DISPLAY_SET_METHOD, input),
+      );
+    },
+    async getHarnessLaunchSettings(
+      input: HarnessLaunchSettingsGet,
+    ): Promise<HarnessLaunchSettings> {
+      return harnessLaunchSettingsSchema.parse(
+        await manager.sendRequest(
+          HARNESS_LAUNCH_SETTINGS_GET_METHOD,
+          harnessLaunchSettingsGetSchema.parse(input),
+        ),
+      );
+    },
+    async setHarnessLaunchSettings(
+      input: HarnessLaunchSettingsSet,
+    ): Promise<HarnessLaunchSettings> {
+      return harnessLaunchSettingsSchema.parse(
+        await manager.sendRequest(
+          HARNESS_LAUNCH_SETTINGS_SET_METHOD,
+          harnessLaunchSettingsSetSchema.parse(input),
+        ),
+      );
+    },
+    async listLoadedSessions(): Promise<LoadedSession[]> {
+      return loadedSessionsSchema.parse(await manager.sendRequest(LOADED_SESSIONS_METHOD, {}));
+    },
+    async setIdleReleaseSettings(settings: IdleReleaseSettings): Promise<IdleReleaseSettings> {
+      const params = idleReleaseSettingsSchema.parse(settings);
+      return idleReleaseSettingsSchema.parse(
+        await manager.sendRequest(IDLE_RELEASE_SETTINGS_METHOD, params),
+      );
+    },
+    ...createRendererSessionImportClient(async (method, params) =>
+      manager.sendRequest(method, params),
+    ),
+    async forkThread(input: ExternalThreadForkParams): Promise<ExternalThreadForkResult> {
+      const params = externalThreadForkParamsSchema.parse(input);
+      const result = await manager.sendRequest(THREAD_FORK_METHOD, params);
+      return externalThreadForkResultSchema.parse(result);
+    },
+    inspectHarness,
+    async listSkills(params: SkillsListParams): Promise<SkillsListResult> {
+      return skillsListResultSchema.parse(
+        await manager.sendRequest(SKILLS_LIST_METHOD, skillsListParamsSchema.parse(params)),
+      );
+    },
+    subscribeSkillsChanged(listener: (params: SkillsChangedParams) => void) {
+      return (
+        notificationTarget(source)?.addNotificationCallback?.(SKILLS_CHANGED_METHOD, (value) => {
+          if (!isRecord(value) || value.method !== SKILLS_CHANGED_METHOD) return;
+          const parsed = skillsChangedParamsSchema.safeParse(value.params);
+          if (parsed.success) listener(parsed.data);
+        }) ?? (() => {})
+      );
+    },
+    async listHarnessPlugins(): Promise<HarnessPluginListResult> {
+      return harnessPluginListResultSchema.parse(
+        await manager.sendRequest(HARNESS_PLUGIN_LIST_METHOD, {}),
+      );
+    },
+    async openHarnessWebUi(input: HarnessWebUiOpenParams): Promise<void> {
+      const params = harnessWebUiOpenParamsSchema.parse(input);
+      const result = await manager.sendRequest(HARNESS_WEB_UI_OPEN_METHOD, params);
+      harnessWebUiOpenResultSchema.parse(result);
+    },
+    async inspectThread(input: ThreadInspectionParams): Promise<ThreadInspection> {
+      const params = threadInspectionParamsSchema.parse(input);
+      let result: unknown;
+      try {
+        result = await manager.sendRequest(THREAD_INSPECT_METHOD, params);
+      } catch (error) {
+        if (!(error instanceof RendererMethodUnavailableError)) throw error;
+
+        // Stock Codex has no Host inspection API. Verify its native Thread on
+        // this same connection; neither an RPC failure nor a missing Account
+        // establishes ownership. Match the external markers used by the Host.
+        await verifyNativeCodexThread(manager.sendRequest, params.threadId);
+        return { owner: "codex", locked: true };
+      }
+      return threadInspectionSchema.parse(result);
+    },
+    inspectHarnessCommands,
+    inspectThreadCommands,
+    executeThreadCommand,
+    async listThreadOwnership(
+      input: ThreadOwnershipListParams,
+    ): Promise<ThreadOwnershipListResult> {
+      const params = threadOwnershipListParamsSchema.parse(input);
+      const value = await manager.sendRequest(THREAD_OWNERSHIP_LIST_METHOD, params);
+      const result = threadOwnershipListResultSchema.parse(value);
+      if (
+        result.threads.length !== params.threadIds.length ||
+        result.threads.some((thread, index) => thread.threadId !== params.threadIds[index])
+      ) {
+        throw new Error("Thread ownership-list result does not match the requested IDs");
+      }
+      return result;
+    },
+    inspectThreadUsage,
+    subscribeThreadUsage(listener: (update: ThreadUsageInspection) => void): () => void {
+      const notifications = notificationTarget(source);
+      if (!notifications?.addNotificationCallback) {
+        throw new Error("Renderer Usage notification callback is unavailable");
+      }
+      let disposed = false;
+      const generations = new Map<ThreadUsageInspectionParams["threadId"], number>();
+      const removeNotificationCallback = notifications.addNotificationCallback(
+        THREAD_USAGE_REFRESH_METHODS,
+        (notification) => {
+          const threadId = notifiedThreadId(notification);
+          if (!threadId) return;
+          const generation = (generations.get(threadId) ?? 0) + 1;
+          generations.set(threadId, generation);
+          void inspectThreadUsage({ threadId })
+            .then((update) => {
+              if (!disposed && generations.get(threadId) === generation) listener(update);
+            })
+            .catch(() => undefined);
+        },
+      );
+      return () => {
+        if (disposed) return;
+        disposed = true;
+        generations.clear();
+        removeNotificationCallback();
+      };
+    },
+    selectThreadModel,
+    selectThreadThinking,
+    selectThreadPermissionMode,
+    async setupSsh(input: RemoteSshSetupParams) {
+      return remoteSshSetupResultSchema.parse(
+        await manager.sendRequest(REMOTE_SSH_SETUP_METHOD, remoteSshSetupParamsSchema.parse(input)),
+      );
+    },
+    async readDelegationThread(input: DelegationReadParams) {
+      return source.sendRequest(DELEGATION_READ_METHOD, delegationReadParamsSchema.parse(input));
+    },
+    async runtimeStatus() {
+      // Asked directly rather than through the remembering sender: an outdated remote
+      // service can be updated in place, after which this method starts answering.
+      try {
+        return runtimeStatusSchema.parse(await source.sendRequest(RUNTIME_STATUS_METHOD, {}));
+      } catch (error) {
+        if (!isUnsupportedMethod(error, RUNTIME_STATUS_METHOD)) throw error;
+        throw new RendererMethodUnavailableError(RUNTIME_STATUS_METHOD, error);
+      }
+    },
+    async updateRemote(version: string) {
+      return runtimeStatusSchema.parse(
+        await manager.sendRequest(REMOTE_UPDATE_METHOD, { version }),
+      );
+    },
+    async listHostExtensions() {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.list];
+      return schema.result.parse(
+        await manager.sendRequest(HOST_EXTENSIONS_RPC.list, schema.params.parse({})),
+      );
+    },
+    async snapshotHostExtensions() {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.snapshot];
+      return schema.result.parse(
+        await manager.sendRequest(HOST_EXTENSIONS_RPC.snapshot, schema.params.parse({})),
+      );
+    },
+    subscribeHostExtensionsChanged(listener: () => void) {
+      extensionListeners.add(listener);
+      return () => {
+        extensionListeners.delete(listener);
+      };
+    },
+    async listHostExtensionCatalog(
+      input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.catalog> = {},
+    ) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.catalog];
+      return schema.result.parse(
+        await manager.sendRequest(HOST_EXTENSIONS_RPC.catalog, schema.params.parse(input)),
+      );
+    },
+    async installHostExtension(input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.install>) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.install];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.install, schema.params.parse(input)),
+        ),
+      );
+    },
+    async updateHostExtension(input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.update>) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.update];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.update, schema.params.parse(input)),
+        ),
+      );
+    },
+    async enableHostExtension(input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.enable>) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.enable];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.enable, schema.params.parse(input)),
+        ),
+      );
+    },
+    async disableHostExtension(input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.disable>) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.disable];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.disable, schema.params.parse(input)),
+        ),
+      );
+    },
+    async uninstallHostExtension(
+      input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.uninstall>,
+    ) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.uninstall];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.uninstall, schema.params.parse(input)),
+        ),
+      );
+    },
+    async recoverHostExtensions(
+      input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.recover> = {},
+    ) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.recover];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.recover, schema.params.parse(input)),
+        ),
+      );
+    },
+    async readHostExtensionAsset(input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.asset>) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.asset];
+      return schema.result.parse(
+        await manager.sendRequest(HOST_EXTENSIONS_RPC.asset, schema.params.parse(input)),
+      );
+    },
+    async getHostExtensionSettings(
+      input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.settingsGet>,
+    ) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.settingsGet];
+      return schema.result.parse(
+        await manager.sendRequest(HOST_EXTENSIONS_RPC.settingsGet, schema.params.parse(input)),
+      );
+    },
+    async setHostExtensionSettings(
+      input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.settingsSet>,
+    ) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.settingsSet];
+      return extensionsChanged(
+        schema.result.parse(
+          await manager.sendRequest(HOST_EXTENSIONS_RPC.settingsSet, schema.params.parse(input)),
+        ),
+      );
+    },
+    async invokeHostExtensionBackend(
+      input: HostExtensionsRpcParams<typeof HOST_EXTENSIONS_RPC.backendInvoke>,
+    ) {
+      const schema = hostExtensionsRpcSchemas[HOST_EXTENSIONS_RPC.backendInvoke];
+      return schema.result.parse(
+        await manager.sendRequest(HOST_EXTENSIONS_RPC.backendInvoke, schema.params.parse(input)),
+      );
+    },
+    async checkUpdate(): Promise<UpdateCheckResult | null> {
+      const result = await manager.sendRequest(
+        UPDATE_CHECK_METHOD,
+        updateEmptyParamsSchema.parse({}),
+      );
+      return updateCheckResultSchema.nullable().parse(result);
+    },
+    async startUpdate(): Promise<UpdateStartResult> {
+      const result = await manager.sendRequest(
+        UPDATE_START_METHOD,
+        updateEmptyParamsSchema.parse({}),
+      );
+      return updateStartResultSchema.parse(result);
+    },
+    async readUpdateStatus(): Promise<UpdateStatusResult> {
+      const result = await manager.sendRequest(
+        UPDATE_STATUS_METHOD,
+        updateEmptyParamsSchema.parse({}),
+      );
+      return updateStatusResultSchema.parse(result);
+    },
+    async getReleaseAnnouncement(
+      input: ReleaseAnnouncementGetParams = {},
+    ): Promise<ReleaseAnnouncementGetResult | null> {
+      const params = releaseAnnouncementGetParamsSchema.parse(input);
+      const result = await manager.sendRequest(RELEASE_ANNOUNCEMENT_GET_METHOD, params);
+      return releaseAnnouncementGetResultSchema.parse(result);
+    },
+    async acknowledgeReleaseAnnouncement(
+      input: ReleaseAnnouncementAcknowledgeParams,
+    ): Promise<void> {
+      const params = releaseAnnouncementAcknowledgeParamsSchema.parse(input);
+      await manager.sendRequest(RELEASE_ANNOUNCEMENT_ACKNOWLEDGE_METHOD, params);
+    },
+    async openWeb(): Promise<WebOpenResult> {
+      const result = await manager.sendRequest(WEB_OPEN_METHOD, webOpenParamsSchema.parse({}));
+      return webOpenResultSchema.parse(result);
+    },
+    async openConsole(): Promise<ConsoleOpenResult> {
+      const result = await manager.sendRequest(
+        CONSOLE_OPEN_METHOD,
+        consoleOpenParamsSchema.parse({}),
+      );
+      return consoleOpenResultSchema.parse(result);
+    },
+    async inspectCodexAccountUsage(
+      input: CodexAccountUsageParams,
+    ): Promise<CodexAccountUsageResult> {
+      const result = await manager.sendRequest(
+        "codexhost/account/usage/inspect",
+        codexAccountUsageParamsSchema.parse(input),
+      );
+      return codexAccountUsageResultSchema.parse(result);
+    },
+    async listHarnessAccountSources(): Promise<HarnessAccountSourceListResult> {
+      return harnessAccountSourceListResultSchema.parse(
+        await manager.sendRequest(HARNESS_ACCOUNT_SOURCES_METHOD, {}),
+      );
+    },
+    async inspectHarnessAccount(
+      input: HarnessAccountInspectParams,
+    ): Promise<HarnessAccountInspectResult> {
+      return harnessAccountInspectResultSchema.parse(
+        await manager.sendRequest(
+          HARNESS_ACCOUNT_INSPECT_METHOD,
+          harnessAccountInspectParamsSchema.parse(input),
+        ),
+      );
+    },
+    async credentialImports(
+      request: CredentialImportsRequest,
+      targetHarnessId?: string,
+    ): Promise<CredentialImportsResult> {
+      return credentialImportsResultSchema.parse(
+        await manager.sendRequest(
+          CREDENTIAL_IMPORTS_METHOD,
+          credentialImportsParamsSchema.parse({ request, targetHarnessId }),
+        ),
+      );
+    },
+    async listHarnessAccounts(
+      input: HarnessAccountListParams = {},
+    ): Promise<HarnessAccountListResult> {
+      return harnessAccountListResultSchema.parse(
+        await manager.sendRequest(
+          "codexhost/harness/accounts/list",
+          harnessAccountListParamsSchema.parse(input),
+        ),
+      );
+    },
+    async listCodexAccounts(): Promise<CodexAccountListResult> {
+      const result = await manager.sendRequest(CODEX_ACCOUNT_LIST_METHOD, {});
+      return codexAccountListResultSchema.parse(result);
+    },
+    async refreshCodexAccounts(): Promise<CodexAccountListResult> {
+      const result = await manager.sendRequest(CODEX_ACCOUNT_REFRESH_METHOD, {});
+      return codexAccountListResultSchema.parse(result);
+    },
+    subscribeCodexAccounts(listener: (state: CodexAccountChanged) => void): () => void {
+      const notifications = notificationTarget(source);
+      if (!notifications?.addNotificationCallback) {
+        throw new Error("Renderer Account notification callback is unavailable");
+      }
+      return notifications.addNotificationCallback(CODEX_ACCOUNT_CHANGED_METHOD, (notification) => {
+        if (!isRecord(notification) || notification.method !== CODEX_ACCOUNT_CHANGED_METHOD) return;
+        const state = codexAccountChangedSchema.safeParse(notification.params);
+        if (state.success) listener(state.data);
+      });
+    },
+  });
+}
+
+function isInvalidParams(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === -32602;
+}

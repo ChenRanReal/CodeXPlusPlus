@@ -1,0 +1,111 @@
+import { createReadStream } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { readdir, stat } from "node:fs/promises";
+
+function projectDirectoryName(cwd: string): string {
+  return cwd.replace(/[^A-Za-z0-9]/gu, "-");
+}
+
+function configDirectory(environment: NodeJS.ProcessEnv): string {
+  return environment.CLAUDE_CONFIG_DIR
+    ? path.resolve(environment.CLAUDE_CONFIG_DIR)
+    : path.join(os.homedir(), ".claude");
+}
+
+async function existingFile(file: string): Promise<boolean> {
+  try {
+    return (await stat(file)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export async function findClaudeTranscript(input: {
+  cwd: string;
+  environment: NodeJS.ProcessEnv;
+  sessionId: string;
+}): Promise<string | null> {
+  const projectsDirectory = path.join(configDirectory(input.environment), "projects");
+  const name = `${input.sessionId}.jsonl`;
+  const expected = path.join(projectsDirectory, projectDirectoryName(input.cwd), name);
+  if (await existingFile(expected)) return expected;
+
+  let projects: string[];
+  try {
+    projects = await readdir(projectsDirectory);
+  } catch {
+    return null;
+  }
+  for (const project of projects) {
+    const candidate = path.join(projectsDirectory, project, name);
+    if (await existingFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function* transcriptLines(transcript: string): AsyncGenerator<string> {
+  const stream = createReadStream(transcript, { encoding: "utf8" });
+  let pending = "";
+  try {
+    for await (const chunk of stream) {
+      const contents = chunk as string;
+      let start = 0;
+      let newline: number;
+      // Split only on LF: Unicode line separators are valid inside JSON strings.
+      while ((newline = contents.indexOf("\n", start)) !== -1) {
+        const line = pending + contents.slice(start, newline);
+        pending = "";
+        yield line;
+        start = newline + 1;
+      }
+      pending += contents.slice(start);
+    }
+    if (pending.length > 0) yield pending;
+  } finally {
+    stream.destroy();
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Reads the complete append-only Claude Code main-session transcript.
+ *
+ * The Agent SDK's getSessionMessages() intentionally follows one parentUuid
+ * branch. Claude can attach a later prompt to a system record before the prior
+ * assistant terminal, which makes that otherwise valid branch omit prior
+ * assistant messages. History recovery needs every persisted main-session
+ * message and attachment in transcript order instead. Like the native SDK, resolve
+ * repeated UUIDs to their last record (including metadata), retaining first-seen order.
+ */
+export async function readClaudeTranscript(input: {
+  cwd: string;
+  environment: NodeJS.ProcessEnv;
+  sessionId: string;
+}): Promise<unknown[] | null> {
+  const transcript = await findClaudeTranscript(input);
+  if (!transcript) return null;
+  const messages = new Map<string, Record<string, unknown>>();
+  for await (const line of transcriptLines(transcript)) {
+    if (line.trim().length === 0) continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      !isRecord(entry) ||
+      (entry.type !== "user" && entry.type !== "assistant" && entry.type !== "attachment") ||
+      typeof entry.uuid !== "string" ||
+      (entry.type !== "attachment" && !isRecord(entry.message))
+    ) {
+      continue;
+    }
+    messages.set(entry.uuid, { ...entry, session_id: input.sessionId });
+  }
+  return [...messages.values()];
+}

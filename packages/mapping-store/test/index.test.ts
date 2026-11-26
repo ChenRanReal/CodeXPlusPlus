@@ -1,0 +1,1455 @@
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import {
+  HARNESS_MODEL_REF_MAX_LENGTH,
+  decodeHarnessPluginRoute,
+  encodeHarnessPluginRoute,
+  harnessPluginRouteSchema,
+  harnessIdSchema,
+  hostThreadIdSchema,
+  hostTurnIdSchema,
+  nativeCheckpointRefSchema,
+  nativeSessionRefSchema,
+  nativeTurnRefSchema,
+  type HostThreadId,
+  type NativeSessionRef,
+} from "@codexhost/shared-contracts";
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  MappingStore,
+  storedThreadCoreV1Schema,
+  storedThreadRecordV1Schema,
+  type MappingStoreError,
+  type StoredThreadRecordV1,
+  type StoredTurnMappingV1,
+} from "../src/index.js";
+
+const temporaryDirectories: string[] = [];
+
+async function temporaryStoreDirectory(): Promise<string> {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codexhost-mapping-store-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+const harnessId = harnessIdSchema.parse("pi");
+const threadId = hostThreadIdSchema.parse("thread-1");
+const nativeRef = nativeSessionRefSchema.parse({
+  harnessId,
+  nativeSessionId: "native-session-1",
+  locator: { sessionFile: "/synthetic/session.jsonl" },
+  formatVersion: 1,
+}) as NativeSessionRef;
+
+function mappingForSession(sessionRef: NativeSessionRef, ordinal: number): StoredTurnMappingV1 {
+  return {
+    hostTurnId: hostTurnIdSchema.parse(`turn-${ordinal}`),
+    nativeTurnRef: nativeTurnRefSchema.parse({
+      harnessId,
+      nativeSessionId: sessionRef.nativeSessionId,
+      nativeTurnKey: `native-turn-${ordinal}`,
+      formatVersion: 1,
+    }),
+    nativeCheckpointRef: nativeCheckpointRefSchema.parse({
+      harnessId,
+      nativeSessionId: sessionRef.nativeSessionId,
+      checkpointId: `checkpoint-${ordinal}`,
+      formatVersion: 1,
+    }),
+  };
+}
+
+function mapping(ordinal: number): StoredTurnMappingV1 {
+  return mappingForSession(nativeRef, ordinal);
+}
+
+async function createReady(
+  store: MappingStore,
+  forkSource?: NonNullable<StoredThreadRecordV1["forkSource"]>,
+): Promise<void> {
+  await store.createProvisional({
+    hostThreadId: threadId,
+    createRequestId: "create-1",
+    harnessId,
+    cwd: "/synthetic",
+    title: "External Thread",
+    transportModelId: "codexhost/pi-native",
+    ephemeral: false,
+    historyMode: "legacy",
+    ...(forkSource ? { forkSource } : {}),
+  });
+  await store.commitReady({
+    hostThreadId: threadId,
+    nativeSessionRef: nativeRef,
+    turnMappings: [mapping(1)],
+  });
+}
+
+async function createProvisional(store: MappingStore, value: string): Promise<HostThreadId> {
+  const hostThreadId = hostThreadIdSchema.parse(value);
+  await store.createProvisional({
+    hostThreadId,
+    createRequestId: `create-${value}`,
+    harnessId,
+    cwd: "/synthetic",
+    transportModelId: "codexhost/pi-native",
+    ephemeral: false,
+    historyMode: "legacy",
+  });
+  return hostThreadId;
+}
+
+async function createReadyThread(store: MappingStore, value: string, title: string) {
+  const hostThreadId = hostThreadIdSchema.parse(value);
+  await store.createProvisional({
+    hostThreadId,
+    createRequestId: `create-${value}`,
+    harnessId,
+    cwd: "/synthetic",
+    title,
+    transportModelId: "codexhost/pi-native",
+    ephemeral: false,
+    historyMode: "legacy",
+  });
+  await store.commitReady({
+    hostThreadId,
+    nativeSessionRef: nativeSessionRefSchema.parse({
+      harnessId,
+      nativeSessionId: `native-${value}`,
+      locator: { sessionFile: `/synthetic/${value}.jsonl` },
+      formatVersion: 1,
+    }) as NativeSessionRef,
+    turnMappings: [],
+  });
+  return hostThreadId;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+describe("mapping-store package", () => {
+  it("resolves a repeated caller create request to the existing Thread", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+
+    await expect(
+      store.createProvisional({
+        hostThreadId: hostThreadIdSchema.parse("thread-duplicate"),
+        createRequestId: "create-1",
+        harnessId,
+        cwd: "/another",
+        transportModelId: "codexhost/pi-native",
+        ephemeral: false,
+        historyMode: "legacy",
+      }),
+    ).resolves.toMatchObject({ hostThreadId: threadId, state: "ready" });
+    await expect(store.listThreads()).resolves.toHaveLength(1);
+    await store.close();
+  });
+
+  it("lists Thread summaries without Turn mappings as independent copies", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+
+    const [full] = await store.listThreads();
+    const [summary] = await store.listThreadSummaries();
+    if (!full || !summary) throw new Error("expected one stored Thread");
+    const { turnMappings, ...expected } = full;
+    expect(turnMappings).toHaveLength(1);
+    expect(summary).toEqual(expected);
+    expect(summary).not.toHaveProperty("turnMappings");
+
+    summary.title = "Changed by caller";
+    await expect(store.getThread(threadId)).resolves.toMatchObject({ title: "External Thread" });
+    await store.close();
+  });
+
+  it("serializes competing Native Session commits across Host Threads", async () => {
+    const directory = await temporaryStoreDirectory();
+    const firstReadyEntered = Promise.withResolvers<undefined>();
+    const releaseFirstReady = Promise.withResolvers<undefined>();
+    let readyReplacements = 0;
+    const store = new MappingStore({
+      directory,
+      beforeReplace(record) {
+        if (record.state !== "ready") return;
+        readyReplacements += 1;
+        if (readyReplacements === 1) {
+          firstReadyEntered.resolve(undefined);
+          return releaseFirstReady.promise;
+        }
+      },
+    });
+    await store.initialize();
+    const firstId = await createProvisional(store, "thread-native-first");
+    const secondId = await createProvisional(store, "thread-native-second");
+
+    const commits = [
+      store.commitReady({ hostThreadId: firstId, nativeSessionRef: nativeRef }),
+      store.commitReady({ hostThreadId: secondId, nativeSessionRef: nativeRef }),
+    ];
+    await firstReadyEntered.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const replacementsBeforeRelease = readyReplacements;
+    releaseFirstReady.resolve(undefined);
+    const results = await Promise.allSettled(commits);
+
+    expect(replacementsBeforeRelease).toBe(1);
+    expect(results.map(({ status }) => status).toSorted()).toEqual(["fulfilled", "rejected"]);
+    const fulfilled = results.find((result) => result.status === "fulfilled");
+    const rejected = results.find((result) => result.status === "rejected");
+    if (
+      !fulfilled ||
+      fulfilled.status !== "fulfilled" ||
+      !rejected ||
+      rejected.status !== "rejected"
+    ) {
+      throw new Error("Expected exactly one successful Native Session commit");
+    }
+    expect(rejected.reason).toMatchObject({ code: "DUPLICATE_NATIVE_SESSION" });
+    const winnerId = fulfilled.value.hostThreadId;
+    const loserId = winnerId === firstId ? secondId : firstId;
+    const inMemory = await store.listThreads();
+    expect(inMemory.filter(({ state }) => state === "ready")).toHaveLength(1);
+    expect(inMemory.find(({ hostThreadId }) => hostThreadId === loserId)).toMatchObject({
+      state: "creating",
+    });
+    const persisted = await Promise.all(
+      [firstId, secondId].map(
+        async (hostThreadId) =>
+          JSON.parse(
+            await readFile(path.join(directory, "threads", `${hostThreadId}.json`), "utf8"),
+          ) as StoredThreadRecordV1,
+      ),
+    );
+    expect(persisted.filter(({ state }) => state === "ready")).toHaveLength(1);
+    expect(persisted.find(({ hostThreadId }) => hostThreadId === loserId)).toMatchObject({
+      state: "creating",
+    });
+
+    await expect(store.removeProvisional(loserId)).resolves.toBeUndefined();
+    await store.close();
+
+    const restarted = new MappingStore({ directory });
+    await restarted.initialize();
+    await expect(restarted.listThreads()).resolves.toEqual([
+      expect.objectContaining({ hostThreadId: winnerId, state: "ready" }),
+    ]);
+    await expect(restarted.getThread(loserId)).resolves.toBeNull();
+    await restarted.close();
+  });
+
+  it("persists strict identity and Desktop metadata across restart", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory, instanceId: "first" });
+    await first.initialize();
+    await createReady(first);
+    await first.close();
+
+    const second = new MappingStore({ directory, instanceId: "second" });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toMatchObject({
+      hostThreadId: threadId,
+      harnessId,
+      state: "ready",
+      nativeSessionRef: nativeRef,
+      ephemeral: false,
+      historyMode: "legacy",
+      transportModelId: "codexhost/pi-native",
+      turnMappings: [mapping(1)],
+    });
+    await second.close();
+  });
+
+  it("persists Delegation relations separately from Thread and Subagent metadata", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory, instanceId: "delegation-first" });
+    await first.initialize();
+    await createReady(first);
+    const childThreadId = hostThreadIdSchema.parse("thread-child");
+    const delegationId = hostThreadIdSchema.parse("delegation-1");
+    await first.createDelegation({
+      delegationId,
+      parentHostThreadId: threadId,
+      childHostThreadId: childThreadId,
+      sourceHarnessId: harnessId,
+      targetHarnessId: harnessIdSchema.parse("claude-code"),
+      status: "running",
+      requestId: "delegate-request-1",
+      taskDigest: "a".repeat(64),
+    });
+    await first.close();
+
+    const second = new MappingStore({ directory, instanceId: "delegation-second" });
+    await second.initialize();
+    await expect(second.getDelegation(delegationId)).resolves.toMatchObject({
+      parentHostThreadId: threadId,
+      childHostThreadId: childThreadId,
+      status: "running",
+      requestId: "delegate-request-1",
+    });
+    await expect(second.findDelegationByRequest("delegate-request-1")).resolves.toMatchObject({
+      delegationId,
+    });
+    await expect(second.getThread(threadId)).resolves.not.toHaveProperty("delegation");
+    await second.setDelegationStatus(delegationId, "completed");
+    await second.setDelegationStatus(delegationId, "running");
+    await expect(second.getDelegationByChild(childThreadId)).resolves.toMatchObject({
+      status: "completed",
+    });
+    await second.close();
+  });
+
+  it("finds recent implicit Delegation duplicates by parent, target and task digest", async () => {
+    const directory = await temporaryStoreDirectory();
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const store = new MappingStore({ directory, now: () => now });
+    await store.initialize();
+    const parentHostThreadId = hostThreadIdSchema.parse("parent-thread");
+    const targetHarnessId = harnessIdSchema.parse("claude-code");
+    await store.createDelegation({
+      delegationId: hostThreadIdSchema.parse("delegation-recent"),
+      parentHostThreadId,
+      childHostThreadId: hostThreadIdSchema.parse("child-recent"),
+      sourceHarnessId: harnessId,
+      targetHarnessId,
+      taskDigest: "b".repeat(64),
+    });
+
+    await expect(
+      store.findRecentDelegation({
+        parentHostThreadId,
+        targetHarnessId,
+        taskDigest: "b".repeat(64),
+        since: new Date("2025-12-31T23:59:00.000Z"),
+      }),
+    ).resolves.toMatchObject({ delegationId: "delegation-recent" });
+    now = new Date("2026-01-01T01:00:00.000Z");
+    await expect(
+      store.findRecentDelegation({
+        parentHostThreadId,
+        targetHarnessId,
+        taskDigest: "b".repeat(64),
+        since: new Date("2026-01-01T00:30:00.000Z"),
+      }),
+    ).resolves.toBeNull();
+    await store.close();
+  });
+
+  it("retains unknown fields but rejects cross-Session Checkpoints", () => {
+    const base = {
+      formatVersion: 1,
+      revision: 1,
+      hostThreadId: threadId,
+      createRequestId: "create-1",
+      harnessId,
+      state: "ready",
+      nativeSessionRef: nativeRef,
+      cwd: "/synthetic",
+      title: "External",
+      archived: false,
+      transportModelId: "codexhost/pi-native",
+      ephemeral: false,
+      historyMode: "legacy",
+      turnMappings: [mapping(1)],
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    expect(storedThreadRecordV1Schema.parse({ ...base, futureField: "opaque" })).toMatchObject({
+      futureField: "opaque",
+    });
+    expect(
+      storedThreadRecordV1Schema.safeParse({
+        ...base,
+        turnMappings: [
+          {
+            ...mapping(1),
+            nativeCheckpointRef: {
+              ...mapping(1).nativeCheckpointRef,
+              nativeSessionId: "another-session",
+            },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects conflicting Host and Native Turn mappings without changing state", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+
+    await expect(
+      store.upsertTurnMappings(threadId, [
+        {
+          ...mapping(2),
+          hostTurnId: mapping(1).hostTurnId,
+        },
+      ]),
+    ).rejects.toMatchObject({ code: "MAPPING_CONFLICT" });
+    await expect(store.getThread(threadId)).resolves.toMatchObject({ turnMappings: [mapping(1)] });
+    await store.close();
+  });
+
+  it("reconciles middle-inserted Turn mappings in complete Snapshot order", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    await first.upsertTurnMappings(threadId, [mapping(4)]);
+    const before = await first.getThread(threadId);
+
+    const ordered = [mapping(1), mapping(2), mapping(3), mapping(4)];
+    const reconciled = await first.reconcileTurnMappings(threadId, ordered);
+    expect(reconciled.turnMappings).toEqual(ordered);
+    expect(reconciled.revision).toBe((before?.revision ?? 0) + 1);
+
+    const repeated = await first.reconcileTurnMappings(threadId, ordered);
+    expect(repeated).toEqual(reconciled);
+    await first.close();
+
+    let now = new Date("2026-03-01T00:00:00.000Z");
+    const second = new MappingStore({ directory, now: () => now });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toMatchObject({
+      revision: reconciled.revision,
+      turnMappings: ordered,
+    });
+
+    const dropped = await second.reconcileTurnMappings(threadId, [
+      mapping(1),
+      mapping(2),
+      mapping(4),
+    ]);
+    expect(dropped.turnMappings).toEqual([mapping(1), mapping(2), mapping(4)]);
+    // Removed and reordered Turns are conversation activity.
+    expect(dropped.updatedAt).toBe(now.toISOString());
+    now = new Date("2026-03-02T00:00:00.000Z");
+    const reordered = await second.reconcileTurnMappings(threadId, [
+      mapping(1),
+      mapping(4),
+      mapping(2),
+    ]);
+    expect(reordered.turnMappings).toEqual([mapping(1), mapping(4), mapping(2)]);
+    expect(reordered.updatedAt).toBe(now.toISOString());
+    now = new Date("2026-03-03T00:00:00.000Z");
+    const nativeCheckpoint = {
+      ...mapping(1),
+      nativeCheckpointRef: {
+        ...mapping(1).nativeCheckpointRef,
+        checkpointId: "native-checkpoint",
+      },
+    } as StoredTurnMappingV1;
+    const adopted = await second.reconcileTurnMappings(threadId, [
+      nativeCheckpoint,
+      mapping(4),
+      mapping(2),
+    ]);
+    expect(adopted.turnMappings[0]).toEqual(nativeCheckpoint);
+    // A newer checkpoint for the same Turns, as a Harness upgrade writes, keeps the Thread's place.
+    expect(adopted).toMatchObject({
+      revision: reordered.revision + 1,
+      updatedAt: reordered.updatedAt,
+    });
+
+    await expect(
+      second.reconcileTurnMappings(threadId, [
+        { ...mapping(1), nativeTurnRef: mapping(4).nativeTurnRef },
+        mapping(4),
+        mapping(2),
+      ]),
+    ).rejects.toMatchObject({ code: "MAPPING_CONFLICT" });
+    await expect(second.getThread(threadId)).resolves.toEqual(adopted);
+    await second.close();
+  });
+
+  it("keeps prior mappings when ordered reconciliation replacement fails", async () => {
+    const directory = await temporaryStoreDirectory();
+    let fail = false;
+    const store = new MappingStore({
+      directory,
+      beforeReplace() {
+        if (fail) throw new Error("synthetic reconciliation failure");
+      },
+    });
+    await store.initialize();
+    await createReady(store);
+    await store.upsertTurnMappings(threadId, [mapping(3)]);
+    const before = await store.getThread(threadId);
+    fail = true;
+
+    await expect(
+      store.reconcileTurnMappings(threadId, [mapping(1), mapping(2), mapping(3)]),
+    ).rejects.toMatchObject({ code: "IO_ERROR" });
+    await expect(store.getThread(threadId)).resolves.toEqual(before);
+    const persisted = JSON.parse(
+      await readFile(path.join(directory, "threads", `${threadId}.json`), "utf8"),
+    ) as StoredThreadRecordV1;
+    expect(persisted.turnMappings).toEqual([mapping(1), mapping(3)]);
+    await store.close();
+  });
+
+  it("keeps the prior durable and in-memory record when replacement fails", async () => {
+    const directory = await temporaryStoreDirectory();
+    let fail = false;
+    const store = new MappingStore({
+      directory,
+      beforeReplace() {
+        if (fail) throw new Error("synthetic disk failure");
+      },
+    });
+    await store.initialize();
+    await createReady(store);
+    fail = true;
+
+    await expect(store.setTitle(threadId, "not committed")).rejects.toMatchObject({
+      code: "IO_ERROR",
+    });
+    await expect(store.getThread(threadId)).resolves.toMatchObject({ title: "External Thread" });
+    const persisted = JSON.parse(
+      await readFile(path.join(directory, "threads", `${threadId}.json`), "utf8"),
+    ) as { title: string };
+    expect(persisted.title).toBe("External Thread");
+    await store.close();
+  });
+
+  it("atomically replaces a ready derived Session and keeps the prior record on failure", async () => {
+    const directory = await temporaryStoreDirectory();
+    let fail = false;
+    const store = new MappingStore({
+      directory,
+      beforeReplace() {
+        if (fail) throw new Error("synthetic replacement failure");
+      },
+    });
+    await store.initialize();
+    const sourceThreadId = hostThreadIdSchema.parse("source-thread");
+    await createReady(store, {
+      hostThreadId: sourceThreadId,
+      hostTurnId: hostTurnIdSchema.parse("source-turn-3"),
+    });
+    const before = await store.upsertTurnMappings(threadId, [mapping(2), mapping(3)]);
+    const replacementRef = nativeSessionRefSchema.parse({
+      harnessId,
+      nativeSessionId: "native-session-2",
+      locator: { sessionFile: "/synthetic/replacement.jsonl" },
+      formatVersion: 1,
+    }) as NativeSessionRef;
+    const replacementMappings = [
+      mappingForSession(replacementRef, 1),
+      mappingForSession(replacementRef, 2),
+    ];
+    const replaced = await store.replaceReadySession({
+      hostThreadId: threadId,
+      expectedRevision: before.revision,
+      expectedNativeSessionRef: nativeRef,
+      nativeSessionRef: replacementRef,
+      turnMappings: replacementMappings,
+      forkSource: {
+        hostThreadId: sourceThreadId,
+        hostTurnId: hostTurnIdSchema.parse("source-turn-2"),
+      },
+    });
+    expect(replaced).toMatchObject({
+      nativeSessionRef: replacementRef,
+      turnMappings: replacementMappings,
+      forkSource: {
+        hostThreadId: sourceThreadId,
+        hostTurnId: hostTurnIdSchema.parse("source-turn-2"),
+      },
+    });
+
+    fail = true;
+    const failedRef = nativeSessionRefSchema.parse({
+      harnessId,
+      nativeSessionId: "native-session-3",
+      formatVersion: 1,
+    }) as NativeSessionRef;
+    await expect(
+      store.replaceReadySession({
+        hostThreadId: threadId,
+        expectedRevision: replaced.revision,
+        expectedNativeSessionRef: replacementRef,
+        nativeSessionRef: failedRef,
+        turnMappings: [mappingForSession(failedRef, 1)],
+        forkSource: { hostThreadId: sourceThreadId, hostTurnId: mapping(1).hostTurnId },
+      }),
+    ).rejects.toMatchObject({ code: "IO_ERROR" });
+    await expect(store.getThread(threadId)).resolves.toMatchObject({
+      nativeSessionRef: replacementRef,
+      turnMappings: replacementMappings,
+    });
+    await store.close();
+  });
+
+  it("atomically replaces the only Turn with an empty ready Session", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory, instanceId: "first" });
+    await first.initialize();
+    const forkSource = {
+      hostThreadId: hostThreadIdSchema.parse("source-thread"),
+      hostTurnId: hostTurnIdSchema.parse("source-turn"),
+    };
+    await createReady(first, forkSource);
+    const before = await first.getThread(threadId);
+    const replacementRef = nativeSessionRefSchema.parse({
+      harnessId,
+      nativeSessionId: "native-session-empty",
+      locator: { sessionFile: "/synthetic/empty.jsonl" },
+      formatVersion: 1,
+    }) as NativeSessionRef;
+
+    const replaced = await first.replaceReadySessionAfterLastTurn({
+      hostThreadId: threadId,
+      expectedRevision: before?.revision ?? 0,
+      expectedNativeSessionRef: nativeRef,
+      nativeSessionRef: replacementRef,
+      turnMappings: [],
+    });
+    expect(replaced).toMatchObject({
+      revision: (before?.revision ?? 0) + 1,
+      nativeSessionRef: replacementRef,
+      turnMappings: [],
+      forkSource,
+      title: "External Thread",
+      transportModelId: "codexhost/pi-native",
+    });
+    await first.close();
+
+    const second = new MappingStore({ directory, instanceId: "second" });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toEqual(replaced);
+    await second.close();
+  });
+
+  it("replaces last-Turn mappings on the same Native Session identity", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+    await store.upsertTurnMappings(threadId, [mapping(1), mapping(2)]);
+    const before = await store.getThread(threadId);
+
+    const replaced = await store.replaceReadySessionAfterLastTurn({
+      hostThreadId: threadId,
+      expectedRevision: before?.revision ?? 0,
+      expectedNativeSessionRef: nativeRef,
+      nativeSessionRef: nativeRef,
+      turnMappings: [mapping(1)],
+    });
+    expect(replaced).toMatchObject({
+      revision: (before?.revision ?? 0) + 1,
+      nativeSessionRef: nativeRef,
+      turnMappings: [mapping(1)],
+    });
+    await store.close();
+  });
+
+  it("keeps the latest ready Session authoritative when last-Turn replacement fails", async () => {
+    const directory = await temporaryStoreDirectory();
+    let fail = false;
+    const store = new MappingStore({
+      directory,
+      beforeReplace() {
+        if (fail) throw new Error("synthetic last-Turn replacement failure");
+      },
+    });
+    await store.initialize();
+    await createReady(store);
+    const before = await store.upsertTurnMappings(threadId, [mapping(2), mapping(3)]);
+    const replacementRef = nativeSessionRefSchema.parse({
+      harnessId,
+      nativeSessionId: "native-session-shorter",
+      formatVersion: 1,
+    }) as NativeSessionRef;
+    const replaced = await store.replaceReadySessionAfterLastTurn({
+      hostThreadId: threadId,
+      expectedRevision: before.revision,
+      expectedNativeSessionRef: nativeRef,
+      nativeSessionRef: replacementRef,
+      turnMappings: [mappingForSession(replacementRef, 1), mappingForSession(replacementRef, 2)],
+    });
+
+    fail = true;
+    const failedRef = nativeSessionRefSchema.parse({
+      harnessId,
+      nativeSessionId: "native-session-failed",
+      formatVersion: 1,
+    }) as NativeSessionRef;
+    await expect(
+      store.replaceReadySessionAfterLastTurn({
+        hostThreadId: threadId,
+        expectedRevision: replaced.revision,
+        expectedNativeSessionRef: replacementRef,
+        nativeSessionRef: failedRef,
+        turnMappings: [mappingForSession(failedRef, 1)],
+      }),
+    ).rejects.toMatchObject({ code: "IO_ERROR" });
+    await expect(store.getThread(threadId)).resolves.toEqual(replaced);
+    const persisted = JSON.parse(
+      await readFile(path.join(directory, "threads", `${threadId}.json`), "utf8"),
+    ) as StoredThreadRecordV1;
+    expect(persisted).toEqual(replaced);
+    await store.close();
+  });
+
+  it("persists the current transport configuration", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    const route = harnessPluginRouteSchema.parse({
+      harnessId,
+      model: { id: "模".repeat(HARNESS_MODEL_REF_MAX_LENGTH), serviceTier: "priority" },
+      thinkingOptionId: "high",
+      permissionModeId: "acceptEdits",
+    });
+    const transportModelId = encodeHarnessPluginRoute(route);
+    await first.setTransportModelId(threadId, transportModelId);
+    await first.close();
+
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    const stored = await second.getThread(threadId);
+    expect(decodeHarnessPluginRoute(stored?.transportModelId)).toEqual(route);
+    await second.close();
+  });
+
+  it("persists archive state atomically and treats matching state as a no-op", async () => {
+    const directory = await temporaryStoreDirectory();
+    let replacements = 0;
+    const first = new MappingStore({
+      directory,
+      now: () => new Date("2026-08-01T00:00:00.000Z"),
+      beforeReplace() {
+        replacements += 1;
+      },
+    });
+    await first.initialize();
+    await createReady(first);
+    const before = await first.getThread(threadId);
+    const archived = await first.setArchived(threadId, true);
+    expect(archived).toMatchObject({ archived: true, revision: (before?.revision ?? 0) + 1 });
+    const afterChangeReplacements = replacements;
+    const unchanged = await first.setArchived(threadId, true);
+    expect(unchanged).toEqual(archived);
+    expect(replacements).toBe(afterChangeReplacements);
+    await first.close();
+
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toMatchObject({ archived: true });
+    await second.setArchived(threadId, false);
+    await second.close();
+
+    const third = new MappingStore({ directory });
+    await third.initialize();
+    await expect(third.getThread(threadId)).resolves.toMatchObject({ archived: false });
+    await third.close();
+  });
+
+  it("patches Thread metadata, clears fields with null, and skips no-op writes", async () => {
+    const directory = await temporaryStoreDirectory();
+    let replacements = 0;
+    const first = new MappingStore({
+      directory,
+      beforeReplace() {
+        replacements += 1;
+      },
+    });
+    await first.initialize();
+    await createReady(first);
+    await first.updateMetadata(threadId, {
+      projectId: "project-a",
+      daybreakEnabled: true,
+      gitInfo: { branch: "main", sha: "abc123" },
+    });
+    const patched = await first.updateMetadata(threadId, { gitInfo: { sha: null } });
+    expect(patched).toMatchObject({
+      projectId: "project-a",
+      daybreakEnabled: true,
+      gitInfo: { branch: "main" },
+    });
+    expect(patched.gitInfo).not.toHaveProperty("sha");
+    const afterChangeReplacements = replacements;
+    await expect(first.updateMetadata(threadId, { projectId: "project-a" })).resolves.toEqual(
+      patched,
+    );
+    expect(replacements).toBe(afterChangeReplacements);
+    await first.updateMetadata(threadId, { projectId: null, gitInfo: { branch: null } });
+    await first.close();
+
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    const reloaded = await second.getThread(threadId);
+    expect(reloaded).toMatchObject({ daybreakEnabled: true });
+    expect(reloaded).not.toHaveProperty("projectId");
+    expect(reloaded).not.toHaveProperty("gitInfo");
+    await second.close();
+  });
+
+  it("applies a native title without changing recency and preserves a concurrent rename", async () => {
+    const directory = await temporaryStoreDirectory();
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const store = new MappingStore({ directory, now: () => now });
+    await store.initialize();
+    const id = await createReadyThread(store, "native-title", "");
+    now = new Date("2026-02-01T00:00:00.000Z");
+    try {
+      await expect(
+        store.setTitle(id, "First native title", { ifUnnamed: true }),
+      ).resolves.toMatchObject({
+        title: "First native title",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+
+      const [renamed, native] = await Promise.all([
+        store.setTitle(id, "User title"),
+        store.setTitle(id, "Late native title", { ifUnnamed: true }),
+      ]);
+      expect(renamed).toMatchObject({ title: "User title", updatedAt: now.toISOString() });
+      expect(native).toEqual(renamed);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("persists preview separately without renaming or changing recency", async () => {
+    const directory = await temporaryStoreDirectory();
+    let now = new Date("2026-01-01T00:00:00.000Z");
+    const store = new MappingStore({ directory, now: () => now });
+    await store.initialize();
+    await createReady(store);
+    const before = await store.setTitle(threadId, "User title");
+    now = new Date("2026-02-01T00:00:00.000Z");
+    const saved = await store.updateMetadata(threadId, { preview: "First prompt" });
+    expect(saved).toMatchObject({
+      preview: "First prompt",
+      title: before.title,
+      updatedAt: before.updatedAt,
+    });
+    expect(await store.updateMetadata(threadId, { preview: "First prompt" })).toEqual(saved);
+    const core = JSON.parse(
+      await readFile(path.join(directory, "threads", `${threadId}.json`), "utf8"),
+    );
+    expect(storedThreadCoreV1Schema.safeParse(core).success).toBe(true);
+    expect(core).not.toHaveProperty("preview");
+    await store.close();
+    const reopened = new MappingStore({ directory });
+    await reopened.initialize();
+    try {
+      expect(await reopened.getThread(threadId)).toMatchObject({
+        title: "User title",
+        preview: "First prompt",
+      });
+      await reopened.updateMetadata(threadId, { preview: "" });
+      expect(await reopened.getThread(threadId)).toHaveProperty("preview", "");
+      await reopened.updateMetadata(threadId, { preview: null });
+      expect(await reopened.getThread(threadId)).not.toHaveProperty("preview");
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("keeps Thread record files readable by releases without Desktop metadata", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    await first.updateMetadata(threadId, {
+      projectId: "project-a",
+      daybreakEnabled: true,
+      gitInfo: { branch: "main" },
+    });
+    // A second write makes the backup a post-metadata copy too.
+    await first.updateMetadata(threadId, { gitInfo: { sha: "abc123" } });
+    await first.close();
+
+    for (const file of ["threads", "backups"].map((name) =>
+      path.join(directory, name, `${threadId}.json`),
+    )) {
+      const onDisk = JSON.parse(await readFile(file, "utf8"));
+      expect(storedThreadCoreV1Schema.safeParse(onDisk).success).toBe(true);
+      for (const field of ["projectId", "daybreakEnabled", "gitInfo"]) {
+        expect(onDisk).not.toHaveProperty(field);
+      }
+    }
+
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toMatchObject({
+      projectId: "project-a",
+      daybreakEnabled: true,
+      gitInfo: { branch: "main", sha: "abc123" },
+    });
+    await second.removeThread(threadId);
+    await expect(readdir(path.join(directory, "thread-metadata"))).resolves.toEqual([]);
+    await second.close();
+  });
+
+  it("leaves the record unchanged on disk and in memory when the metadata write fails", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    const before = await first.getThread(threadId);
+    const recordFile = path.join(directory, "threads", `${threadId}.json`);
+    const onDiskBefore = await readFile(recordFile, "utf8");
+    // A non-empty directory at the metadata path makes the atomic rename fail.
+    const blocker = path.join(directory, "thread-metadata", `${threadId}.json`);
+    await mkdir(blocker);
+    await writeFile(path.join(blocker, "block"), "");
+
+    await expect(first.updateMetadata(threadId, { projectId: "project-a" })).rejects.toMatchObject({
+      code: "IO_ERROR",
+    });
+    await expect(first.getThread(threadId)).resolves.toEqual(before);
+    await expect(readFile(recordFile, "utf8")).resolves.toBe(onDiskBefore);
+    await first.close();
+
+    await rm(blocker, { recursive: true });
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toEqual(before);
+    await second.close();
+  });
+
+  it("moves inline metadata out of the record and drops metadata of removed Threads", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    await first.close();
+    const recordFile = path.join(directory, "threads", `${threadId}.json`);
+    const inline = { ...JSON.parse(await readFile(recordFile, "utf8")), projectId: "project-a" };
+    await writeFile(recordFile, `${JSON.stringify(inline)}\n`);
+    // Left behind when an older release removed its Thread.
+    await writeFile(
+      path.join(directory, "thread-metadata", "thread-gone.json"),
+      `${JSON.stringify({ formatVersion: 1, hostThreadId: "thread-gone", projectId: "p" })}\n`,
+    );
+
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toMatchObject({ projectId: "project-a" });
+    expect(
+      storedThreadCoreV1Schema.safeParse(JSON.parse(await readFile(recordFile, "utf8"))).success,
+    ).toBe(true);
+    await expect(readdir(path.join(directory, "thread-metadata"))).resolves.toEqual([
+      `${threadId}.json`,
+    ]);
+    await second.close();
+  });
+
+  it("never persists credentials embedded in a Git origin URL", async () => {
+    const store = new MappingStore({ directory: await temporaryStoreDirectory() });
+    await store.initialize();
+    await createReady(store);
+    const origin = async (originUrl: string) =>
+      (await store.updateMetadata(threadId, { gitInfo: { originUrl } })).gitInfo?.originUrl;
+    await expect(origin("https://ghp_secret@github.com/o/r.git")).resolves.toBe(
+      "https://github.com/o/r.git",
+    );
+    await expect(origin("https://user:pass@example.com/r.git")).resolves.toBe(
+      "https://example.com/r.git",
+    );
+    await expect(origin("ssh://git@github.com/o/r.git")).resolves.toBe(
+      "ssh://git@github.com/o/r.git",
+    );
+    await expect(origin("git@github.com:o/r.git")).resolves.toBe("git@github.com:o/r.git");
+    // Values the URL parser rejects must not bypass credential removal.
+    await expect(origin("https://user:tok@example.com:bad/r.git")).resolves.toBe(
+      "https://example.com:bad/r.git",
+    );
+    await expect(origin("https://ghp_secret@example.com:bad/r.git")).resolves.toBe(
+      "https://example.com:bad/r.git",
+    );
+    await expect(origin("ssh://git:tok@example.com:bad/r.git")).resolves.toBe(
+      "ssh://example.com:bad/r.git",
+    );
+    await expect(origin("ssh://git@example.com:bad/r.git")).resolves.toBe(
+      "ssh://git@example.com:bad/r.git",
+    );
+    await expect(origin("user:tok@example.com:o/r.git")).resolves.toBe("example.com:o/r.git");
+    await store.close();
+  });
+
+  it("applies a conditional project clear only while the assignment still matches", async () => {
+    const store = new MappingStore({ directory: await temporaryStoreDirectory() });
+    await store.initialize();
+    await createReady(store);
+    await store.updateMetadata(threadId, { projectId: "project-b" });
+    await expect(
+      store.updateMetadata(threadId, { projectId: null }, { ifProjectId: "project-a" }),
+    ).resolves.toMatchObject({ projectId: "project-b" });
+    const cleared = await store.updateMetadata(
+      threadId,
+      { projectId: null },
+      { ifProjectId: "project-b" },
+    );
+    expect(cleared).not.toHaveProperty("projectId");
+    await store.close();
+  });
+
+  it("keeps prior archive state and Revision when archive replacement fails", async () => {
+    const directory = await temporaryStoreDirectory();
+    let fail = false;
+    const store = new MappingStore({
+      directory,
+      beforeReplace() {
+        if (fail) throw new Error("synthetic archive failure");
+      },
+    });
+    await store.initialize();
+    await createReady(store);
+    const before = await store.getThread(threadId);
+    fail = true;
+    await expect(store.setArchived(threadId, true)).rejects.toMatchObject({ code: "IO_ERROR" });
+    await expect(store.getThread(threadId)).resolves.toEqual(before);
+    await store.close();
+  });
+
+  it("returns defensive content-free enumeration copies", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+    const records = await store.listThreads();
+    expect(records).toHaveLength(1);
+    expect(JSON.stringify(records)).not.toMatch(
+      /"(?:prompt|transcript|toolOutput|diff|usage|cost|context|requestId|refreshCache|apiKey|accessToken)"/iu,
+    );
+    const returned = records[0];
+    if (!returned) throw new Error("Expected one enumerated record");
+    returned.title = "mutated caller copy";
+    returned.turnMappings.length = 0;
+    await expect(store.getThread(threadId)).resolves.toMatchObject({
+      title: "External Thread",
+      turnMappings: [mapping(1)],
+    });
+    await store.close();
+  });
+
+  it("recovers a malformed primary from the latest valid backup", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    await first.setTitle(threadId, "latest title");
+    await first.close();
+
+    await writeFile(path.join(directory, "threads", `${threadId}.json`), "{broken", "utf8");
+    const recovered = new MappingStore({ directory });
+    await recovered.initialize();
+    await expect(recovered.getThread(threadId)).resolves.toMatchObject({
+      title: "External Thread",
+    });
+    await recovered.close();
+  });
+
+  it("quarantines Thread metadata with a record whose primary and backup are unreadable", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    await first.updateMetadata(threadId, { projectId: "project-a", daybreakEnabled: true });
+    await first.close();
+    const metadataPath = path.join(directory, "thread-metadata", `${threadId}.json`);
+    const metadataContent = await readFile(metadataPath, "utf8");
+
+    await writeFile(path.join(directory, "threads", `${threadId}.json`), "{broken", "utf8");
+    await writeFile(path.join(directory, "backups", `${threadId}.json`), "{broken", "utf8");
+    const reopened = new MappingStore({ directory, now: () => new Date(1_700_000_000_000) });
+    await reopened.initialize();
+    await expect(reopened.getThread(threadId)).resolves.toBeNull();
+    await reopened.close();
+
+    await expect(readdir(path.join(directory, "thread-metadata"))).resolves.toEqual([]);
+    const quarantined = `${threadId}.json.1700000000000.invalid`;
+    await expect(readdir(path.join(directory, "quarantine"))).resolves.toEqual([
+      quarantined,
+      `${quarantined}.metadata`,
+    ]);
+    await expect(
+      readFile(path.join(directory, "quarantine", `${quarantined}.metadata`), "utf8"),
+    ).resolves.toBe(metadataContent);
+  });
+
+  it("reloads from disk when retrying after a partially loaded initialization fails", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await createReady(first);
+    await first.updateMetadata(threadId, { projectId: "project-a" });
+    const changed = await createReadyThread(first, "thread-changed", "Loaded title");
+    const removed = await createReadyThread(first, "thread-removed", "Removed Thread");
+    await first.close();
+    const primaryPath = path.join(directory, "threads", `${threadId}.json`);
+    const primaryContent = await readFile(primaryPath, "utf8");
+    const record = JSON.parse(primaryContent) as { createRequestId: string };
+    record.createRequestId = `create-${changed}`;
+    await writeFile(primaryPath, JSON.stringify(record), "utf8");
+    const reopened = new MappingStore({ directory });
+    await expect(reopened.initialize()).rejects.toMatchObject({
+      code: "DUPLICATE_CREATE_REQUEST",
+    });
+    await expect(readFile(path.join(directory, "store.lock"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const changedPath = path.join(directory, "threads", `${changed}.json`);
+    const changedRecord = JSON.parse(await readFile(changedPath, "utf8")) as { title: string };
+    changedRecord.title = "Title changed on disk";
+    await writeFile(changedPath, JSON.stringify(changedRecord), "utf8");
+    await rm(path.join(directory, "threads", `${removed}.json`));
+    await rm(path.join(directory, "backups", `${removed}.json`), { force: true });
+    await writeFile(primaryPath, primaryContent, "utf8");
+    await reopened.initialize();
+    await expect(reopened.getThread(threadId)).resolves.toMatchObject({ projectId: "project-a" });
+    await expect(reopened.getThread(changed)).resolves.toMatchObject({
+      title: "Title changed on disk",
+    });
+    await expect(reopened.getThread(removed)).resolves.toBeNull();
+    await reopened.close();
+  });
+
+  it("cleans a provisional create without Native identity on restart", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory });
+    await first.initialize();
+    await first.createProvisional({
+      hostThreadId: threadId,
+      createRequestId: "provisional",
+      harnessId,
+      cwd: "/synthetic",
+      transportModelId: "codexhost/pi-native",
+      ephemeral: false,
+      historyMode: "legacy",
+      forkSource: {
+        hostThreadId: hostThreadIdSchema.parse("source-thread"),
+        hostTurnId: hostTurnIdSchema.parse("source-turn"),
+      },
+    });
+    await first.close();
+
+    const second = new MappingStore({ directory });
+    await second.initialize();
+    await expect(second.getThread(threadId)).resolves.toBeNull();
+    await second.close();
+  });
+
+  it("allows failed Fork commit cleanup while retaining the source", async () => {
+    const directory = await temporaryStoreDirectory();
+    let failDerivedCommit = false;
+    const store = new MappingStore({
+      directory,
+      beforeReplace(record) {
+        if (
+          failDerivedCommit &&
+          record.hostThreadId === "derived-thread" &&
+          record.state === "ready"
+        ) {
+          throw new Error("synthetic Fork commit failure");
+        }
+      },
+    });
+    await store.initialize();
+    await createReady(store);
+    const derivedId = hostThreadIdSchema.parse("derived-thread");
+    await store.createProvisional({
+      hostThreadId: derivedId,
+      createRequestId: "fork-create",
+      harnessId,
+      cwd: "/synthetic",
+      transportModelId: "codexhost/pi-native",
+      ephemeral: false,
+      historyMode: "legacy",
+      forkSource: { hostThreadId: threadId, hostTurnId: mapping(1).hostTurnId },
+    });
+    failDerivedCommit = true;
+    await expect(
+      store.commitReady({
+        hostThreadId: derivedId,
+        nativeSessionRef: {
+          harnessId: nativeRef.harnessId,
+          nativeSessionId: "derived-native",
+          locator: { sessionFile: "/synthetic/derived.jsonl" },
+          formatVersion: 1,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "IO_ERROR" });
+    await store.removeProvisional(derivedId);
+    await expect(store.getThread(derivedId)).resolves.toBeNull();
+    await expect(store.getThread(threadId)).resolves.toMatchObject({ state: "ready" });
+    await store.close();
+  });
+
+  it("removes a ready Thread and releases its global indexes", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+
+    await store.removeThread(threadId);
+    await expect(store.getThread(threadId)).resolves.toBeNull();
+    await store.createProvisional({
+      hostThreadId: threadId,
+      createRequestId: "replacement-create",
+      harnessId,
+      cwd: "/synthetic",
+      transportModelId: "codexhost/pi-native",
+      ephemeral: false,
+      historyMode: "legacy",
+    });
+    await store.close();
+  });
+
+  it.each(["backups", "thread-metadata"])(
+    "preserves a discoverable mapping when deletion of %s fails",
+    async (subdirectory) => {
+      const directory = await temporaryStoreDirectory();
+      const store = new MappingStore({ directory });
+      await store.initialize();
+      await createReady(store);
+      const blockedPath = path.join(directory, subdirectory, `${threadId}.json`);
+      await rm(blockedPath, { force: true });
+      await mkdir(blockedPath);
+      try {
+        await expect(store.removeThread(threadId)).rejects.toThrow();
+        await expect(store.getThread(threadId)).resolves.toMatchObject({ state: "ready" });
+      } finally {
+        await store.close();
+      }
+      await rm(blockedPath, { recursive: true });
+      const reopened = new MappingStore({ directory });
+      try {
+        await reopened.initialize();
+        await expect(reopened.getThread(threadId)).resolves.toMatchObject({ state: "ready" });
+        await reopened.removeThread(threadId);
+        await expect(reopened.getThread(threadId)).resolves.toBeNull();
+      } finally {
+        await reopened.close();
+      }
+    },
+  );
+
+  it("preserves all metadata when the primary record cannot be deleted", async () => {
+    const directory = await temporaryStoreDirectory();
+    const store = new MappingStore({ directory });
+    await store.initialize();
+    await createReady(store);
+    await store.updateMetadata(threadId, {
+      projectId: "project",
+      daybreakEnabled: true,
+      gitInfo: { branch: "main" },
+    });
+    const expected = await store.getThread(threadId);
+    const primary = path.join(directory, "threads", `${threadId}.json`);
+    const metadata = path.join(directory, "thread-metadata", `${threadId}.json`);
+    const content = await readFile(primary, "utf8");
+    const metadataContent = await readFile(metadata, "utf8");
+    await rm(primary);
+    await mkdir(primary);
+    try {
+      await expect(store.removeThread(threadId)).rejects.toThrow();
+      await expect(store.getThread(threadId)).resolves.toEqual(expected);
+      await expect(readFile(metadata, "utf8")).resolves.toBe(metadataContent);
+    } finally {
+      await rm(primary, { recursive: true });
+      await writeFile(primary, content);
+      await store.close();
+    }
+    const reopened = new MappingStore({ directory });
+    try {
+      await reopened.initialize();
+      await expect(reopened.getThread(threadId)).resolves.toEqual(expected);
+    } finally {
+      await reopened.close();
+    }
+  });
+
+  it("enforces one live writer per directory", async () => {
+    const directory = await temporaryStoreDirectory();
+    const first = new MappingStore({ directory, instanceId: "first" });
+    const second = new MappingStore({ directory, instanceId: "second" });
+    await first.initialize();
+    try {
+      const lockPath = path.join(directory, "store.lock");
+      const lock = await readFile(lockPath, "utf8");
+      const { startedAt } = JSON.parse(lock) as { startedAt: string };
+      await expect(second.initialize()).rejects.toEqual(
+        expect.objectContaining<Partial<MappingStoreError>>({
+          code: "STORE_LOCKED",
+          message: expect.stringContaining(`PID ${process.pid}`),
+        }),
+      );
+      await expect(second.initialize()).rejects.toThrow(startedAt);
+      await expect(second.initialize()).rejects.toThrow(directory);
+      expect(await readFile(lockPath, "utf8")).toBe(lock);
+    } finally {
+      await second.close();
+      await first.close();
+    }
+  });
+
+  it("reports a live legacy lock without dumping unrelated lock fields", async () => {
+    const directory = await temporaryStoreDirectory();
+    const lockPath = path.join(directory, "store.lock");
+    const lock = JSON.stringify({ pid: process.pid, instanceId: "legacy", token: "not-for-logs" });
+    await writeFile(lockPath, lock);
+    const store = new MappingStore({ directory });
+    try {
+      await expect(store.initialize()).rejects.toThrow(
+        `Another codexhost process owns Mapping Store at ${directory} (owner PID ${process.pid}; startedAt: unknown)`,
+      );
+      expect(await readFile(lockPath, "utf8")).toBe(lock);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("removes lock files left aside by earlier runs", async () => {
+    const directory = await temporaryStoreDirectory();
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, "store.lock.stale-1"), "{}\n", "utf8");
+    await writeFile(path.join(directory, "store.lock.stale-2"), "{}\n", "utf8");
+    // An unparsable lock cannot prove a live owner, so initialization reclaims it.
+    await writeFile(path.join(directory, "store.lock"), "not json\n", "utf8");
+
+    const store = new MappingStore({ directory, instanceId: "recovered" });
+    await store.initialize();
+    expect((await readdir(directory)).filter((name) => name.startsWith("store.lock."))).toEqual([]);
+    await store.close();
+  });
+
+  it("recovers a Windows lock whose PID was reused by another executable", async () => {
+    if (process.platform !== "win32") return;
+    const directory = await temporaryStoreDirectory();
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      path.join(directory, "store.lock"),
+      `${JSON.stringify({
+        pid: process.pid,
+        instanceId: "legacy-owner",
+        startedAt: new Date(0).toISOString(),
+        executablePath: "C:\\\\Windows\\\\System32\\\\svchost.exe",
+        processStartedAt: new Date(0).toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    const store = new MappingStore({ directory, instanceId: "recovered" });
+    await store.initialize();
+    await store.close();
+  });
+
+  it("recovers a Windows lock whose PID and executable were both reused", async () => {
+    if (process.platform !== "win32") return;
+    const directory = await temporaryStoreDirectory();
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      path.join(directory, "store.lock"),
+      `${JSON.stringify({
+        pid: process.pid,
+        instanceId: "legacy-owner",
+        startedAt: new Date(0).toISOString(),
+        executablePath: process.execPath,
+        processStartedAt: new Date(0).toISOString(),
+      })}\n`,
+      "utf8",
+    );
+
+    const store = new MappingStore({ directory, instanceId: "recovered" });
+    await store.initialize();
+    await store.close();
+  });
+});
+
+it("stores latest measurements only in existing metadata without changing identity revision or activity", async () => {
+  const directory = await temporaryStoreDirectory();
+  const store = new MappingStore({ directory });
+  await store.initialize();
+  await createReady(store);
+  await store.updateMetadata(threadId, { preview: "keep preview", projectId: "project" });
+  const before = await store.getThread(threadId);
+  const core = await readFile(path.join(directory, "threads", `${threadId}.json`), "utf8");
+  const values = {
+    outputTokensPerSecond: { version: 4 as const, value: 100, turnId: "turn-1", at: 100 },
+    timeToFirstOutputMs: { value: 50, turnId: "turn-1", at: 90 },
+    outputTimings: [
+      {
+        version: 4 as const,
+        requestId: "one",
+        turnId: "turn-1",
+        outputTokens: 100,
+        startedAtMs: 1000,
+        completedAtMs: 2000,
+      },
+    ],
+  };
+  const saved = await store.saveUsageMeasurements(threadId, nativeRef, values);
+  expect(saved).toMatchObject({
+    revision: before?.revision,
+    updatedAt: before?.updatedAt,
+    preview: "keep preview",
+    usageMeasurements: { values },
+  });
+  expect(await readFile(path.join(directory, "threads", `${threadId}.json`), "utf8")).toBe(core);
+  expect(
+    JSON.parse(await readFile(path.join(directory, "thread-metadata", `${threadId}.json`), "utf8")),
+  ).toMatchObject({ projectId: "project", usageMeasurements: { values } });
+  const metadataPath = path.join(directory, "thread-metadata", `${threadId}.json`);
+  const stamp = await stat(metadataPath, { bigint: true });
+  await store.saveUsageMeasurements(threadId, nativeRef, values);
+  expect((await stat(metadataPath, { bigint: true })).mtimeNs).toBe(stamp.mtimeNs);
+  expect((await stat(metadataPath, { bigint: true })).ino).toBe(stamp.ino);
+  await store.close();
+  const reopened = new MappingStore({ directory });
+  await reopened.initialize();
+  expect((await reopened.getThread(threadId))?.usageMeasurements?.values).toEqual(values);
+  const wrong = nativeSessionRefSchema.parse({ ...nativeRef, nativeSessionId: "other" });
+  expect(
+    (await reopened.saveUsageMeasurements(threadId, wrong, {})).usageMeasurements?.values,
+  ).toEqual(values);
+  await reopened.reconcileTurnMappings(threadId, []);
+  expect(
+    (await reopened.saveUsageMeasurements(threadId, nativeRef, values)).usageMeasurements,
+  ).toBeUndefined();
+  expect((await reopened.getThread(threadId))?.preview).toBe("keep preview");
+  await reopened.close();
+});
+
+it("does not discard organization metadata when optional usage cache is invalid", async () => {
+  const directory = await temporaryStoreDirectory();
+  const first = new MappingStore({ directory });
+  await first.initialize();
+  await createReady(first);
+  await first.updateMetadata(threadId, { preview: "keep", projectId: "project" });
+  await first.close();
+  const file = path.join(directory, "thread-metadata", `${threadId}.json`);
+  const metadata = JSON.parse(await readFile(file, "utf8"));
+  metadata.usageMeasurements = {
+    nativeSessionRef: nativeRef,
+    values: { timeToFirstOutputMs: { value: -1, turnId: "turn-1", at: 1 } },
+  };
+  await writeFile(file, JSON.stringify(metadata));
+  const reopened = new MappingStore({ directory });
+  await reopened.initialize();
+  const record = await reopened.getThread(threadId);
+  expect(record).toMatchObject({ preview: "keep", projectId: "project" });
+  expect(record?.usageMeasurements).toBeUndefined();
+  await reopened.close();
+});

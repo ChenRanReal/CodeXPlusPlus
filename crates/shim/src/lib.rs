@@ -1,0 +1,1530 @@
+#![forbid(unsafe_code)]
+
+use std::env;
+use std::error::Error;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use codexhost_platform::discover_desktop_managed_codex_cli;
+use codexhost_platform::{
+    CODEX_CLI_PATH_ENV, STOCK_CODEX_PATH_ENV, canonical_existing_file,
+    configure_background_command, node_entrypoint_path, proxy_environment, spawn_supervised,
+    validate_proxy_target,
+};
+
+mod desktop_invocation;
+mod local_runtime_lease;
+mod process_identity;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod remote_lifecycle;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod remote_listener_process;
+
+use local_runtime_lease::{LocalRuntimeAdmission, admit_local_runtime};
+
+pub type ShimResult<T> = Result<T, Box<dyn Error>>;
+
+pub const HOST_NODE_PATH_ENV: &str = "CODEXHOST_HOST_NODE_PATH";
+pub const HOST_RUNTIME_PATH_ENV: &str = "CODEXHOST_HOST_RUNTIME_PATH";
+pub const REMOTE_SSH_MANAGED_ENV: &str = "CODEXHOST_REMOTE_SSH_MANAGED";
+const DATA_DIRECTORY_ENV: &str = "CODEXHOST_DATA_DIR";
+const LAUNCHER_PID_ENV: &str = "CODEXHOST_LAUNCHER_PID";
+const REMOTE_LISTENER_CHILD_ENV: &str = "CODEXHOST_REMOTE_LISTENER_CHILD";
+const INTERNAL_ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+const DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+/// Hidden app-server options that take several values each. Codex Desktop passes them to set
+/// process-local launch directories for stdio MCP servers:
+/// `--mcp-launch-cwd <SERVER> <EXECUTABLE> <DIRECTORY>` and
+/// `--plugin-mcp-launch-cwd <PLUGIN_ID> <SERVER> <DIRECTORY>`.
+const APP_SERVER_MULTI_VALUE_OPTIONS: &[(&str, usize)] =
+    &[("--mcp-launch-cwd", 3), ("--plugin-mcp-launch-cwd", 3)];
+
+/// Returns how many values follow a multi-value app-server option, or `None` for other arguments.
+fn app_server_multi_value_count(argument: &str) -> Option<usize> {
+    APP_SERVER_MULTI_VALUE_OPTIONS
+        .iter()
+        .find_map(|&(option, count)| (option == argument).then_some(count))
+}
+
+fn has_app_server_multi_values(arguments: &[OsString], index: usize, count: usize) -> bool {
+    arguments
+        .get(index + 1..=index + count)
+        .is_some_and(|values| values.iter().all(|value| !value.is_empty()))
+}
+
+/// Optional lifecycle hooks for diagnostics around the byte-transparent proxy core.
+pub trait ProxyObserver {
+    fn invocation(&self, _arguments: &[OsString], _stock_codex_path: &Path) {}
+
+    fn exit(&self, _child_id: u32, _status: &ExitStatus, _elapsed: Duration) {}
+}
+
+struct NoopProxyObserver;
+
+impl ProxyObserver for NoopProxyObserver {}
+
+fn copy_stream<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
+where
+    R: Read,
+    W: Write,
+{
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(copied),
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        writer.write_all(&buffer[..count])?;
+        writer.flush()?;
+        copied += count as u64;
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct ShutdownSignals {
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl ShutdownSignals {
+    fn install() -> ShimResult<Self> {
+        use nix::sys::signal::{SigSet, Signal};
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        use signal_hook::flag::register_usize;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut managed = SigSet::empty();
+        for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
+            managed.add(signal);
+        }
+        managed.thread_unblock()?;
+
+        let pending = Arc::new(AtomicUsize::new(0));
+        let mut registrations = Vec::new();
+        for signal in [SIGTERM, SIGINT, SIGHUP] {
+            registrations.push(register_usize(
+                signal,
+                Arc::clone(&pending),
+                signal as usize,
+            )?);
+        }
+        Ok(Self {
+            pending,
+            registrations,
+        })
+    }
+
+    fn pending(&self) -> Option<i32> {
+        use std::sync::atomic::Ordering;
+
+        let signal = self.pending.swap(0, Ordering::SeqCst);
+        (signal != 0).then_some(signal as i32)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for ShutdownSignals {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct ShutdownSignals;
+
+#[cfg(target_os = "windows")]
+impl ShutdownSignals {
+    fn install() -> ShimResult<Self> {
+        Ok(Self)
+    }
+}
+
+struct ChildOutcome {
+    status: ExitStatus,
+    forwarded_signal: Option<i32>,
+    forced: bool,
+    terminated_descendants: bool,
+    desktop_input_closed: bool,
+}
+
+#[cfg(target_os = "macos")]
+const PROCESS_TREE_REFRESH_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(target_os = "linux")]
+const PROCESS_TREE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_tree_refresh_due(
+    last_refresh: Option<Instant>,
+    now: Instant,
+    root_exited: bool,
+) -> bool {
+    root_exited
+        || last_refresh.is_none_or(|last_refresh| {
+            now.saturating_duration_since(last_refresh) >= PROCESS_TREE_REFRESH_INTERVAL
+        })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_for_child(
+    child: &mut codexhost_platform::SupervisedChild,
+    signals: &ShutdownSignals,
+    desktop_input: Option<&std::sync::mpsc::Receiver<io::Result<u64>>>,
+) -> ShimResult<ChildOutcome> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+    let mut root_status = None;
+    let mut forwarded_signal = None;
+    let mut deadline = None;
+    let mut forced = false;
+    let mut terminated_descendants = false;
+    let mut desktop_input_closed = false;
+    let mut last_process_tree_refresh = None;
+    loop {
+        if root_status.is_none() {
+            root_status = child.try_wait()?;
+        }
+        // `has_live_processes` takes a full system process snapshot so escaped descendants can
+        // still be attributed to this launch. Preserve the responsive macOS observation needed
+        // for descendants that create a new process group; throttle Linux snapshots to avoid the
+        // measured idle CPU regression. Root exit and lifecycle signals still trigger immediate
+        // snapshots through this branch or the signal operations.
+        let now = Instant::now();
+        let refresh_process_tree =
+            process_tree_refresh_due(last_process_tree_refresh, now, root_status.is_some());
+        let has_live_processes = if refresh_process_tree {
+            let has_live_processes = child.has_live_processes()?;
+            #[cfg(all(target_os = "macos", feature = "test-utils"))]
+            if let Some(path) = env::var_os("CODEXHOST_TEST_PROCESS_OBSERVATIONS") {
+                // The stderr pump holds its output lock for the child's lifetime.
+                // Use a test-only file to acknowledge completed observations.
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?
+                    .write_all(b".")?;
+            }
+            last_process_tree_refresh = Some(now);
+            has_live_processes
+        } else {
+            true
+        };
+        if let Some(status) = root_status.as_ref()
+            && !has_live_processes
+        {
+            return Ok(ChildOutcome {
+                status: *status,
+                forwarded_signal,
+                forced,
+                terminated_descendants,
+                desktop_input_closed,
+            });
+        }
+        if !desktop_input_closed
+            && root_status.is_none()
+            && desktop_input.is_some_and(|input| input.try_recv().is_ok())
+        {
+            child.terminate()?;
+            desktop_input_closed = true;
+            deadline = Some(Instant::now() + TERMINATION_GRACE);
+        } else if let Some(signal) = signals.pending().filter(|_| forwarded_signal.is_none()) {
+            child.forward_signal(signal)?;
+            forwarded_signal = Some(signal);
+            deadline = Some(Instant::now() + TERMINATION_GRACE);
+        } else if root_status.is_some() && deadline.is_none() && has_live_processes {
+            child.terminate()?;
+            terminated_descendants = true;
+            deadline = Some(Instant::now() + TERMINATION_GRACE);
+        }
+        if !forced && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            child.force_terminate()?;
+            forced = true;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_child(
+    child: &mut codexhost_platform::SupervisedChild,
+    _signals: &ShutdownSignals,
+    desktop_input: Option<&std::sync::mpsc::Receiver<io::Result<u64>>>,
+) -> ShimResult<ChildOutcome> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+    let mut desktop_input_closed = false;
+    let mut deadline = None;
+    let mut forced = false;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(ChildOutcome {
+                status,
+                forwarded_signal: None,
+                forced,
+                terminated_descendants: false,
+                desktop_input_closed,
+            });
+        }
+        if !desktop_input_closed && desktop_input.is_some_and(|input| input.try_recv().is_ok()) {
+            child.terminate()?;
+            desktop_input_closed = true;
+            deadline = Some(Instant::now() + TERMINATION_GRACE);
+        }
+        if !forced && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            child.force_terminate()?;
+            forced = true;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal()
+}
+
+#[cfg(target_os = "windows")]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
+}
+
+/// Returns the position of the named Codex subcommand after supported global options.
+///
+/// An arbitrary later argument matching `expected` is not treated as a subcommand. This keeps the
+/// Shim transparent for prompts and subcommands whose values happen to contain the same text.
+#[must_use]
+fn subcommand_index(arguments: &[OsString], expected: &str) -> Option<usize> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--remote",
+        "--remote-auth-token-env",
+        "-m",
+        "--model",
+        "--local-provider",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+    ];
+    const FLAG_OPTIONS: &[&str] = &[
+        "--strict-config",
+        "--oss",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+    ];
+
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index).and_then(|value| value.to_str()) {
+        if argument == expected {
+            return Some(index);
+        }
+        if VALUE_OPTIONS.contains(&argument) {
+            arguments.get(index + 1)?;
+            index += 2;
+            continue;
+        }
+        if VALUE_OPTIONS.iter().any(|option| {
+            argument
+                .strip_prefix(option)
+                .is_some_and(|remainder| remainder.starts_with('='))
+        }) || FLAG_OPTIONS.contains(&argument)
+        {
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Returns the position of the Codex `app-server` subcommand after supported global options.
+///
+/// An arbitrary later argument named `app-server` is not treated as a subcommand. This keeps the
+/// Shim transparent for prompts and subcommands whose values happen to contain the same text.
+#[must_use]
+pub fn app_server_subcommand_index(arguments: &[OsString]) -> Option<usize> {
+    subcommand_index(arguments, "app-server")
+}
+
+/// Returns the position of the Codex `exec-server` subcommand after supported global options.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+fn exec_server_subcommand_index(arguments: &[OsString]) -> Option<usize> {
+    subcommand_index(arguments, "exec-server")
+}
+
+/// Returns whether a macOS stock-CLI passthrough invocation should replace the Shim process with
+/// the validated official CLI via `exec`.
+///
+/// Desktop's native socket peer authorization verifies both ancestry back to Desktop and OpenAI
+/// code-signing identities across the peer, its parent, and its grandparent. Keeping an
+/// ad-hoc-signed Shim above Desktop's `exec-server`, auxiliary `app-server`, or `sandbox` helpers
+/// breaks that chain when those helpers connect to native Desktop pipes such as `codex-app-tools`.
+#[cfg(any(target_os = "macos", test))]
+#[must_use]
+fn should_replace_shim_with_stock_codex(
+    arguments: &[OsString],
+    desktop_caller: &desktop_invocation::DesktopCaller,
+    desktop_helper: bool,
+    cli_discovery_only: bool,
+) -> bool {
+    let is_exec_server = exec_server_subcommand_index(arguments).is_some();
+    if is_exec_server
+        && matches!(
+            desktop_caller,
+            desktop_invocation::DesktopCaller::Main | desktop_invocation::DesktopCaller::Helper
+        )
+    {
+        return true;
+    }
+    (desktop_helper || cli_discovery_only)
+        && (app_server_subcommand_index(arguments).is_some()
+            || is_exec_server
+            || arguments
+                .first()
+                .is_some_and(|argument| argument == "sandbox"))
+}
+
+/// Returns whether the app-server invocation belongs to the Skysight memory summarizer.
+///
+/// Skysight starts a short-lived stock Codex app-server with the dedicated `openai-memgen`
+/// provider. That auxiliary server must not be replaced by the long-lived codexhost Host Runtime.
+#[must_use]
+fn is_skysight_memory_app_server(arguments: &[OsString]) -> bool {
+    const CONFIG_OPTIONS: &[&str] = &["-c", "--config"];
+
+    let mut index = 0;
+    while index < arguments.len() {
+        let Some(argument) = arguments.get(index).and_then(|value| value.to_str()) else {
+            return false;
+        };
+
+        // Read only real Codex config overrides. Codex accepts them on either side of the
+        // app-server subcommand, so scanning the complete invocation is required for Skysight.
+        // Exact key/value parsing avoids treating an unrelated mention as a memory invocation.
+        let config_value = if CONFIG_OPTIONS.contains(&argument) {
+            index += 1;
+            arguments.get(index).and_then(|value| value.to_str())
+        } else {
+            CONFIG_OPTIONS.iter().find_map(|option| {
+                argument
+                    .strip_prefix(option)
+                    .and_then(|remainder| remainder.strip_prefix('='))
+            })
+        };
+
+        if config_value.is_some_and(|value| {
+            let Some((key, configured_value)) = value.split_once('=') else {
+                return false;
+            };
+            key.trim() == "model_provider"
+                && configured_value
+                    .trim()
+                    .trim_matches(['\'', '"'])
+                    .eq("openai-memgen")
+        }) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Returns whether this invocation starts an app-server instance owned by the Host Runtime.
+///
+/// App-server management commands such as `proxy` and `daemon` must stay on the stock Codex CLI.
+/// In particular, Codex Desktop's SSH transport runs `app-server proxy` as a byte-transparent
+/// bridge to the already-running Unix listener; replacing that bridge with the JSONL Host Runtime
+/// would corrupt the WebSocket transport.
+#[must_use]
+pub fn should_start_host_runtime(arguments: &[OsString]) -> bool {
+    should_start_host_runtime_for_originator(
+        arguments,
+        env::var_os(INTERNAL_ORIGINATOR_OVERRIDE_ENV).as_deref(),
+    )
+}
+
+/// Applies the Host Runtime routing policy for an optional official Codex internal originator.
+///
+/// Official auxiliary services such as Skysight and Computer Use launch isolated app-servers with
+/// an internal originator override. Those one-shot servers must remain on the stock Codex CLI.
+#[must_use]
+fn should_start_host_runtime_for_originator(
+    arguments: &[OsString],
+    internal_originator: Option<&OsStr>,
+) -> bool {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--listen",
+        "--ws-auth",
+        "--ws-token-file",
+        "--ws-token-sha256",
+        "--ws-shared-secret-file",
+        "--ws-issuer",
+        "--ws-audience",
+        "--ws-max-clock-skew-seconds",
+    ];
+    const FLAG_OPTIONS: &[&str] = &["--strict-config", "--stdio", "--analytics-default-enabled"];
+
+    let Some(app_server_index) = app_server_subcommand_index(arguments) else {
+        return false;
+    };
+    // Internal Codex services own their auxiliary server lifecycle. Intercepting one of these
+    // processes causes the caller to lose its one-shot response, as seen in Skysight summaries.
+    if internal_originator.is_some_and(|originator| {
+        !originator.is_empty() && originator != OsStr::new(DESKTOP_ORIGINATOR)
+    }) || is_skysight_memory_app_server(arguments)
+    {
+        return false;
+    }
+    let mut index = app_server_index + 1;
+    while let Some(argument) = arguments.get(index).and_then(|value| value.to_str()) {
+        if VALUE_OPTIONS.contains(&argument) {
+            if arguments.get(index + 1).is_none() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(count) = app_server_multi_value_count(argument) {
+            if !has_app_server_multi_values(arguments, index, count) {
+                return false;
+            }
+            index += count + 1;
+            continue;
+        }
+        if VALUE_OPTIONS.iter().any(|option| {
+            argument
+                .strip_prefix(option)
+                .is_some_and(|remainder| remainder.starts_with('='))
+        }) || FLAG_OPTIONS.contains(&argument)
+        {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+#[must_use]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn is_default_remote_unix_listener(arguments: &[OsString]) -> bool {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "--ws-auth",
+        "--ws-token-file",
+        "--ws-token-sha256",
+        "--ws-shared-secret-file",
+        "--ws-issuer",
+        "--ws-audience",
+        "--ws-max-clock-skew-seconds",
+    ];
+    const FLAG_OPTIONS: &[&str] = &["--strict-config", "--analytics-default-enabled"];
+
+    let Some(mut index) = app_server_subcommand_index(arguments).map(|index| index + 1) else {
+        return false;
+    };
+    let mut saw_default_listener = false;
+    while let Some(argument) = arguments.get(index).and_then(|value| value.to_str()) {
+        if argument == "--stdio" {
+            return false;
+        }
+        if argument == "--listen" {
+            let Some(value) = arguments.get(index + 1).and_then(|value| value.to_str()) else {
+                return false;
+            };
+            if saw_default_listener || value != "unix://" {
+                return false;
+            }
+            saw_default_listener = true;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--listen=") {
+            if saw_default_listener || value != "unix://" {
+                return false;
+            }
+            saw_default_listener = true;
+            index += 1;
+            continue;
+        }
+        if VALUE_OPTIONS.contains(&argument) {
+            if arguments.get(index + 1).is_none() {
+                return false;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(count) = app_server_multi_value_count(argument) {
+            if !has_app_server_multi_values(arguments, index, count) {
+                return false;
+            }
+            index += count + 1;
+            continue;
+        }
+        if VALUE_OPTIONS.iter().any(|option| {
+            argument
+                .strip_prefix(option)
+                .is_some_and(|remainder| remainder.starts_with('='))
+        }) || FLAG_OPTIONS.contains(&argument)
+        {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+    saw_default_listener
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn default_remote_socket_path() -> ShimResult<PathBuf> {
+    let codex_home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .ok_or("CODEX_HOME or HOME is required for the remote listener")?;
+    Ok(codex_home
+        .join("app-server-control")
+        .join("app-server-control.sock"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn socket_identity(socket_path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(socket_path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn detach_remote_listener_session() -> ShimResult<()> {
+    use nix::unistd::setsid;
+
+    setsid().map(|_| ()).map_err(|error| {
+        io::Error::other(format!(
+            "could not detach the managed remote listener session: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stop_detached_listener(child: &mut std::process::Child) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let Ok(raw_process_id) = i32::try_from(child.id()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    let process_id = Pid::from_raw(raw_process_id);
+    let _ = kill(process_id, Signal::SIGTERM);
+    // The listener supervisor needs its own two-second grace to kill descendants.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// A managed remote listener owns the remote installation's Host state. It must never run
+/// with a local Launcher session or without the remote data directory, otherwise its Host
+/// Runtime would use, and lock, the local Desktop's Mapping Store.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ensure_remote_listener_environment() -> ShimResult<()> {
+    if let Some(launcher_id) = env::var_os(LAUNCHER_PID_ENV) {
+        return Err(format!(
+            "refusing to start the managed remote listener inside a local codexhost Desktop session (Launcher PID {}); the remote SSH bootstrap leaked into a local process, so start remote listeners only from an SSH session",
+            launcher_id.to_string_lossy()
+        )
+        .into());
+    }
+    if env::var_os(DATA_DIRECTORY_ENV).is_none_or(|value| value.is_empty()) {
+        return Err(format!(
+            "refusing to start the managed remote listener without {DATA_DIRECTORY_ENV}; reinstall the remote SSH Host so its profile exports the remote data directory"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn launch_detached_remote_listener(arguments: &[OsString]) -> ShimResult<i32> {
+    use std::os::unix::net::UnixStream;
+
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+    let current_executable = env::current_exe()?;
+    let socket_path = default_remote_socket_path()?;
+    let mut previous_socket = socket_identity(&socket_path);
+    if previous_socket.is_some() {
+        let stock_codex_path = env::var_os(STOCK_CODEX_PATH_ENV)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{STOCK_CODEX_PATH_ENV} is required"))?;
+        let (node_path, host_runtime_path) = (
+            env::var_os(HOST_NODE_PATH_ENV),
+            env::var_os(HOST_RUNTIME_PATH_ENV),
+        );
+        let node_path = node_path.as_deref().map(Path::new);
+        let host_runtime_path = host_runtime_path.as_deref().map(Path::new);
+        if remote_lifecycle::existing_listener_is_reusable(
+            &socket_path,
+            &stock_codex_path,
+            node_path,
+            host_runtime_path,
+        )? {
+            UnixStream::connect(&socket_path).map_err(|error| {
+                format!(
+                    "managed remote listener at {} is owned by the installed runtime but is not accepting connections: {error}",
+                    socket_path.display()
+                )
+            })?;
+            return Ok(0);
+        }
+        // No process owns the existing socket: a previous listener exited without
+        // removing it. The replacement listener removes this stale path and binds
+        // a new socket, and filesystems such as ext4 immediately hand the freed
+        // inode number to that new socket. A stale (dev, ino) baseline would then
+        // never look replaced and the healthy replacement would be terminated at
+        // the startup timeout, so a connectable socket alone proves readiness.
+        previous_socket = None;
+    }
+    ensure_remote_listener_environment()?;
+    let mut command = Command::new(&current_executable);
+    command
+        .args(arguments)
+        .env(REMOTE_LISTENER_CHILD_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_background_command(&mut command);
+    let mut child = remote_listener_process::RemoteListenerProcess::spawn(&mut command)?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(
+                format!("managed remote listener exited before readiness: {status}").into(),
+            );
+        }
+        let current_socket = socket_identity(&socket_path);
+        let socket_replaced = current_socket.is_some() && current_socket != previous_socket;
+        if socket_replaced && UnixStream::connect(&socket_path).is_ok() {
+            thread::sleep(POLL_INTERVAL);
+            if let Some(status) = child.try_wait()? {
+                return Err(
+                    format!("managed remote listener exited after readiness: {status}").into(),
+                );
+            }
+            child.detach();
+            return Ok(0);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "managed remote listener did not become ready at {} within {} seconds",
+                socket_path.display(),
+                STARTUP_TIMEOUT.as_secs()
+            )
+            .into());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[must_use]
+fn is_managed_remote_listener(arguments: &[OsString]) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        env::var_os(REMOTE_SSH_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+            && is_default_remote_unix_listener(arguments)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = arguments;
+        false
+    }
+}
+
+#[must_use]
+fn host_runtime_paths_are_configured() -> bool {
+    matches!(
+        (
+            env::var_os(HOST_NODE_PATH_ENV),
+            env::var_os(HOST_RUNTIME_PATH_ENV),
+        ),
+        (Some(_), Some(_))
+    )
+}
+
+fn child_command(
+    arguments: &[OsString],
+    current_executable: &Path,
+    stock_codex_path: &Path,
+    desktop_helper: bool,
+) -> ShimResult<Command> {
+    let launcher_managed = env::var_os(LAUNCHER_PID_ENV).is_some();
+    let inherited_remote_profile = launcher_managed
+        && env::var_os(REMOTE_SSH_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1"));
+    // Local Launcher or remote installation owns this pair. npm paths describe
+    // the updater's runtime, not a replacement for the selected Host runtime.
+    let host_paths = (
+        env::var_os(HOST_NODE_PATH_ENV),
+        env::var_os(HOST_RUNTIME_PATH_ENV),
+    );
+    let remote_proxy_environment =
+        if env::var_os(REMOTE_SSH_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            proxy_environment()
+        } else {
+            Vec::new()
+        };
+    #[cfg(target_os = "windows")]
+    let remote_proxy_environment = if desktop_helper || env::var_os(STOCK_CODEX_PATH_ENV).is_none()
+    {
+        codexhost_platform::desktop_helper_proxy_environment()
+    } else {
+        remote_proxy_environment
+    };
+    if !desktop_helper && should_start_host_runtime(arguments) {
+        if inherited_remote_profile {
+            if is_managed_remote_listener(arguments) {
+                return Err("managed remote listener inherited a local codexhost Launcher session; start remote listeners only from an SSH session".into());
+            }
+            return Err("local Desktop inherited remote Host bootstrap; restart through codexhost with a clean local environment".into());
+        }
+        match host_paths {
+            (Some(node_path), Some(runtime_path)) => {
+                let node_path =
+                    validate_proxy_target(current_executable, &PathBuf::from(node_path))?;
+                let runtime_path = canonical_existing_file(&PathBuf::from(runtime_path))?;
+                let mut command = Command::new(&node_path);
+                command
+                    .arg(node_entrypoint_path(&runtime_path))
+                    .args(arguments)
+                    .env(STOCK_CODEX_PATH_ENV, stock_codex_path)
+                    .env(HOST_NODE_PATH_ENV, &node_path)
+                    .env(HOST_RUNTIME_PATH_ENV, &runtime_path)
+                    .env_remove(CODEX_CLI_PATH_ENV)
+                    .env_remove(REMOTE_SSH_MANAGED_ENV)
+                    .env_remove(REMOTE_LISTENER_CHILD_ENV);
+                command.envs(remote_proxy_environment);
+                configure_background_command(&mut command);
+                return Ok(command);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "{HOST_NODE_PATH_ENV} and {HOST_RUNTIME_PATH_ENV} must be configured together"
+                )
+                .into());
+            }
+        }
+    }
+
+    let mut command = Command::new(stock_codex_path);
+    if desktop_helper {
+        // Do not pass launcher/runtime credentials or npm routing back into the
+        // stock helper's descendants. The official CLI still performs policy,
+        // authentication, and tool approvals using its normal configuration.
+        for (name, _) in env::vars_os() {
+            if name.to_string_lossy().starts_with("CODEXHOST_") {
+                command.env_remove(name);
+            }
+        }
+    }
+    command
+        .args(arguments)
+        .env_remove(CODEX_CLI_PATH_ENV)
+        .env_remove(HOST_NODE_PATH_ENV)
+        .env_remove(HOST_RUNTIME_PATH_ENV)
+        .env_remove(REMOTE_SSH_MANAGED_ENV)
+        .env_remove(REMOTE_LISTENER_CHILD_ENV);
+    command.envs(remote_proxy_environment);
+    configure_background_command(&mut command);
+    Ok(command)
+}
+
+/// Resolve the official CLI for both the launcher-managed process tree and
+/// Desktop helpers that persist only the standard `CODEX_CLI_PATH`
+/// override.
+///
+/// The launcher-provided path remains authoritative. Discovery requires the
+/// exact self override, except for Desktop node_repl's top-level `sandbox` call:
+/// it resolves the executable before clearing both CLI overrides from the child.
+fn resolve_stock_codex_path(
+    current_executable: &Path,
+    arguments: &[OsString],
+) -> ShimResult<PathBuf> {
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let _ = arguments;
+    let stock_codex_path = match env::var_os(STOCK_CODEX_PATH_ENV) {
+        Some(configured) => PathBuf::from(configured),
+        None => {
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            return Err(format!("{STOCK_CODEX_PATH_ENV} is required").into());
+
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                if let Some(cli_override) = env::var_os(CODEX_CLI_PATH_ENV) {
+                    let cli_override = canonical_existing_file(&PathBuf::from(cli_override))?;
+                    let current_executable = canonical_existing_file(current_executable)?;
+                    if cli_override != current_executable {
+                        return Err(format!(
+                            "{STOCK_CODEX_PATH_ENV} is required when {CODEX_CLI_PATH_ENV} does not identify the running Shim"
+                        )
+                        .into());
+                    }
+                } else if arguments
+                    .first()
+                    .is_none_or(|argument| argument != "sandbox")
+                {
+                    return Err(format!("{STOCK_CODEX_PATH_ENV} is required").into());
+                }
+                discover_desktop_managed_codex_cli().map_err(|error| {
+                    format!(
+                        "{STOCK_CODEX_PATH_ENV} is unavailable and the Desktop-managed official Codex CLI could not be discovered: {error}"
+                    )
+                })?
+            }
+        }
+    };
+    Ok(validate_proxy_target(
+        current_executable,
+        &stock_codex_path,
+    )?)
+}
+
+/// Runs the byte-transparent proxy and emits optional lifecycle observations.
+/// A child that exits before its identity is recorded leaves no process to snapshot. Its exit
+/// status and stderr are the real diagnosis, so the proxy reports them instead of the
+/// registration error; the unpublished lease is released when it drops.
+fn child_exited_during_startup(child: &mut codexhost_platform::SupervisedChild) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => return false,
+        }
+    }
+}
+
+pub fn run_proxy_with_observer(
+    arguments: &[OsString],
+    observer: &impl ProxyObserver,
+) -> ShimResult<i32> {
+    let current_executable = env::current_exe()?;
+    let stock_codex_path = resolve_stock_codex_path(&current_executable, arguments)?;
+    observer.invocation(arguments, &stock_codex_path);
+
+    let started = Instant::now();
+    let shutdown_signals = ShutdownSignals::install()?;
+    let desktop_caller = desktop_invocation::classify_desktop_caller(&stock_codex_path, arguments);
+    let mut desktop_helper = desktop_caller == desktop_invocation::DesktopCaller::Helper;
+    let mut local_host_runtime = !desktop_helper
+        && should_start_host_runtime(arguments)
+        && host_runtime_paths_are_configured()
+        && !is_managed_remote_listener(arguments)
+        && env::var_os(DATA_DIRECTORY_ENV).is_some();
+    let mut local_runtime_lease = None;
+    if local_host_runtime {
+        let data_directory = PathBuf::from(
+            env::var_os(DATA_DIRECTORY_ENV).ok_or("CODEXHOST_DATA_DIR is unavailable")?,
+        );
+        match admit_local_runtime(&data_directory, &desktop_caller)? {
+            LocalRuntimeAdmission::Owner(lease) => local_runtime_lease = Some(lease),
+            LocalRuntimeAdmission::OfficialCli(reason) => {
+                eprintln!(
+                    "codexhost shim: {reason}; this app-server was not started by Codex Desktop, so it runs on the official CLI"
+                );
+                desktop_helper = true;
+                local_host_runtime = false;
+            }
+        }
+    }
+    let mut command = child_command(
+        arguments,
+        &current_executable,
+        &stock_codex_path,
+        desktop_helper,
+    )?;
+    #[cfg(target_os = "macos")]
+    if command.get_program() == stock_codex_path.as_os_str()
+        && !is_managed_remote_listener(arguments)
+        && should_replace_shim_with_stock_codex(
+            arguments,
+            &desktop_caller,
+            desktop_helper,
+            !host_runtime_paths_are_configured() && env::var_os(STOCK_CODEX_PATH_ENV).is_none(),
+        )
+    {
+        // Native peer authorization requires the signed helper's original caller chain.
+        use std::os::unix::process::CommandExt;
+        return Err(command.exec().into());
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn_supervised(&mut command)?;
+    let child_id = child.id();
+    if let Some(lease) = &mut local_runtime_lease
+        && let Err(error) = lease.set_child_process_id(child_id)
+        && !child_exited_during_startup(&mut child)
+    {
+        let _ = child.force_terminate();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let child_stdin = child
+        .take_stdin()
+        .ok_or("official CLI stdin is unavailable")?;
+    let child_stdout = child
+        .take_stdout()
+        .ok_or("official CLI stdout is unavailable")?;
+    let child_stderr = child
+        .take_stderr()
+        .ok_or("official CLI stderr is unavailable")?;
+
+    let (stdin_sender, stdin_receiver) = std::sync::mpsc::sync_channel(1);
+    let _stdin_pump = thread::spawn(move || {
+        let _ = stdin_sender.send(copy_stream(io::stdin().lock(), child_stdin));
+    });
+    let stdout_pump = thread::spawn(move || copy_stream(child_stdout, io::stdout().lock()));
+    let stderr_pump = thread::spawn(move || copy_stream(child_stderr, io::stderr().lock()));
+
+    let outcome = wait_for_child(
+        &mut child,
+        &shutdown_signals,
+        local_host_runtime.then_some(&stdin_receiver),
+    )?;
+    stdout_pump
+        .join()
+        .map_err(|_| "official CLI stdout pump panicked")??;
+    stderr_pump
+        .join()
+        .map_err(|_| "official CLI stderr pump panicked")??;
+    observer.exit(child_id, &outcome.status, started.elapsed());
+
+    if let Some(signal) = outcome.forwarded_signal {
+        eprintln!("codexhost shim: forwarded shutdown signal {signal}");
+    }
+    // Normal cleanup must not replace a failed child's last stderr line with a success notice.
+    let preserve_child_error = outcome.status.code().is_some_and(|code| code != 0)
+        && outcome.forwarded_signal.is_none()
+        && !outcome.desktop_input_closed
+        && !outcome.forced;
+    if outcome.terminated_descendants && !preserve_child_error {
+        eprintln!("codexhost shim: terminated official CLI descendants after root exit");
+    }
+    if outcome.desktop_input_closed {
+        eprintln!("codexhost shim: closed the local Host Runtime after Desktop stdin EOF");
+    }
+    if outcome.forced {
+        eprintln!("codexhost shim: forced official CLI process-group termination after timeout");
+    }
+    if let Some(signal) = exit_signal(&outcome.status) {
+        eprintln!("codexhost shim: official CLI terminated by signal {signal}");
+    }
+    Ok(if outcome.desktop_input_closed {
+        0
+    } else {
+        outcome.status.code().unwrap_or(1)
+    })
+}
+
+pub fn run_proxy(arguments: &[OsString]) -> ShimResult<i32> {
+    run_proxy_with_observer(arguments, &NoopProxyObserver)
+}
+
+pub fn run_from_environment() -> ShimResult<i32> {
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    if arguments.first().and_then(|argument| argument.to_str())
+        == Some(codexhost_platform::AQUA_SPAWN_ARGUMENT)
+    {
+        if arguments.len() != 2 {
+            return Err("Aqua spawn helper requires exactly one private socket path".into());
+        }
+        codexhost_platform::run_aqua_spawn_helper(Path::new(&arguments[1]))?;
+        return Ok(0);
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if arguments.first().and_then(|argument| argument.to_str())
+        == Some("--codexhost-remote-terminate")
+    {
+        let lifecycle_arguments = arguments[1..]
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        return remote_lifecycle::run_terminate(&lifecycle_arguments);
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if env::var_os(REMOTE_SSH_MANAGED_ENV).as_deref() == Some(std::ffi::OsStr::new("1"))
+        && is_default_remote_unix_listener(&arguments)
+    {
+        if env::var_os(REMOTE_LISTENER_CHILD_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+            detach_remote_listener_session()?;
+        } else {
+            return launch_detached_remote_listener(&arguments);
+        }
+    }
+    run_proxy(&arguments)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::time::{Duration, Instant};
+
+    use super::desktop_invocation::DesktopCaller;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::{PROCESS_TREE_REFRESH_INTERVAL, ShutdownSignals, process_tree_refresh_due};
+    use super::{
+        app_server_subcommand_index, exec_server_subcommand_index, is_default_remote_unix_listener,
+        should_replace_shim_with_stock_codex, should_start_host_runtime,
+        should_start_host_runtime_for_originator,
+    };
+
+    fn arguments(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn refreshes_process_tree_at_platform_interval_and_immediately_after_root_exit() {
+        let started = Instant::now();
+
+        assert!(process_tree_refresh_due(None, started, false));
+        assert!(!process_tree_refresh_due(
+            Some(started),
+            started + PROCESS_TREE_REFRESH_INTERVAL - Duration::from_millis(1),
+            false,
+        ));
+        assert!(process_tree_refresh_due(
+            Some(started),
+            started + PROCESS_TREE_REFRESH_INTERVAL,
+            false,
+        ));
+        assert!(process_tree_refresh_due(
+            Some(started),
+            started + Duration::from_millis(1),
+            true,
+        ));
+    }
+
+    #[test]
+    fn finds_app_server_after_supported_global_options_only() {
+        assert_eq!(
+            app_server_subcommand_index(&arguments(&[
+                "-c",
+                "features.code_mode_host=true",
+                "--strict-config",
+                "app-server",
+                "--analytics-default-enabled",
+            ])),
+            Some(3)
+        );
+        assert_eq!(
+            app_server_subcommand_index(&arguments(&[
+                "--config=features.code_mode_host=true",
+                "app-server",
+            ])),
+            Some(1)
+        );
+        assert_eq!(
+            app_server_subcommand_index(&arguments(&["--label", "app-server"])),
+            None
+        );
+        assert_eq!(app_server_subcommand_index(&arguments(&["-c"])), None);
+    }
+
+    #[test]
+    fn finds_exec_server_after_supported_global_options_only() {
+        assert_eq!(
+            exec_server_subcommand_index(&arguments(&[
+                "-c",
+                "forced_login_method=\"chatgpt\"",
+                "exec-server",
+                "--concurrent-requests",
+                "32",
+            ])),
+            Some(2)
+        );
+        assert_eq!(
+            exec_server_subcommand_index(&arguments(&[
+                "--config=forced_login_method=\"chatgpt\"",
+                "exec-server",
+            ])),
+            Some(1)
+        );
+        assert_eq!(
+            exec_server_subcommand_index(&arguments(&["exec-server"])),
+            Some(0)
+        );
+        assert_eq!(
+            exec_server_subcommand_index(&arguments(&["--label", "exec-server"])),
+            None
+        );
+        assert_eq!(exec_server_subcommand_index(&arguments(&["-c"])), None);
+    }
+
+    #[test]
+    fn replaces_macos_shim_for_desktop_exec_server_and_helper_tools() {
+        let exec_server = arguments(&[
+            "-c",
+            "forced_login_method=\"chatgpt\"",
+            "exec-server",
+            "--concurrent-requests",
+            "32",
+        ]);
+        let app_server = arguments(&["app-server", "--listen", "stdio://"]);
+        let sandbox = arguments(&["sandbox", "--", "/official/node", "/official/kernel.js"]);
+
+        assert!(should_replace_shim_with_stock_codex(
+            &exec_server,
+            &DesktopCaller::Main,
+            false,
+            false,
+        ));
+        assert!(should_replace_shim_with_stock_codex(
+            &exec_server,
+            &DesktopCaller::Helper,
+            true,
+            false,
+        ));
+        assert!(should_replace_shim_with_stock_codex(
+            &exec_server,
+            &DesktopCaller::Unknown,
+            false,
+            true,
+        ));
+        assert!(!should_replace_shim_with_stock_codex(
+            &exec_server,
+            &DesktopCaller::NonDesktop,
+            false,
+            false,
+        ));
+        assert!(!should_replace_shim_with_stock_codex(
+            &app_server,
+            &DesktopCaller::Main,
+            false,
+            false,
+        ));
+        assert!(should_replace_shim_with_stock_codex(
+            &app_server,
+            &DesktopCaller::Helper,
+            true,
+            false,
+        ));
+        assert!(should_replace_shim_with_stock_codex(
+            &sandbox,
+            &DesktopCaller::Unknown,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn starts_host_runtime_for_servers_but_not_app_server_management_commands() {
+        assert!(should_start_host_runtime(&arguments(&[
+            "-c",
+            "features.code_mode_host=true",
+            "app-server",
+            "--listen",
+            "unix://",
+        ])));
+        assert!(should_start_host_runtime(&arguments(&[
+            "app-server",
+            "--analytics-default-enabled",
+        ])));
+        assert!(!should_start_host_runtime(&arguments(&[
+            "app-server",
+            "proxy"
+        ])));
+        assert!(!should_start_host_runtime(&arguments(&[
+            "app-server",
+            "daemon",
+            "start",
+        ])));
+        assert!(!should_start_host_runtime(&arguments(&[
+            "app-server",
+            "generate-json-schema",
+        ])));
+    }
+
+    #[test]
+    fn keeps_skysight_memory_app_servers_on_the_stock_codex_cli() {
+        assert!(!should_start_host_runtime(&arguments(&[
+            "-c",
+            "model_provider=\"openai-memgen\"",
+            "-c",
+            "model_providers.openai-memgen.name=\"OpenAI\"",
+            "app-server",
+            "--stdio",
+        ])));
+        assert!(!should_start_host_runtime(&arguments(&[
+            "app-server",
+            "--analytics-default-enabled",
+            "--config=model_provider=openai-memgen",
+        ])));
+
+        // A provider definition alone does not select the Skysight memory provider and must not
+        // disable the normal Host Runtime route.
+        assert!(should_start_host_runtime(&arguments(&[
+            "-c",
+            "model_providers.openai-memgen.name=\"OpenAI\"",
+            "app-server",
+            "--stdio",
+        ])));
+        assert!(should_start_host_runtime(&arguments(&[
+            "-c",
+            "model_provider=\"openai\"",
+            "app-server",
+            "--stdio",
+        ])));
+    }
+
+    #[test]
+    fn keeps_internal_codex_auxiliary_app_servers_on_the_stock_cli() {
+        let arguments = arguments(&["app-server", "--stdio"]);
+
+        assert!(!should_start_host_runtime_for_originator(
+            &arguments,
+            Some(std::ffi::OsStr::new("skysight")),
+        ));
+        assert!(should_start_host_runtime_for_originator(&arguments, None));
+        assert!(should_start_host_runtime_for_originator(
+            &arguments,
+            Some(std::ffi::OsStr::new("")),
+        ));
+        assert!(should_start_host_runtime_for_originator(
+            &arguments,
+            Some(std::ffi::OsStr::new("Codex Desktop")),
+        ));
+    }
+
+    const DESKTOP_APP_SERVER: &[&str] = &[
+        "-c",
+        "features.code_mode_host=true",
+        "app-server",
+        "--analytics-default-enabled",
+        "-c",
+        "plugins.codex-app-tools@openai-bundled.mcp_servers.codex_app.enabled=true",
+    ];
+
+    fn with_desktop_app_server(extra: &[&str]) -> Vec<OsString> {
+        arguments(&[DESKTOP_APP_SERVER, extra].concat())
+    }
+
+    #[test]
+    fn starts_host_runtime_for_desktop_mcp_launch_directories() {
+        assert!(should_start_host_runtime(&with_desktop_app_server(&[])));
+        assert!(should_start_host_runtime(&with_desktop_app_server(&[
+            "--mcp-launch-cwd",
+            "files",
+            "/usr/bin/node",
+            "/tmp/project",
+        ])));
+        assert!(should_start_host_runtime(&with_desktop_app_server(&[
+            "--plugin-mcp-launch-cwd",
+            "github@openai-curated",
+            "github",
+            "/tmp/project",
+        ])));
+        assert!(should_start_host_runtime(&with_desktop_app_server(&[
+            "--mcp-launch-cwd",
+            "files",
+            "/usr/bin/node",
+            "/tmp/project",
+            "--plugin-mcp-launch-cwd",
+            "github@openai-curated",
+            "github",
+            "/tmp/project",
+            "--mcp-launch-cwd",
+            "docs",
+            "/usr/bin/python3",
+            "/tmp/docs",
+        ])));
+        assert!(is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--listen",
+            "unix://",
+            "--mcp-launch-cwd",
+            "files",
+            "/usr/bin/node",
+            "/tmp/project",
+        ])));
+    }
+
+    #[test]
+    fn keeps_incomplete_mcp_launch_directories_and_unknown_options_on_the_stock_cli() {
+        for incomplete in [
+            &["--mcp-launch-cwd"][..],
+            &["--mcp-launch-cwd", "files", "/usr/bin/node"],
+            &["--plugin-mcp-launch-cwd", "github@openai-curated", "github"],
+            &["--mcp-launch-cwd", "files", "/usr/bin/node", ""],
+            &[
+                "--plugin-mcp-launch-cwd",
+                "github@openai-curated",
+                "github",
+                "",
+            ],
+            &["--mcp-launch-cwd=files", "/usr/bin/node", "/tmp/project"],
+        ] {
+            assert!(
+                !should_start_host_runtime(&with_desktop_app_server(incomplete)),
+                "{incomplete:?}"
+            );
+            let remote = [&["app-server", "--listen", "unix://"][..], incomplete].concat();
+            assert!(
+                !is_default_remote_unix_listener(&arguments(&remote)),
+                "{incomplete:?}"
+            );
+        }
+        assert!(!should_start_host_runtime(&with_desktop_app_server(&[
+            "--unknown-option",
+        ])));
+    }
+
+    #[test]
+    fn classifies_only_the_default_remote_unix_listener_for_detachment() {
+        assert!(is_default_remote_unix_listener(&arguments(&[
+            "-c",
+            "features.code_mode_host=true",
+            "app-server",
+            "--listen",
+            "unix://",
+        ])));
+        assert!(is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--listen=unix://",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--listen=unix:///tmp/custom.sock",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "proxy",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--stdio",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--stdio",
+            "--listen",
+            "unix://",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--listen",
+            "unix:///tmp/custom.sock",
+            "--listen",
+            "unix://",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--listen",
+            "unix://",
+            "--listen=unix://",
+        ])));
+        assert!(!is_default_remote_unix_listener(&arguments(&[
+            "app-server",
+            "--listen",
+            "unix://",
+            "--listen=unix:///tmp/custom.sock",
+        ])));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn observe_sigterm(signals: &ShutdownSignals) {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        use signal_hook::consts::SIGTERM;
+        use std::time::{Duration, Instant};
+
+        kill(Pid::this(), Signal::SIGTERM).expect("signal current test process");
+        let started = Instant::now();
+        let observed = loop {
+            if let Some(signal) = signals.pending() {
+                break Some(signal);
+            }
+            if started.elapsed() >= Duration::from_secs(1) {
+                break None;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(observed, Some(SIGTERM));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn records_sigterm_in_an_atomic_flag() {
+        let signals = ShutdownSignals::install().expect("install shutdown signals");
+        observe_sigterm(&signals);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn records_sigterm_after_spawning_a_supervised_child() {
+        use std::process::Command;
+
+        let signals = ShutdownSignals::install().expect("install shutdown signals");
+        let mut command = Command::new("/usr/bin/true");
+        let mut child =
+            codexhost_platform::spawn_supervised(&mut command).expect("spawn supervised child");
+        let _ = child.wait().expect("wait for child");
+        observe_sigterm(&signals);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn records_sigterm_while_a_supervised_child_is_running() {
+        use std::process::Command;
+
+        let signals = ShutdownSignals::install().expect("install shutdown signals");
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut child =
+            codexhost_platform::spawn_supervised(&mut command).expect("spawn supervised child");
+        observe_sigterm(&signals);
+        child.force_terminate().expect("terminate child");
+        let _ = child.wait().expect("wait for child");
+    }
+}

@@ -1,0 +1,66 @@
+/** Native Desktop scheduling metadata, never part of the Host RPC params.
+ * Keep interactive work out of the background discovery queue; critical
+ * capacity remains reserved for native Thread/Turn lifecycle operations. */
+export interface RendererRequestOptions {
+  readonly priority: "background" | "interactive";
+  readonly timeoutMs?: number;
+}
+
+/** A request may have reached the peer, but no complete response was received. */
+export class RendererRequestTransportError extends Error {
+  constructor(cause: unknown) {
+    super("Request transport was interrupted", { cause });
+    this.name = "RendererRequestTransportError";
+  }
+}
+
+export class RendererMethodUnavailableError extends Error {
+  readonly code = -32601;
+
+  constructor(
+    readonly method: string,
+    cause: unknown,
+  ) {
+    super(`${method} is unsupported on this Host connection`, { cause });
+    this.name = "RendererMethodUnavailableError";
+  }
+}
+
+/** Return true only when the peer explicitly rejects this RPC method. */
+export function isUnsupportedMethod(error: unknown, method: string): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  // Desktop's main-process RPC exposes the original error code as jsonRpcCode.
+  const code =
+    "code" in error ? error.code : "jsonRpcCode" in error ? error.jsonRpcCode : undefined;
+  const message = "message" in error ? error.message : undefined;
+  return (
+    code === -32601 ||
+    (code === -32600 &&
+      typeof message === "string" &&
+      message.startsWith(`Invalid request: unknown variant \`${method}\``))
+  );
+}
+
+/** One sender per request client. Only explicit method absence is remembered;
+ * successes, params, Harness availability and transient failures are not cached. */
+export function createRendererRequestSender(
+  send: (
+    method: string,
+    params: unknown,
+    options?: RendererRequestOptions,
+  ) => Promise<unknown> | unknown,
+): (method: string, params: unknown, options?: RendererRequestOptions) => Promise<unknown> {
+  const unsupported = new Map<string, RendererMethodUnavailableError>();
+  return async (method, params, options) => {
+    const known = unsupported.get(method);
+    if (known) throw known;
+    try {
+      return await (options === undefined ? send(method, params) : send(method, params, options));
+    } catch (error) {
+      if (!method.startsWith("codexhost/") || !isUnsupportedMethod(error, method)) throw error;
+      const unavailable = new RendererMethodUnavailableError(method, error);
+      unsupported.set(method, unavailable);
+      throw unavailable;
+    }
+  };
+}

@@ -1,0 +1,260 @@
+import type { HarnessModelRef } from "@codexhost/shared-contracts";
+
+import type { DelegationCliCommand } from "./delegation-cli-help.js";
+import { formatDelegationModel } from "./delegation-model-argument.js";
+import {
+  type DelegationStartResult,
+  type DelegationThreadListResult,
+  type DelegationThreadSnapshot,
+  type HarnessInspectResult,
+  type ThreadAnswerResult,
+  type ThreadCancelResult,
+  type ThreadSendResult,
+  type ThreadWatchListResult,
+  type ThreadWatchResult,
+} from "./delegation-types.js";
+import { originClientName } from "./external-client-origin.js";
+
+/** A Thread as a link; a client origin is no Thread, so it is shown as is. */
+function targetLink(identifier: string): string {
+  return originClientName(identifier) !== undefined ? identifier : threadLink(identifier);
+}
+
+export type DelegationCliFormat = "json" | "compact" | "text";
+
+function threadLink(threadId: string): string {
+  return `codex://threads/${threadId}`;
+}
+
+function watchOutput(watch: DelegationStartResult["watch"]): { watch?: unknown } {
+  if (!watch) return {};
+  if (watch.state === "notRegistered") return { watch };
+  return {
+    watch: {
+      state: watch.state,
+      notify: targetLink(watch.notifyThreadId),
+      timeoutMs: watch.timeoutMs,
+      ...(watch.pendingQuestions?.length ? { pendingQuestions: watch.pendingQuestions } : {}),
+    },
+  };
+}
+
+export function jsonDelegationOutput(command: DelegationCliCommand, body: unknown): unknown {
+  if (command !== "harness inspect") return body;
+  const result = body as HarnessInspectResult;
+  if (result.inspection.status !== "ready") return body;
+  const { catalog } = result.inspection;
+  const displayRef = (ref: HarnessModelRef) => ({ id: formatDelegationModel(ref) });
+  return {
+    ...result,
+    inspection: {
+      ...result.inspection,
+      catalog: {
+        ...catalog,
+        models: catalog.models.map((model) => ({
+          ...model,
+          ref: displayRef(model.ref),
+          ...(model.fastModel ? { fastModel: displayRef(model.fastModel) } : {}),
+        })),
+        ...(catalog.defaultModel ? { defaultModel: displayRef(catalog.defaultModel) } : {}),
+      },
+    },
+  };
+}
+
+function inspectOutput({ harnessId, inspection }: HarnessInspectResult): unknown {
+  if (inspection.status !== "ready") return { harnessId, ...inspection };
+  const { catalog } = inspection;
+  return {
+    harnessId,
+    status: inspection.status,
+    models: catalog.models.flatMap(({ ref, label, fastModel, supportedThinkingOptionIds }) => [
+      {
+        id: formatDelegationModel(ref),
+        label,
+        ...(supportedThinkingOptionIds ? { thinking: supportedThinkingOptionIds } : {}),
+      },
+      ...(fastModel
+        ? [
+            {
+              id: formatDelegationModel(fastModel),
+              label: `${label} (Fast)`,
+              ...(supportedThinkingOptionIds ? { thinking: supportedThinkingOptionIds } : {}),
+            },
+          ]
+        : []),
+    ]),
+    ...(catalog.defaultModel ? { defaultModel: formatDelegationModel(catalog.defaultModel) } : {}),
+    thinkingOptions: catalog.thinkingOptions,
+    ...(catalog.defaultThinkingOptionId
+      ? { defaultThinkingOptionId: catalog.defaultThinkingOptionId }
+      : {}),
+    capabilities: inspection.capabilities,
+  };
+}
+
+function snapshotOutput(
+  snapshot: DelegationThreadSnapshot & { timedOut?: boolean },
+  view: "result" | "messages",
+): unknown {
+  const common = {
+    thread: snapshot.hostId
+      ? `thread://${snapshot.threadId}?hostId=${encodeURIComponent(snapshot.hostId)}`
+      : threadLink(snapshot.threadId),
+    harnessId: snapshot.harnessId,
+    status: snapshot.status,
+    ...(snapshot.timedOut !== undefined ? { timedOut: snapshot.timedOut } : {}),
+    ...(snapshot.pendingQuestions !== undefined
+      ? { pendingQuestions: snapshot.pendingQuestions }
+      : {}),
+  };
+  if (view === "messages") {
+    return {
+      ...common,
+      totalTurns: snapshot.totalTurns,
+      from: snapshot.from,
+      to: snapshot.to,
+      turns: (snapshot.turns ?? []).map(({ turnNumber, status, messages }) => ({
+        turnNumber,
+        status,
+        messages: messages.map(({ role, phase, text }) => ({
+          role,
+          ...(phase ? { phase } : {}),
+          text,
+        })),
+      })),
+      ...(snapshot.result.message ? { error: snapshot.result.message } : {}),
+    };
+  }
+  const progress = snapshot.progress.filter(({ text }) => text.trim()).at(-1)?.text;
+  return {
+    ...common,
+    result: snapshot.result,
+    ...(snapshot.status === "running" && progress ? { progress } : {}),
+  };
+}
+
+export function compactDelegationOutput(
+  command: DelegationCliCommand,
+  body: unknown,
+  view: "result" | "messages" = "result",
+): unknown {
+  switch (command) {
+    case "host info":
+    case "project list":
+    case "thread file":
+    case "thread export":
+    case "harness list":
+      return body;
+    case "harness inspect":
+      return inspectOutput(body as HarnessInspectResult);
+    case "delegate start": {
+      const result = body as DelegationStartResult;
+      const effective = result.configuration?.effective;
+      const model = effective?.effectiveModel
+        ? formatDelegationModel(effective.effectiveModel)
+        : effective?.resolvedModelLabel;
+      return {
+        thread: result.deepLink,
+        harnessId: result.harnessId,
+        status: result.status,
+        ...(result.cwd ? { cwd: result.cwd } : {}),
+        ...(result.worktree ? { worktree: result.worktree } : {}),
+        ...(result.parentThreadId
+          ? {
+              parent: targetLink(result.parentThreadId),
+            }
+          : {}),
+        ...(model ? { model } : {}),
+        ...(effective?.effectiveThinkingOptionId
+          ? { thinking: effective.effectiveThinkingOptionId }
+          : {}),
+        ...watchOutput(result.watch),
+      };
+    }
+    case "thread send": {
+      const result = body as ThreadSendResult;
+      return {
+        thread: threadLink(result.threadId),
+        harnessId: result.harnessId,
+        status: result.status,
+        ...watchOutput(result.watch),
+      };
+    }
+    case "thread cancel": {
+      const result = body as ThreadCancelResult;
+      return {
+        thread: threadLink(result.threadId),
+        harnessId: result.harnessId,
+        cancelRequested: result.cancelled,
+      };
+    }
+    case "thread read":
+    case "thread wait":
+      return snapshotOutput(body as DelegationThreadSnapshot, view);
+    case "thread answer": {
+      const result = body as ThreadAnswerResult;
+      return {
+        thread: threadLink(result.threadId),
+        interaction: result.interactionId,
+        turn: result.turnId,
+        harnessId: result.harnessId,
+        status: result.status,
+      };
+    }
+    case "thread watch": {
+      const result = body as ThreadWatchResult;
+      return {
+        thread: threadLink(result.threadId),
+        notify: targetLink(result.notifyThreadId),
+        state: result.state,
+        status: result.status,
+        timeoutMs: result.timeoutMs,
+        ...(result.pendingQuestions?.length ? { pendingQuestions: result.pendingQuestions } : {}),
+      };
+    }
+    case "thread watches": {
+      const result = body as ThreadWatchListResult;
+      return {
+        watches: result.watches.map(
+          ({
+            threadId,
+            notifyThreadId,
+            state,
+            outcome,
+            turnId,
+            reason,
+            interactionId,
+            taskName,
+            threadStatus,
+            watchedForMs,
+          }) => ({
+            thread: threadLink(threadId),
+            notify: targetLink(notifyThreadId),
+            state,
+            ...(outcome ? { outcome } : {}),
+            ...(outcome === "needsInput" && turnId ? { turn: turnId } : {}),
+            ...(outcome === "needsInput" && interactionId ? { interaction: interactionId } : {}),
+            ...(reason ? { reason } : {}),
+            ...(taskName ? { taskName } : {}),
+            ...(threadStatus ? { threadStatus } : {}),
+            ...(watchedForMs !== undefined ? { watchedForMs } : {}),
+          }),
+        ),
+      };
+    }
+    case "thread list": {
+      const result = body as DelegationThreadListResult;
+      return {
+        threads: result.threads.map(({ deepLink, harnessId, status, title, cwd }) => ({
+          thread: deepLink,
+          harnessId,
+          status,
+          ...(title ? { title } : {}),
+          ...(cwd ? { cwd } : {}),
+        })),
+        nextCursor: result.nextCursor,
+      };
+    }
+  }
+}

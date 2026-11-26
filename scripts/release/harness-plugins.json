@@ -1,0 +1,4 @@
+{
+  "plugins": ["packages/adapters/antigravity", "packages/adapters/cursor-cli"],
+  "runtimePackages": ["@agentclientprotocol/sdk", "diff", "zod"]
+}

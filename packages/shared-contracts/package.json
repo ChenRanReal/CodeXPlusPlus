@@ -1,0 +1,33 @@
+{
+  "name": "@codexhost/shared-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./version": {
+      "types": "./dist/version.d.ts",
+      "import": "./dist/version.js"
+    },
+    "./desktop-screenshot": {
+      "types": "./dist/desktop-screenshot.d.ts",
+      "import": "./dist/desktop-screenshot.js"
+    },
+    "./sidebar-browser": {
+      "types": "./dist/sidebar-browser.d.ts",
+      "import": "./dist/sidebar-browser.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  }
+}

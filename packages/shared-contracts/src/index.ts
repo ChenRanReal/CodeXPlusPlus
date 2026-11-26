@@ -1,0 +1,574 @@
+import { z } from "zod";
+export * from "./client-channel.js";
+export * from "./thread-catalog.js";
+export * from "./thread-tree-watch.js";
+export * from "./desktop-extensions.js";
+export * from "./web-native-extensions.js";
+export * from "./host-extensions.js";
+export * from "./host-extension-management.js";
+export * from "./thread-archive-confirm.js";
+export * from "./voice.js";
+export * from "./skills.js";
+export * from "./skill-reference.js";
+export * from "./web-access-tokens.js";
+export * from "./delegation-read.js";
+export * from "./credential-imports.js";
+export * from "./harness-display-settings.js";
+export * from "./harness-preferences.js";
+export * from "./harness-presentation.js";
+export * from "./account-credits-presentation.js";
+export * from "./model-price-overrides.js";
+export * from "./usage-statistics.js";
+export * from "./thread-prewarm.js";
+export * from "./thread-questions.js";
+export * from "./web.js";
+export * from "./web-tool-output.js";
+export {
+  CONSOLE_HOST_METHODS,
+  CONSOLE_OPEN_METHOD,
+  isConsoleHostMethod,
+  type ConsoleHostMethod,
+  consoleAnnouncementSchema,
+  type ConsoleAnnouncement,
+  consoleOpenParamsSchema,
+  consoleOpenResultSchema,
+  type ConsoleOpenResult,
+} from "./console.js";
+import { WORKSPACE_CONTRACT_VERSION } from "./version.js";
+export {
+  IDLE_RELEASE_SETTINGS_METHOD,
+  IDLE_RELEASE_TIMEOUT_MINUTES_MAX,
+  IDLE_RELEASE_TIMEOUT_MINUTES_MIN,
+  DEFAULT_IDLE_RELEASE_SETTINGS,
+  idleReleaseSettingsSchema,
+  type IdleReleaseSettings,
+} from "./idle-release.js";
+export {
+  LOADED_SESSIONS_METHOD,
+  loadedSessionsSchema,
+  type LoadedSession,
+} from "./loaded-sessions.js";
+export {
+  THREAD_MANUAL_COMPACTION_STARTED_METHOD,
+  threadManualCompactionStartedSchema,
+  type ThreadManualCompactionStarted,
+} from "./manual-compaction.js";
+
+export {
+  accountBalanceSnapshotSchema,
+  harnessAccountSnapshotSchema,
+  harnessAccountSourceSchema,
+  harnessAccountSourceListParamsSchema,
+  harnessAccountSourceListResultSchema,
+  harnessAccountInspectParamsSchema,
+  harnessAccountInspectResultSchema,
+  harnessAccountListParamsSchema,
+  harnessAccountListResultSchema,
+} from "./harness-accounts.js";
+export type {
+  AccountBalanceSnapshot,
+  HarnessAccountSnapshot,
+  HarnessAccountSource,
+  HarnessAccountSourceListResult,
+  HarnessAccountInspectParams,
+  HarnessAccountInspectResult,
+  HarnessAccountListParams,
+  HarnessAccountListResult,
+} from "./harness-accounts.js";
+
+export {
+  HARNESS_PLUGIN_ROUTE_PREFIX,
+  decodeHarnessPluginRoute,
+  encodeHarnessPluginRoute,
+  harnessPluginRouteSchema,
+} from "./harness-route.js";
+export type { HarnessPluginRoute } from "./harness-route.js";
+export {
+  HARNESS_PLUGIN_API_VERSION,
+  HARNESS_PLUGIN_ICON_MAX_BYTES,
+  HARNESS_PLUGIN_LIMIT,
+  HARNESS_PLUGIN_MANIFEST_MAX_BYTES,
+  harnessPluginConfigurationSchema,
+  harnessPluginDescriptorSchema,
+  harnessPluginIconSchema,
+  harnessPluginIdSchema,
+  harnessPluginListParamsSchema,
+  harnessPluginListResultSchema,
+  harnessPluginManifestSchema,
+  installedHarnessPluginIdSchema,
+  isHarnessPluginInScope,
+} from "./harness-plugins.js";
+export type {
+  HarnessPluginConfiguration,
+  HarnessPluginDescriptor,
+  HarnessPluginListResult,
+  HarnessPluginManifest,
+  HarnessPluginScope,
+} from "./harness-plugins.js";
+export * from "./harness-launch-settings.js";
+export * from "./harness-installation.js";
+export { codexhostErrorSchema } from "./errors.js";
+export {
+  codexAccountUsageParamsSchema,
+  codexAccountUsageResultSchema,
+  codexAccountChangedSchema,
+  codexAccountPhaseSchema,
+  codexAccountListResultSchema,
+  codexAccountPlanTypeSchema,
+  codexAccountSchema,
+} from "./codex-accounts.js";
+export type {
+  CodexAccountUsageParams,
+  CodexAccountUsageResult,
+  CodexAccountChanged,
+  CodexAccountPhase,
+  CodexAccountListResult,
+  CodexAccountPlanType,
+  CodexAccountSummary,
+} from "./codex-accounts.js";
+export { REASONING_TRANSCRIPT_COMMAND } from "./reasoning-transcript.js";
+export type { CodexhostError } from "./errors.js";
+export {
+  HARNESS_SESSION_IMPORT_CWD_MAX_LENGTH,
+  HARNESS_SESSION_IMPORT_ID_MAX_LENGTH,
+  HARNESS_SESSION_IMPORT_LIST_MAX_LENGTH,
+  HARNESS_SESSION_IMPORT_TITLE_MAX_LENGTH,
+  HARNESS_SESSION_IMPORT_UPDATED_AT_MAX,
+  harnessSessionImportCandidateSchema,
+  HARNESS_SESSION_IMPORT_DEFAULT_PAGE_SIZE,
+  harnessSessionImportIdSchema,
+  harnessSessionImportSourcesParamsSchema,
+  harnessSessionImportSourcesResultSchema,
+  harnessSessionListParamsSchema,
+  harnessSessionListResultSchema,
+  harnessSessionImportParamsSchema,
+  harnessSessionImportResultSchema,
+} from "./harness-session-import.js";
+export type {
+  HarnessSessionImportCandidate,
+  HarnessSessionImportSourcesResult,
+  HarnessSessionListParams,
+  HarnessSessionListResult,
+  HarnessSessionImportParams,
+  HarnessSessionImportResult,
+} from "./harness-session-import.js";
+export {
+  DEEPSEEK_MODERN_HOST_THREAD_ID_MAX_LENGTH,
+  DEEPSEEK_MODERN_SESSION_CWD_MAX_LENGTH,
+  DEEPSEEK_MODERN_SESSION_ID_MAX_LENGTH,
+  DEEPSEEK_MODERN_SESSION_LIST_MAX_LENGTH,
+  DEEPSEEK_MODERN_SESSION_TITLE_MAX_LENGTH,
+  DEEPSEEK_MODERN_SESSION_UPDATED_AT_MAX,
+  deepSeekModernSessionCandidateSchema,
+  deepSeekModernSessionImportParamsSchema,
+  deepSeekModernSessionImportResultSchema,
+  deepSeekModernSessionListParamsSchema,
+  deepSeekModernSessionListResultSchema,
+} from "./deepseek-modern-sessions.js";
+export type {
+  DeepSeekModernSessionCandidate,
+  DeepSeekModernSessionImportParams,
+  DeepSeekModernSessionImportResult,
+  DeepSeekModernSessionListParams,
+  DeepSeekModernSessionListResult,
+} from "./deepseek-modern-sessions.js";
+export {
+  externalThreadForkParamsSchema,
+  externalThreadForkResultSchema,
+} from "./external-thread-fork.js";
+export type { ExternalThreadForkParams, ExternalThreadForkResult } from "./external-thread-fork.js";
+export {
+  HARNESS_PERMISSION_MODE_CATALOG_MAX_LENGTH,
+  HARNESS_PERMISSION_MODE_DESCRIPTION_MAX_LENGTH,
+  HARNESS_PERMISSION_MODE_ID_MAX_LENGTH,
+  HARNESS_PERMISSION_MODE_LABEL_MAX_LENGTH,
+  harnessPermissionModeCatalogSchema,
+  harnessPermissionModeIdSchema,
+  harnessPermissionModeSchema,
+  threadPermissionModeSelectParamsSchema,
+} from "./harness-permission-modes.js";
+export type {
+  HarnessPermissionMode,
+  HarnessPermissionModeCatalog,
+  HarnessPermissionModeId,
+  ThreadPermissionModeSelectParams,
+} from "./harness-permission-modes.js";
+export { HARNESS_TRANSPORT_MODEL_ID_MAX_LENGTH } from "./harness-route-limit.js";
+export {
+  HARNESS_MODEL_LABEL_MAX_LENGTH,
+  HARNESS_MODEL_REF_MAX_LENGTH,
+  HARNESS_THINKING_OPTION_ID_MAX_LENGTH,
+  THREAD_OWNERSHIP_LIST_MAX_LENGTH,
+  harnessConfigurationStateSchema,
+  harnessInspectParamsSchema,
+  harnessInspectionSchema,
+  harnessModelCatalogSchema,
+  catalogModelForRef,
+  harnessModelRefIdSchema,
+  harnessModelRefSchema,
+  harnessModelServiceTierSchema,
+  sameHarnessModelRef,
+  harnessModelRefKey,
+  harnessModelRefFromKey,
+  harnessModelSchema,
+  harnessModelSelectionStateSchema,
+  harnessPermissionModeScopeSchema,
+  harnessResolvedModelLabelSchema,
+  harnessSessionCapabilitiesSchema,
+  harnessThinkingOptionIdSchema,
+  harnessThinkingOptionSchema,
+  harnessWebUiCapabilitySchema,
+  harnessWebUiOpenParamsSchema,
+  harnessWebUiOpenResultSchema,
+  permissionModeFixedAtCreate,
+  threadInspectionParamsSchema,
+  threadInspectionSchema,
+  threadModelSelectParamsSchema,
+  threadThinkingSelectParamsSchema,
+  threadOwnershipListParamsSchema,
+  threadOwnershipListResultSchema,
+  threadSteeringInspectParamsSchema,
+  threadSteeringInspectResultSchema,
+  THREAD_STEER_DELIVERY_PARAM,
+  THREAD_STEER_STRICT_TARGET_PARAM,
+  THREAD_STEER_STRICT_TARGET_FIELD,
+  THREAD_STEERING_CONTEXT_PARAM,
+  threadSteeringContextSchema,
+  threadSteerDeliverySchema,
+  threadOwnershipSchema,
+} from "./harness-models.js";
+export type {
+  HarnessConfigurationState,
+  HarnessInspectParams,
+  HarnessInspection,
+  HarnessModel,
+  HarnessModelCatalog,
+  HarnessModelRef,
+  HarnessModelServiceTier,
+  HarnessModelSelectionState,
+  HarnessPermissionModeScope,
+  HarnessSessionCapabilities,
+  HarnessThinkingOption,
+  HarnessThinkingOptionId,
+  HarnessWebUiCapability,
+  HarnessWebUiOpenParams,
+  HarnessWebUiOpenResult,
+  ThreadInspection,
+  ThreadInspectionParams,
+  ThreadModelSelectParams,
+  ThreadThinkingSelectParams,
+  ThreadOwnership,
+  ThreadOwnershipListParams,
+  ThreadOwnershipListResult,
+  ThreadSteeringInspectResult,
+  ThreadSteerDelivery,
+} from "./harness-models.js";
+export {
+  harnessCommandCatalogSchema,
+  harnessCommandDescriptorSchema,
+  harnessCommandsInspectParamsSchema,
+  threadCommandExecuteParamsSchema,
+  threadCommandExecuteResultSchema,
+  threadCommandsInspectParamsSchema,
+} from "./harness-commands.js";
+export type {
+  HarnessCommandCatalog,
+  HarnessCommandDescriptor,
+  HarnessCommandsInspectParams,
+  ThreadCommandExecuteParams,
+  ThreadCommandExecuteResult,
+  ThreadCommandsInspectParams,
+} from "./harness-commands.js";
+export {
+  accountCreditsProductUsageSchema,
+  accountResetCreditsSchema,
+  accountCreditsSnapshotSchema,
+  composerIndicatorsSchema,
+  threadUsageInspectionParamsSchema,
+  threadUsageInspectionSchema,
+  threadUsageSnapshotSchema,
+} from "./thread-usage.js";
+export type {
+  AccountCreditsSnapshot,
+  AccountResetCredits,
+  ThreadUsageInspection,
+  ThreadUsageInspectionParams,
+  ThreadUsageSnapshot,
+} from "./thread-usage.js";
+export {
+  harnessIdSchema,
+  hostInteractionIdSchema,
+  hostItemIdSchema,
+  hostThreadIdSchema,
+  hostTurnIdSchema,
+} from "./ids.js";
+export type { HarnessId, HostInteractionId, HostItemId, HostThreadId, HostTurnId } from "./ids.js";
+export {
+  jsonRpcEnvelopeSchema,
+  jsonRpcErrorResponseSchema,
+  jsonRpcErrorSchema,
+  jsonRpcIdSchema,
+  jsonRpcNotificationSchema,
+  jsonRpcRequestSchema,
+  jsonRpcSuccessResponseSchema,
+} from "./json-rpc.js";
+export type {
+  JsonRpcEnvelope,
+  JsonRpcError,
+  JsonRpcErrorResponse,
+  JsonRpcId,
+  JsonRpcNotification,
+  JsonRpcRequest,
+  JsonRpcSuccessResponse,
+} from "./json-rpc.js";
+export {
+  jsonArraySchema,
+  jsonObjectSchema,
+  jsonPrimitiveSchema,
+  jsonValueSchema,
+} from "./json-value.js";
+export type { JsonArray, JsonObject, JsonPrimitive, JsonValue } from "./json-value.js";
+export {
+  nativeCheckpointRefSchema,
+  nativeCheckpointRefV1Schema,
+  nativeSessionRefSchema,
+  nativeSessionRefV1Schema,
+  nativeTurnRefSchema,
+  nativeTurnRefV1Schema,
+} from "./native-refs.js";
+export type {
+  NativeCheckpointRef,
+  NativeCheckpointRefV1,
+  NativeSessionRef,
+  NativeSessionRefV1,
+  NativeTurnRef,
+  NativeTurnRefV1,
+} from "./native-refs.js";
+export {
+  UPDATE_ERROR_MAX_LENGTH,
+  UPDATE_SEMVER_PATTERN,
+  updateCheckResultSchema,
+  updateEmptyParamsSchema,
+  updateInstallationSchema,
+  updatePhaseSchema,
+  updateSemanticVersionSchema,
+  updateStartResultSchema,
+  updateStatusResultSchema,
+  updateStatusSchema,
+} from "./updates.js";
+export type {
+  UpdateCheckResult,
+  UpdateInstallation,
+  UpdatePhase,
+  UpdateStartResult,
+  UpdateStatus,
+  UpdateStatusResult,
+} from "./updates.js";
+export {
+  RELEASE_ANNOUNCEMENT_ACKNOWLEDGE_METHOD,
+  RELEASE_ANNOUNCEMENT_GET_METHOD,
+  RELEASE_ANNOUNCEMENT_MAX_THEMES,
+  releaseAnnouncementAcknowledgeParamsSchema,
+  releaseAnnouncementContentSchema,
+  releaseAnnouncementGetParamsSchema,
+  releaseAnnouncementGetResultSchema,
+  releaseAnnouncementSchema,
+  releaseAnnouncementThemeSchema,
+} from "./release-announcement.js";
+export type {
+  ReleaseAnnouncement,
+  ReleaseAnnouncementAcknowledgeParams,
+  ReleaseAnnouncementContent,
+  ReleaseAnnouncementGetParams,
+  ReleaseAnnouncementGetResult,
+  ReleaseAnnouncementTheme,
+} from "./release-announcement.js";
+export { WORKSPACE_CONTRACT_VERSION } from "./version.js";
+
+export const workspaceContractVersionSchema = z.literal(WORKSPACE_CONTRACT_VERSION);
+
+export const packageMetadata = {
+  name: "@codexhost/shared-contracts",
+  contractVersion: WORKSPACE_CONTRACT_VERSION,
+} as const;
+
+export {
+  DELEGATION_MENTION_PATH_PREFIX,
+  HARNESS_COMMAND_MENTION_PATH_PREFIX,
+  delegationMentionPath,
+  harnessCommandMentionPath,
+  restoreHarnessCommandMentions,
+  formatDelegationMentionLink,
+  stripDelegationMentions,
+  type DelegationMention,
+  type DelegationMentionRewrite,
+} from "./delegation-mention.js";
+
+export { desktopImageAttachmentPaths } from "./desktop-attachments.js";
+
+export {
+  THREAD_WATCH_NOTICE_HEADER,
+  THREAD_WATCH_NOTICE_OUTCOMES,
+  formatThreadWatchNotice,
+  parseThreadWatchNotice,
+  type ThreadWatchNoticeEntry,
+  type ThreadWatchNoticeOutcome,
+} from "./thread-watch-notice.js";
+
+export {
+  RESPONSE_ANNOTATIONS_CLOSE,
+  RESPONSE_ANNOTATIONS_GUIDANCE,
+  RESPONSE_ANNOTATIONS_HEADER,
+  RESPONSE_ANNOTATIONS_OPEN,
+  RESPONSE_ANNOTATIONS_REQUEST_HEADER,
+  composeAnnotatedMessage,
+  formatResponseAnnotations,
+  parseAnnotatedMessage,
+  responseAnnotationIndex,
+  responseAnnotationsOf,
+  type ParsedAnnotatedMessage,
+  type ResponseAnnotation,
+} from "./response-annotation.js";
+
+export {
+  REMOTE_SSH_SETUP_METHOD,
+  remoteSshSetupParamsSchema,
+  remoteSshSetupResultSchema,
+  type RemoteSshSetupParams,
+  type RemoteSshSetupResult,
+  RUNTIME_STATUS_METHOD,
+  REMOTE_UPDATE_METHOD,
+  runtimeStatusSchema,
+  remoteUpdateParamsSchema,
+  type RuntimeStatus,
+  type RemoteUpdateParams,
+} from "./remote-runtime.js";
+export {
+  CONSOLE_REMOTE_CONNECTIONS_METHOD,
+  codexSshConnectionSchema,
+  codexSshDraftSchema,
+  remoteConnectionsRequestSchema,
+  remoteConnectionsReplySchema,
+  type RemoteConnectionsRequest,
+  type RemoteConnectionsReply,
+  type CodexSshConnection,
+  type CodexSshDraft,
+} from "./remote-connections.js";
+
+export {
+  THREAD_NAME_AUTO_SOURCE_PARAM,
+  threadTitleInputSchema,
+  threadTitleResultSchema,
+  type ThreadTitleInput,
+} from "./thread-title.js";
+
+export {
+  usageMeasurementsSchema,
+  mergeUsageOutputTimings,
+  type UsageMeasurementsSnapshot,
+  type UsageOutputTiming,
+} from "./thread-usage.js";
+
+export {
+  webUiExtensionIdSchema,
+  webUiExtensionMetaSchema,
+  webUiExtensionSchema,
+  webUiExtensionsStateSchema,
+  webUiExtensionRegistrySchema,
+  webUiExtensionInstallSchema,
+  webUiExtensionEnabledSchema,
+  webUiExtensionRemoveSchema,
+  type WebUiExtension,
+  type WebUiExtensionMeta,
+  type WebUiExtensionsState,
+} from "./web-ui-extensions.js";
+export {
+  remoteDeliveryReplySchema,
+  remoteQueueSnapshotSchema,
+  remoteSessionOperationSchema,
+  remoteSessionRequestBytes,
+  REMOTE_CONTROLLER_REQUEST_MAX_BYTES,
+  REMOTE_IDENTITY_MAX_LENGTH,
+  type RemoteDeliveryReply,
+  type RemoteQueueSnapshot,
+  type RemoteSessionOperation,
+} from "./remote-sessions.js";
+export {
+  REMOTE_PEER_HOST_ID_PREFIX,
+  REMOTE_PEER_ID_PATTERN,
+  REMOTE_PEERS_METHODS,
+  REMOTE_PEERS_CHANGED_EVENT,
+  REMOTE_PEER_COLORS,
+  defaultRemotePeerColor,
+  resolveRemotePeerColor,
+  remotePeerHostId,
+  peerIdFromRemoteHostId,
+  remotePeerIdSchema,
+  remotePeerHostIdSchema,
+  remotePeerTransportKindSchema,
+  remotePeerColorSchema,
+  remotePeerStateSchema,
+  remotePeerSummarySchema,
+  remotePeerListResultSchema,
+  remotePeerAddParamsSchema,
+  remotePeerUpdateParamsSchema,
+  remotePeerIdParamsSchema,
+  remotePeerRemoveResultSchema,
+  remotePeerTestParamsSchema,
+  remotePeerTestProjectSchema,
+  remotePeerTestResultSchema,
+  remotePeerCapabilitiesSchema,
+  remotePeerManifestProjectSchema,
+  remotePeerManifestSchema,
+  REMOTE_PEER_UPLOAD_SCOPE_PATTERN,
+  REMOTE_PEER_FILE_PROXY_PATH,
+  remotePeerHarnessIconPath,
+  remotePeerWorkspaceId,
+  remotePeerHarnessPresentationPath,
+  remotePeerPromptParamsSchema,
+  remotePeerUploadResultSchema,
+  remotePeerPromptResultSchema,
+  remotePeerDirectoryEntrySchema,
+  remotePeerListDirsParamsSchema,
+  remotePeerListDirsResultSchema,
+  remotePeerCreateDirParamsSchema,
+  remotePeerCreateDirResultSchema,
+  remotePeerCreateWorkspaceParamsSchema,
+  remotePeerRenameWorkspaceParamsSchema,
+  remotePeerDeleteWorkspaceParamsSchema,
+  remotePeerWorkspaceMutationResultSchema,
+  type RemotePeerCapabilities,
+  type RemotePeerColor,
+  type RemotePeerTransportKind,
+  type RemotePeerState,
+  type RemotePeerSummary,
+  type RemotePeerListResult,
+  type RemotePeerAddParams,
+  type RemotePeerUpdateParams,
+  type RemotePeerIdParams,
+  type RemotePeerRemoveResult,
+  type RemotePeerTestParams,
+  type RemotePeerTestProject,
+  type RemotePeerTestResult,
+  type RemotePeerManifestProject,
+  type RemotePeerManifest,
+  type RemotePeerPromptParams,
+  type RemotePeerUploadResult,
+  type RemotePeerPromptResult,
+  type RemotePeerDirectoryEntry,
+  type RemotePeerListDirsParams,
+  type RemotePeerListDirsResult,
+  type RemotePeerCreateDirParams,
+  type RemotePeerCreateDirResult,
+  type RemotePeerCreateWorkspaceParams,
+  type RemotePeerRenameWorkspaceParams,
+  type RemotePeerDeleteWorkspaceParams,
+  type RemotePeerWorkspaceMutationResult,
+} from "./remote-peers.js";
+
+export {
+  officialCodexModelRef,
+  officialCodexModelSelection,
+  normalizeOfficialCodexModelRef,
+} from "./official-codex-model-ref.js";
+export { desktopProjectDefinitions } from "./desktop-project-definitions.js";

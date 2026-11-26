@@ -1,0 +1,2441 @@
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+
+import { parseHostUsage, sanitizeDiagnosticTail, type HostUsage } from "@codexhost/harness-adapter";
+import {
+  harnessThinkingOptionIdSchema,
+  hostItemIdSchema,
+  jsonValueSchema,
+  type HarnessThinkingOptionId,
+  type JsonObject,
+  type JsonValue,
+} from "@codexhost/shared-contracts";
+
+import {
+  piHistoryMessageIdentities,
+  piMessageIdentity,
+  type PiMessageIdentity,
+} from "./pi-message-item-id.js";
+import { parsePiNativeCommands, type PiNativeCommand } from "./pi-slash-commands.js";
+import {
+  piAssistantPhase,
+  piAssistantWasAborted,
+  type PiAssistantPhase,
+} from "./pi-assistant-outcome.js";
+import { ensureGotgenesExtension, GOTGENES_WIDGET } from "./pi-gotgenes-extension.js";
+import {
+  parseGotgenesWidget,
+  type GotgenesRecord,
+  type GotgenesObservationOwner,
+} from "./pi-gotgenes-subagents.js";
+import { ensurePiFastExtension, PI_FAST_ACK, PI_FAST_COMMAND } from "./pi-fast-mode.js";
+import type { PiEmptySessionConfiguration } from "./pi-empty-session.js";
+import { resolvePiExecutable, withNodeRuntimeOnPath } from "./command.js";
+import { activePiEntries, mapPiSnapshot, type PiSessionHistory } from "./pi-history.js";
+import {
+  latestPiCacheHitRatePercent,
+  optionalPiCacheHitRatePercent,
+  optionalPiStateContextUsage,
+  parsePiSessionUsage,
+  parsePiStateContextUsage,
+  type PiUsageObservation,
+} from "./pi-usage.js";
+import type { PiNativeModel, PiNativeModelRef } from "./pi-model-catalog.js";
+import { verifyPiSessionCwd } from "./pi-session-file.js";
+import { isWindowsUncDirectory, piUncNodeInvocation } from "./pi-unc-launch.js";
+import { PiContentStream, PiContentStreamConflictError } from "./pi-content-stream.js";
+import { PiSubagentRpc } from "./pi-subagent-rpc.js";
+import type { PiSubagentInspection, PiSubagentNode } from "./pi-subagents.js";
+import {
+  piCustomNotice,
+  piCustomNoticeKey,
+  piHistoryNotices,
+  piStatusText,
+  type PiProgressMessage,
+} from "./pi-progress.js";
+
+export interface PiSessionState {
+  sessionId: string;
+  sessionFile: string | null;
+  provider: string | null;
+  modelId: string | null;
+  /** Native reasoning capability of the effective Model when Pi reports its full Model object. */
+  modelReasoning?: boolean;
+  thinkingLevel: HarnessThinkingOptionId | null;
+  fast?: boolean;
+  contextUsage: Pick<HostUsage, "contextUsedTokens" | "contextWindowTokens"> | null;
+}
+
+export type PiInteractionRequest =
+  | {
+      requestId: string;
+      method: "select";
+      title: string;
+      options: string[];
+      timeoutMs?: number;
+    }
+  | {
+      requestId: string;
+      method: "confirm";
+      title: string;
+      message: string;
+      timeoutMs?: number;
+    }
+  | {
+      requestId: string;
+      method: "input";
+      title: string;
+      placeholder?: string;
+      timeoutMs?: number;
+    }
+  | {
+      requestId: string;
+      method: "editor";
+      title: string;
+      prefill?: string;
+      timeoutMs?: number;
+    };
+
+export type PiInteractionResponse =
+  | { requestId: string; cancelled: true }
+  | { requestId: string; value: string }
+  | { requestId: string; confirmed: boolean };
+
+export type PiTurnEvent =
+  | PiProgressMessage
+  | {
+      type: "text.delta";
+      messageId: string;
+      nativeMessageIdentity?: PiMessageIdentity;
+      delta: string;
+    }
+  | {
+      type: "reasoning.delta";
+      messageId: string;
+      nativeMessageIdentity?: PiMessageIdentity;
+      delta: string;
+    }
+  | { type: "reasoning.completed"; messageId: string }
+  | { type: "message.completed"; messageId: string; phase?: PiAssistantPhase }
+  | { type: "compaction.started" }
+  | {
+      type: "compaction.completed";
+      outcome: "succeeded" | "cancelled" | "failed";
+      errorMessage?: string;
+    }
+  | { type: "interaction.requested"; request: PiInteractionRequest }
+  | {
+      type: "interaction.closed";
+      requestId: string;
+      reason: "responded" | "cancelled" | "expired" | "superseded";
+    }
+  | { type: "tool.started"; callId: string; toolName: string; arguments: JsonValue }
+  | { type: "tool.updated"; callId: string; output: JsonValue }
+  | {
+      type: "tool.completed";
+      callId: string;
+      toolName: string;
+      result: JsonValue;
+      isError: boolean;
+    };
+
+export interface PiTurnResult {
+  text: string;
+  cancelled: boolean;
+}
+
+export type PiAutonomousTurnResult =
+  | { status: "succeeded"; text: string }
+  | { status: "cancelled"; text: string; reason: string }
+  | { status: "failed"; text: string; error: Error };
+
+export interface PiAutonomousTurn {
+  nativeTurnKey: string | null;
+  events: PiTurnEvent[];
+  result: PiAutonomousTurnResult;
+}
+
+/** A native run is busy from agent_start, before its persisted Turn identity is available. */
+export type PiAutonomousTurnLifecycle =
+  | { type: "started"; runId: string }
+  | { type: "event"; runId: string; event: PiTurnEvent }
+  | { type: "completed"; runId: string; turn: PiAutonomousTurn };
+
+export class PiRpcBusyError extends Error {
+  constructor() {
+    super(
+      "Pi is still running a native Turn; wait for completion or use the active Turn's stop/steer action",
+    );
+    this.name = "PiRpcBusyError";
+  }
+}
+
+export interface PiCompactResult {
+  outcome: "succeeded" | "cancelled" | "failed";
+  errorMessage?: string;
+}
+
+export type PiRpcFaultKind = "notInstalled" | "unavailable" | "protocolError" | "processExited";
+
+export class PiRpcFaultError extends Error {
+  constructor(
+    readonly kind: PiRpcFaultKind,
+    message: string,
+    readonly diagnostic?: string,
+  ) {
+    super(message);
+    this.name = "PiRpcFaultError";
+  }
+}
+
+/** A correlated native response explicitly refused steer before acceptance. */
+export class PiRpcSteerRejectedError extends Error {}
+
+/** An idle queue cannot establish delivery to the requested Turn. Never replay this input. */
+export class PiRpcSteerTargetEndedError extends PiRpcFaultError {
+  constructor(readonly history: PiSessionHistory) {
+    super(
+      "protocolError",
+      "Pi Turn ended before steer admission could be confirmed; the isolated runtime was closed. Input hook effects are unknown, so do not automatically resend the input",
+    );
+  }
+}
+
+export class PiRpcUnsupportedCommandError extends Error {
+  constructor(readonly command: string) {
+    super(`Pi RPC does not support '${command}'`);
+    this.name = "PiRpcUnsupportedCommandError";
+  }
+}
+
+export interface PiRpcSessionOptions {
+  cwd: string;
+  command?: string;
+  environment?: NodeJS.ProcessEnv;
+  sessionFile?: string;
+  forkSessionFile?: string;
+  model?: PiNativeModelRef;
+  emptySessionConfiguration?: PiEmptySessionConfiguration;
+  commandTimeoutMs?: number;
+  cancelTimeoutMs?: number;
+  closeTimeoutMs?: number;
+  onFault?: (error: PiRpcFaultError) => void;
+}
+
+export interface PiRpcProcessOptions {
+  cwd: string;
+  fastExtension?: string;
+  subagentExtension?: string;
+  command?: string;
+  environment: NodeJS.ProcessEnv;
+  sessionFile?: string;
+  forkSessionFile?: string;
+  model?: PiNativeModelRef;
+  emptySessionConfiguration?: PiEmptySessionConfiguration;
+}
+
+export interface PiRpcProcessAdapter {
+  spawn(options: PiRpcProcessOptions): ChildProcessWithoutNullStreams;
+}
+
+// Commands without Pi-side effects; a late answer to one of these after its timeout is harmless.
+const READ_ONLY_COMMANDS = new Set([
+  "get_state",
+  "get_commands",
+  "get_entries",
+  "get_session_stats",
+  "get_available_models",
+  "get_available_thinking_levels",
+]);
+
+// Bound on remembered expired ids, so a Pi that never answers cannot grow the set without limit.
+// Past it the oldest id is forgotten, and its late answer faults the Session as an unknown id.
+const MAX_EXPIRED_IDS = 64;
+const CANCELLATION_RECOVERY_TIMEOUT_MS = 60_000;
+
+interface PendingCommand {
+  command: string;
+  resolve(value: Record<string, unknown>): void;
+  reject(error: Error): void;
+  timeout: NodeJS.Timeout | null;
+}
+
+interface ManualCompaction {
+  onEvent(event: PiTurnEvent): void;
+  resolve(result: PiCompactResult): void;
+  reject(error: Error): void;
+}
+
+interface CancellationRecovery {
+  timer: NodeJS.Timeout;
+  probe: Promise<void> | null;
+  nativeStartGeneration: number;
+}
+
+interface ActiveTurn {
+  origin: "requested" | "autonomous";
+  autonomousRunId: string | null;
+  runGeneration: number;
+  autonomousEvents: PiTurnEvent[] | null;
+  autonomousMessage?: Record<string, unknown>;
+  nativeTurnKey: string | null;
+  nativeCancellationObserved: boolean;
+  text: string;
+  assistantMessageId: string | null;
+  assistantNativeMessageIdentity: PiMessageIdentity | undefined;
+  textStream: PiContentStream;
+  reasoningStream: PiContentStream;
+  sawStreamedMessageText: boolean;
+  sawStreamedMessageReasoning: boolean;
+  lastFinalizedMessageText: string | null;
+  lastFinalizedMessageReasoning: string | null;
+  reasoningMessageOpen: boolean;
+  onEvent(event: PiTurnEvent): void;
+  resolve(value: PiTurnResult): void;
+  reject(error: Error): void;
+  failure: Error | null;
+  sawTool: boolean;
+  tools: Map<string, string>;
+  interactions: Map<string, { request: PiInteractionRequest; timeout: NodeJS.Timeout | null }>;
+  settlement: "pending" | "confirming" | "confirmed";
+  cancellation: "none" | "requesting" | "accepted" | "abandoned";
+  cancellationTimeout: NodeJS.Timeout | null;
+  abortPromise: Promise<void> | null;
+}
+
+function nativeMessageIdentity(active: ActiveTurn): { nativeMessageIdentity?: PiMessageIdentity } {
+  return active.assistantNativeMessageIdentity
+    ? { nativeMessageIdentity: active.assistantNativeMessageIdentity }
+    : {};
+}
+
+const textDecoder = new TextDecoder("utf-8", { fatal: true });
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function message(value: unknown): string {
+  return value instanceof Error ? value.message : String(value);
+}
+
+function nonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function parseNativeModel(value: unknown, context: string): PiNativeModelRef | null {
+  if (value === null || value === undefined) return null;
+  if (!isRecord(value) || !nonBlankString(value.provider) || !nonBlankString(value.id)) {
+    throw new PiRpcFaultError("protocolError", `Pi RPC returned an invalid ${context} Model`);
+  }
+  return { provider: value.provider, id: value.id };
+}
+
+function sessionStateData(response: Record<string, unknown>): Record<string, unknown> {
+  const data = isRecord(response.data) ? response.data : null;
+  if (!data) throw new PiRpcFaultError("protocolError", "Pi RPC state response has no data");
+  return data;
+}
+
+function parseSessionState(response: Record<string, unknown>): PiSessionState {
+  const data = sessionStateData(response);
+  const model = parseNativeModel(data.model, "state");
+  const modelReasoning =
+    isRecord(data.model) && typeof data.model.reasoning === "boolean" ? data.model.reasoning : null;
+  if (!nonBlankString(data.sessionId)) {
+    throw new PiRpcFaultError("protocolError", "Pi RPC state has no stable Session identity");
+  }
+  const thinkingLevel =
+    data.thinkingLevel === undefined
+      ? null
+      : harnessThinkingOptionIdSchema.safeParse(data.thinkingLevel);
+  if (thinkingLevel !== null && !thinkingLevel.success) {
+    throw new PiRpcFaultError("protocolError", "Pi RPC state has an invalid Thinking level");
+  }
+  return {
+    sessionId: data.sessionId,
+    sessionFile: typeof data.sessionFile === "string" ? data.sessionFile : null,
+    provider: model?.provider ?? null,
+    modelId: model?.id ?? null,
+    ...(modelReasoning === null ? {} : { modelReasoning }),
+    thinkingLevel: thinkingLevel?.data ?? null,
+    contextUsage: optionalPiStateContextUsage(data.contextUsage),
+  };
+}
+
+function parseSessionStreaming(response: Record<string, unknown>): boolean {
+  const isStreaming = sessionStateData(response).isStreaming;
+  if (typeof isStreaming !== "boolean") {
+    throw new PiRpcFaultError("protocolError", "Pi RPC state has no Streaming status");
+  }
+  return isStreaming;
+}
+
+function parseSessionHistory(response: Record<string, unknown>): PiSessionHistory {
+  const data = isRecord(response.data) ? response.data : null;
+  if (!data || !Array.isArray(data.entries)) {
+    throw new PiRpcFaultError("protocolError", "Pi RPC entries response has no Entries");
+  }
+  const entries = data.entries.map((entry) => {
+    const parsed = jsonValueSchema.safeParse(entry);
+    if (!parsed.success || !isRecord(parsed.data)) {
+      throw new PiRpcFaultError(
+        "protocolError",
+        "Pi RPC entries response contains an invalid Entry",
+      );
+    }
+    return parsed.data as JsonObject;
+  });
+  if (data.leafId !== null && typeof data.leafId !== "string") {
+    throw new PiRpcFaultError("protocolError", "Pi RPC entries response has an invalid leaf ID");
+  }
+  return { entries, leafId: data.leafId as string | null };
+}
+
+function parseAvailableThinkingLevels(
+  response: Record<string, unknown>,
+): HarnessThinkingOptionId[] {
+  const data = isRecord(response.data) ? response.data : null;
+  if (!data || !Array.isArray(data.levels) || data.levels.length === 0) {
+    throw new PiRpcFaultError("protocolError", "Pi RPC Thinking catalog response has no levels");
+  }
+  const levels = data.levels.map((level) => {
+    const parsed = harnessThinkingOptionIdSchema.safeParse(level);
+    if (!parsed.success) {
+      throw new PiRpcFaultError(
+        "protocolError",
+        "Pi RPC Thinking catalog contains an invalid level",
+      );
+    }
+    return parsed.data;
+  });
+  if (new Set(levels).size !== levels.length) {
+    throw new PiRpcFaultError("protocolError", "Pi RPC Thinking catalog contains duplicate levels");
+  }
+  return levels;
+}
+
+function parseAvailableModels(response: Record<string, unknown>): PiNativeModel[] {
+  const data = isRecord(response.data) ? response.data : null;
+  if (!data || !Array.isArray(data.models)) {
+    throw new PiRpcFaultError("protocolError", "Pi RPC Model catalog response has no models");
+  }
+  return data.models.map((model) => {
+    const parsed = parseNativeModel(model, "catalog");
+    if (!parsed || !isRecord(model) || typeof model.reasoning !== "boolean") {
+      throw new PiRpcFaultError(
+        "protocolError",
+        "Pi RPC catalog contains a Model without reasoning capability",
+      );
+    }
+    return {
+      ...parsed,
+      reasoning: model.reasoning,
+      ...(typeof model.api === "string" ? { api: model.api } : {}),
+    };
+  });
+}
+
+function assistantText(value: unknown): string | null {
+  if (!isRecord(value) || value.role !== "assistant" || !Array.isArray(value.content)) return null;
+  return value.content
+    .filter(
+      (content): content is Record<string, unknown> =>
+        isRecord(content) && content.type === "text" && typeof content.text === "string",
+    )
+    .map((content) => content.text as string)
+    .join("");
+}
+
+function assistantMessageId(value: unknown): string | null {
+  if (!isRecord(value) || value.role !== "assistant") return null;
+  return nonBlankString(value.responseId) ? value.responseId : null;
+}
+
+function extractReasoningText(content: unknown): string | null {
+  if (!isRecord(content)) return null;
+  const type = String(content.type ?? "");
+  if (type === "thinking" || type === "reasoning" || type === "thought") {
+    const text = content.thinking ?? content.reasoning ?? content.text ?? content.delta;
+    return typeof text === "string" ? text : null;
+  }
+  return null;
+}
+
+function assistantReasoning(value: unknown): string | null {
+  if (!isRecord(value) || value.role !== "assistant" || !Array.isArray(value.content)) return null;
+  return value.content
+    .map(extractReasoningText)
+    .filter((text): text is string => typeof text === "string")
+    .join("");
+}
+
+function assistantFailure(value: unknown): Error | null | undefined {
+  if (!isRecord(value) || value.role !== "assistant") return undefined;
+  if (value.stopReason !== "error" && value.stopReason !== "aborted") return null;
+  const fallback =
+    value.stopReason === "aborted"
+      ? "Pi assistant message was aborted"
+      : "Pi assistant message failed";
+  return new Error(nonBlankString(value.errorMessage) ? value.errorMessage : fallback);
+}
+
+function signalProcessTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (!isRecord(error) || error.code !== "ESRCH") throw error;
+  }
+}
+
+function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return Promise.race([
+    new Promise<boolean>((resolve) => child.once("exit", () => resolve(true))),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+  ]);
+}
+
+interface PiProcessCommandDependencies {
+  platform: NodeJS.Platform;
+  homeDirectory: string;
+  isExecutable(filePath: string): boolean;
+}
+
+export function piRpcProcessCommand(
+  options: PiRpcProcessOptions,
+  dependencies: Partial<PiProcessCommandDependencies> = {},
+): {
+  command: string;
+  arguments: string[];
+  windowsVerbatimArguments: boolean;
+} {
+  if (options.sessionFile && options.forkSessionFile) {
+    throw new Error("Pi RPC cannot combine Session resume and Fork startup");
+  }
+  if (options.model && (options.sessionFile || options.forkSessionFile)) {
+    throw new Error("Pi RPC cannot combine a startup Model with Session restore or Fork");
+  }
+  if (
+    options.emptySessionConfiguration &&
+    (!options.sessionFile || options.model || options.forkSessionFile)
+  ) {
+    throw new Error("Pi empty Session configuration requires an exclusive Session resume");
+  }
+  const platform = dependencies.platform ?? process.platform;
+  const command = resolvePiExecutable(
+    {
+      ...(options.command ? { command: options.command } : {}),
+      environment: options.environment,
+    },
+    {
+      platform,
+      ...(dependencies.homeDirectory ? { homeDirectory: dependencies.homeDirectory } : {}),
+      ...(dependencies.isExecutable ? { isExecutable: dependencies.isExecutable } : {}),
+    },
+  );
+  const sessionArguments = options.forkSessionFile
+    ? ["--fork", options.forkSessionFile]
+    : options.sessionFile
+      ? ["--session", options.sessionFile]
+      : [];
+  const startupModel = options.emptySessionConfiguration?.model ?? options.model;
+  const modelArguments = startupModel
+    ? ["--provider", startupModel.provider, "--model", startupModel.id]
+    : [];
+  const thinkingArguments = options.emptySessionConfiguration
+    ? ["--thinking", options.emptySessionConfiguration.thinkingLevel]
+    : [];
+  const arguments_ = [
+    ...(options.fastExtension ? ["--extension", options.fastExtension] : []),
+    ...(options.subagentExtension ? ["--extension", options.subagentExtension] : []),
+    "--mode",
+    "rpc",
+    ...modelArguments,
+    ...thinkingArguments,
+    ...sessionArguments,
+  ];
+  const extension = path.win32.extname(command).toLowerCase();
+  if (platform !== "win32" || ![".cmd", ".bat"].includes(extension)) {
+    return { command, arguments: arguments_, windowsVerbatimArguments: false };
+  }
+  if (isWindowsUncDirectory(options.cwd)) {
+    try {
+      return piUncNodeInvocation(command, arguments_, options.environment);
+    } catch (error) {
+      throw new PiRpcFaultError("unavailable", message(error));
+    }
+  }
+  const quote = (value: string): string => `"${value.replaceAll("%", "%%").replaceAll('"', '""')}"`;
+  const commandLine = [command, ...arguments_].map(quote).join(" ");
+  return {
+    command: options.environment?.ComSpec ?? options.environment?.COMSPEC ?? "cmd.exe",
+    arguments: ["/d", "/v:off", "/s", "/c", `"${commandLine}"`],
+    windowsVerbatimArguments: true,
+  };
+}
+
+const nodeProcessAdapter: PiRpcProcessAdapter = {
+  spawn(options) {
+    const invocation = piRpcProcessCommand(options);
+    return spawn(invocation.command, invocation.arguments, {
+      cwd: options.cwd,
+      env: options.environment,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    });
+  },
+};
+
+export class PiRpcSession {
+  readonly #options: Required<
+    Pick<PiRpcSessionOptions, "commandTimeoutMs" | "cancelTimeoutMs" | "closeTimeoutMs">
+  > &
+    PiRpcSessionOptions;
+  readonly #processAdapter: PiRpcProcessAdapter;
+  #activeTurn: ActiveTurn | null = null;
+  #runGeneration = 0;
+  #deferredRunFrames: { value: Record<string, unknown>; generation: number }[] = [];
+  #deferredRunBytes = 0;
+  readonly #runWaiters = new Set<{ check(): void; reject(error: Error): void }>();
+  #messageTimestampCounts = new Map<number, number>();
+  #autonomousTurnHandler: ((turn: PiAutonomousTurn) => void) | null = null;
+  #autonomousLifecycleHandler: ((update: PiAutonomousTurnLifecycle) => void) | null = null;
+  #usageHandler: ((observation: PiUsageObservation) => void) | null = null;
+  #usageRequestStartedAtMs: number | null = null;
+  #usageRequestTimingUnavailable = false;
+  // Pieces of the unterminated frame; joined once at its newline so a large frame (a long
+  // Session's get_entries) costs linear rather than quadratic copying on the Host event loop.
+  #buffer: Buffer<ArrayBufferLike>[] = [];
+  // Ids whose read-only command timed out or whose Turn was abandoned.
+  #expired = new Set<string>();
+  #child: ChildProcessWithoutNullStreams | null = null;
+  #closed = false;
+  #closePromise: Promise<void> | null = null;
+  #cancellationRecovery: CancellationRecovery | null = null;
+  #compactionActive = false;
+  #compactionTurn: ActiveTurn | null = null;
+  #failed = false;
+  #pending = new Map<string, PendingCommand>();
+  #state: PiSessionState | null = null;
+  #fast: Pick<PiNativeModelRef, "provider" | "id"> | null = null;
+  #fastAcknowledgement: { message: string; received: boolean } | null = null;
+  #latestCacheHitRatePercent: number | null | undefined;
+  #manualCompaction: ManualCompaction | null = null;
+  #noticeOccurrences = new Map<string, number>();
+  #seenNoticeFrames = new Set<string>();
+  #pendingProgress: { event: PiProgressMessage; statusKey?: string }[] = [];
+  #omittedProgress = 0;
+  #extensionStatuses = new Map<string, string>();
+  #stderrTail = "";
+  readonly #subagents: PiSubagentRpc;
+  #gotgenesHandler:
+    ((records: GotgenesRecord[], owner: GotgenesObservationOwner) => void) | undefined;
+  #gotgenesLatest: GotgenesRecord[] | undefined;
+
+  constructor(
+    options: PiRpcSessionOptions,
+    processAdapter: PiRpcProcessAdapter = nodeProcessAdapter,
+  ) {
+    if (options.sessionFile && options.forkSessionFile) {
+      throw new Error("Pi RPC cannot combine Session resume and Fork startup");
+    }
+    if (options.model && (options.sessionFile || options.forkSessionFile)) {
+      throw new Error("Pi RPC cannot combine a startup Model with Session restore or Fork");
+    }
+    this.#options = {
+      commandTimeoutMs: 30_000,
+      // Bounds proven stable settlement (Abort acknowledgement plus agent_settled and get_state
+      // confirmation), not the RPC write round trip; must exceed the Host's 20s external steering
+      // bound so a slow cancellation times out gracefully instead of faulting the whole Session.
+      cancelTimeoutMs: 30_000,
+      closeTimeoutMs: 2_000,
+      ...options,
+    };
+    this.#processAdapter = processAdapter;
+    this.#subagents = new PiSubagentRpc(
+      (type, payload) => this.#send(type, payload),
+      this.#options.commandTimeoutMs,
+    );
+  }
+
+  get state(): PiSessionState {
+    if (!this.#state) throw new Error("Pi RPC Session has not started");
+    if (
+      this.#fast &&
+      (this.#fast.provider !== this.#state.provider || this.#fast.id !== this.#state.modelId)
+    )
+      this.#fast = null;
+    return this.#fast ? { ...this.#state, fast: true } : this.#state;
+  }
+
+  get stderrTail(): string {
+    return this.#stderrTail;
+  }
+
+  get isBusy(): boolean {
+    return (
+      this.#activeTurn !== null ||
+      this.#cancellationRecovery !== null ||
+      this.#manualCompaction !== null ||
+      this.#compactionActive ||
+      this.#deferredRunFrames.length > 0 ||
+      this.#hasPendingCommand(["steer"])
+    );
+  }
+
+  #hasPendingCommand(commands: readonly string[]): boolean {
+    for (const pending of this.#pending.values()) {
+      if (commands.includes(pending.command)) return true;
+    }
+    return false;
+  }
+
+  setSubagentStatusHandler(handler: (runs: PiSubagentNode[]) => void): void {
+    this.#subagents.setHandler(handler);
+  }
+
+  setGotgenesStatusHandler(
+    handler: (records: GotgenesRecord[], owner: GotgenesObservationOwner) => void,
+  ): void {
+    this.#gotgenesHandler = handler;
+    // Replaying a retained snapshot does not establish ownership of a new Host Turn.
+    if (this.#gotgenesLatest) handler(this.#gotgenesLatest, "idle");
+  }
+
+  inspectSubagent(id: string): Promise<PiSubagentInspection> {
+    return this.#subagents.inspect(id);
+  }
+
+  setUsageHandler(handler: (observation: PiUsageObservation) => void): void {
+    this.#usageHandler = handler;
+  }
+
+  /** Every finished assistant message is one model request, with or without an active Turn. */
+  #observeUsage(value: Record<string, unknown>): void {
+    if (value.type === "message_start") {
+      if (isRecord(value.message) && value.message.role === "assistant") {
+        this.#usageRequestStartedAtMs = null;
+        this.#usageRequestTimingUnavailable = false;
+      }
+      return;
+    }
+    if (value.type === "message_update") {
+      const event = value.assistantMessageEvent;
+      if (
+        this.#usageRequestStartedAtMs === null &&
+        !this.#usageRequestTimingUnavailable &&
+        isRecord(event) &&
+        typeof event.type === "string"
+      ) {
+        if (
+          // Native thinking starts can precede visible text by seconds; output usage includes it.
+          /^(thinking|reasoning|thought)_start$/u.test(event.type) ||
+          (/^(text|thinking|reasoning|thought)_delta$/u.test(event.type) &&
+            typeof event.delta === "string" &&
+            event.delta.length > 0)
+        )
+          this.#usageRequestStartedAtMs = Date.now();
+        else if (
+          event.type === "toolcall_delta" &&
+          typeof event.delta === "string" &&
+          event.delta.length > 0
+        ) {
+          // Some providers synthesize start/delta/end after assembling the entire arguments.
+          try {
+            JSON.parse(event.delta);
+            this.#usageRequestTimingUnavailable = true;
+          } catch {
+            this.#usageRequestStartedAtMs = Date.now();
+          }
+        } else if (event.type === "toolcall_end") this.#usageRequestTimingUnavailable = true;
+      }
+      return;
+    }
+    if (value.type === "message_end" && isRecord(value.message)) {
+      if (value.message.role !== "assistant") return;
+      const startedAtMs = this.#usageRequestStartedAtMs;
+      this.#usageRequestStartedAtMs = null;
+      this.#usageHandler?.({
+        message: value.message,
+        startedAtMs,
+        completedAtMs: Date.now(),
+      });
+    }
+  }
+
+  setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => void): void {
+    this.#autonomousTurnHandler = handler;
+    this.#autonomousLifecycleHandler = null;
+  }
+
+  setAutonomousTurnLifecycleHandler(handler: (update: PiAutonomousTurnLifecycle) => void): void {
+    this.#autonomousLifecycleHandler = handler;
+    this.#autonomousTurnHandler = null;
+  }
+
+  async start(): Promise<this> {
+    if (this.#child || this.#closed) throw new Error("Pi RPC Session cannot be started twice");
+    const fastExtension =
+      this.#processAdapter === nodeProcessAdapter
+        ? await ensurePiFastExtension({ ...process.env, ...this.#options.environment })
+        : undefined;
+    const subagentExtension =
+      this.#processAdapter === nodeProcessAdapter
+        ? await ensureGotgenesExtension({ ...process.env, ...this.#options.environment })
+        : undefined;
+    const child = this.#processAdapter.spawn({
+      cwd: this.#options.cwd,
+      ...(fastExtension ? { fastExtension } : {}),
+      ...(subagentExtension ? { subagentExtension } : {}),
+      ...(this.#options.command ? { command: this.#options.command } : {}),
+      environment: withNodeRuntimeOnPath({
+        ...process.env,
+        ...this.#options.environment,
+        PI_SKIP_VERSION_CHECK: "1",
+        PI_TELEMETRY: "0",
+      }),
+      ...(this.#options.sessionFile ? { sessionFile: this.#options.sessionFile } : {}),
+      ...(this.#options.forkSessionFile ? { forkSessionFile: this.#options.forkSessionFile } : {}),
+      ...(this.#options.model ? { model: this.#options.model } : {}),
+      ...(this.#options.emptySessionConfiguration
+        ? { emptySessionConfiguration: this.#options.emptySessionConfiguration }
+        : {}),
+    });
+    this.#child = child;
+    child.stdout.on("data", (chunk: Buffer) => this.#push(chunk));
+    child.stdout.on("end", () => {
+      if (this.#buffer.length !== 0) {
+        this.#fail(new PiRpcFaultError("protocolError", "Pi RPC stdout ended mid-frame"));
+      }
+    });
+    child.stderr.on("data", (chunk: Buffer | string) => {
+      this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk.toString()}`);
+    });
+    // A child that exits before reading closes the pipe; without a listener the
+    // EPIPE becomes an uncaught exception and stops the shared Host.
+    child.stdin.on("error", (error) => {
+      this.#fail(
+        new PiRpcFaultError(
+          "processExited",
+          `Pi RPC stdin closed: ${error.message}`,
+          this.stderrTail,
+        ),
+      );
+    });
+    child.once("error", (error) => {
+      const kind = isRecord(error) && error.code === "ENOENT" ? "notInstalled" : "unavailable";
+      this.#fail(
+        new PiRpcFaultError(kind, `Pi RPC failed to start: ${error.message}`, this.stderrTail),
+      );
+    });
+    child.once("exit", (code, signal) => {
+      if (!this.#closed) {
+        this.#fail(
+          new PiRpcFaultError(
+            "processExited",
+            `Pi RPC exited (code=${code}, signal=${signal})`,
+            this.stderrTail,
+          ),
+        );
+      }
+    });
+    await Promise.race([
+      new Promise<void>((resolve, reject) => {
+        child.once("spawn", resolve);
+        child.once("error", reject);
+      }),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(
+          () => reject(new Error("Pi RPC start timed out")),
+          this.#options.commandTimeoutMs,
+        ),
+      ),
+    ]);
+    try {
+      this.#state = parseSessionState(await this.#send("get_state", {}));
+      await this.getEntries();
+    } catch (error) {
+      const fault =
+        error instanceof PiRpcFaultError
+          ? error
+          : new PiRpcFaultError("unavailable", `Pi RPC state unavailable: ${message(error)}`);
+      this.#fail(fault);
+      throw fault;
+    }
+    return this;
+  }
+
+  /** Live slash commands, prompt templates and skills of the running Pi Session. */
+  async getCommands(): Promise<PiNativeCommand[]> {
+    return parsePiNativeCommands(await this.#send("get_commands", {}));
+  }
+
+  async getEntries(): Promise<PiSessionHistory> {
+    try {
+      const history = parseSessionHistory(await this.#send("get_entries", {}));
+      // The Adapter already reads history before accepting each requested Turn.
+      // Refresh while idle so runTurn can dispatch its prompt without a new await
+      // in which cancellation could overtake the prompt.
+      if (!this.#activeTurn && this.#state) {
+        this.#messageTimestampCounts = piHistoryMessageIdentities(
+          this.state.sessionId,
+          activePiEntries(history),
+        ).timestampCounts;
+        this.#noticeOccurrences = piHistoryNotices(
+          this.state.sessionId,
+          activePiEntries(history),
+        ).occurrences;
+      }
+      return history;
+    } catch (error) {
+      if (error instanceof PiRpcFaultError) this.#fail(error);
+      throw error;
+    }
+  }
+
+  async compact(
+    customInstructions: string | undefined,
+    onEvent: (event: PiTurnEvent) => void,
+  ): Promise<PiCompactResult> {
+    if (!this.#child || !this.#state || this.#closed || this.#failed) {
+      throw new Error("Pi RPC Session is unavailable");
+    }
+    if (
+      this.#activeTurn ||
+      this.#cancellationRecovery ||
+      this.#manualCompaction ||
+      this.#compactionActive ||
+      this.#hasPendingCommand(["steer"])
+    ) {
+      throw new Error("Pi RPC Session already has an active operation");
+    }
+
+    const result = new Promise<PiCompactResult>((resolve, reject) => {
+      this.#manualCompaction = { onEvent, resolve, reject };
+    });
+    try {
+      await this.#send("compact", customInstructions ? { customInstructions } : {});
+    } catch (error) {
+      const pending = this.#manualCompaction as ManualCompaction | null;
+      this.#manualCompaction = null;
+      pending?.reject(error instanceof Error ? error : new Error(message(error)));
+    }
+    return result;
+  }
+
+  async getSessionUsage(): Promise<HostUsage | null> {
+    try {
+      const usage = parsePiSessionUsage(await this.#send("get_session_stats", {}));
+      await this.#ensureLatestCacheHitRate();
+      return this.#withLatestCacheHitRate(usage);
+    } catch (error) {
+      if (!(error instanceof PiRpcUnsupportedCommandError)) throw error;
+      const response = await this.#send("get_state", {});
+      const observedState = parseSessionState(response);
+      if (
+        !this.#state ||
+        observedState.sessionId !== this.#state.sessionId ||
+        observedState.provider !== this.#state.provider ||
+        observedState.modelId !== this.#state.modelId
+      ) {
+        throw new Error("Pi RPC Usage fallback does not match the confirmed Session state");
+      }
+      await this.#ensureLatestCacheHitRate();
+      const usage = parsePiStateContextUsage(response);
+      return usage ? this.#withLatestCacheHitRate(usage) : null;
+    }
+  }
+
+  async #ensureLatestCacheHitRate(): Promise<void> {
+    if (this.#latestCacheHitRatePercent !== undefined) return;
+    try {
+      this.#latestCacheHitRatePercent = latestPiCacheHitRatePercent(
+        parseSessionHistory(await this.#send("get_entries", {})),
+      );
+    } catch {
+      this.#latestCacheHitRatePercent = null;
+    }
+  }
+
+  #withLatestCacheHitRate(usage: HostUsage): HostUsage {
+    return this.#latestCacheHitRatePercent === null || this.#latestCacheHitRatePercent === undefined
+      ? usage
+      : parseHostUsage({ ...usage, cacheHitRatePercent: this.#latestCacheHitRatePercent });
+  }
+
+  async fork(entryId: string): Promise<PiSessionState> {
+    if (entryId.length === 0) throw new Error("Pi Fork Entry ID must not be empty");
+    await this.#send("fork", { entryId });
+    const state = await this.#refreshState("Fork");
+    await this.getEntries();
+    return state;
+  }
+
+  async clone(): Promise<PiSessionState> {
+    await this.#send("clone", {});
+    const state = await this.#refreshState("Clone");
+    await this.getEntries();
+    return state;
+  }
+
+  verifySessionCwd(expectedCwd: string): Promise<void> {
+    return verifyPiSessionCwd({
+      sessionFile: this.state.sessionFile,
+      sessionId: this.state.sessionId,
+      expectedCwd,
+    });
+  }
+
+  async getAvailableModels(): Promise<PiNativeModel[]> {
+    try {
+      return parseAvailableModels(await this.#send("get_available_models", {}));
+    } catch (error) {
+      if (error instanceof PiRpcFaultError) this.#fail(error);
+      throw error;
+    }
+  }
+
+  async getAvailableThinkingLevels(): Promise<HarnessThinkingOptionId[] | null> {
+    try {
+      return parseAvailableThinkingLevels(await this.#send("get_available_thinking_levels", {}));
+    } catch (error) {
+      if (error instanceof PiRpcUnsupportedCommandError) return null;
+      if (error instanceof PiRpcFaultError) this.#fail(error);
+      throw error;
+    }
+  }
+
+  async supportsFastMode(): Promise<boolean> {
+    return (await this.getCommands()).some(
+      (command) => command.name === PI_FAST_COMMAND && command.source === "extension",
+    );
+  }
+
+  async selectFastMode(enabled: boolean): Promise<PiSessionState> {
+    if (!enabled && !this.#fast) return this.state;
+    if (!(await this.supportsFastMode()))
+      throw new Error("Installed Pi does not support the Host Fast extension");
+    const nonce = randomUUID();
+    const mode = enabled ? "on" : "off";
+    const acknowledgement = { message: `${PI_FAST_ACK}${nonce}:${mode}`, received: false };
+    this.#fastAcknowledgement = acknowledgement;
+    try {
+      await this.#send("prompt", { message: `/${PI_FAST_COMMAND} ${mode} ${nonce}` });
+      if (!acknowledgement.received) throw new Error("Pi did not confirm the Fast selection");
+      this.#fast = enabled
+        ? { provider: this.state.provider ?? "", id: this.state.modelId ?? "" }
+        : null;
+      return this.state;
+    } catch (error) {
+      // The extension may have changed request policy before its response/notification failed.
+      // An unknown policy must never remain usable for subsequent Turns.
+      const fault =
+        error instanceof PiRpcFaultError
+          ? error
+          : new PiRpcFaultError(
+              "protocolError",
+              `Pi Fast selection could not be confirmed: ${message(error)}`,
+            );
+      this.#fail(fault);
+      await this.close().catch(() => undefined);
+      throw fault;
+    } finally {
+      this.#fastAcknowledgement = null;
+    }
+  }
+
+  async selectModel(model: PiNativeModelRef): Promise<PiSessionState> {
+    if (this.#fast) await this.selectFastMode(false);
+    await this.#send("set_model", { provider: model.provider, modelId: model.id });
+    return this.#refreshState("Model");
+  }
+
+  async selectThinkingOption(thinkingOptionId: HarnessThinkingOptionId): Promise<PiSessionState> {
+    const level = harnessThinkingOptionIdSchema.parse(thinkingOptionId);
+    await this.#send("set_thinking_level", { level });
+    return this.#refreshState("Thinking");
+  }
+
+  async #refreshState(operation: string): Promise<PiSessionState> {
+    try {
+      this.#state = parseSessionState(await this.#send("get_state", {}));
+      return this.state;
+    } catch (error) {
+      const fault =
+        error instanceof PiRpcFaultError
+          ? error
+          : new PiRpcFaultError(
+              "protocolError",
+              `Pi RPC ${operation} state could not be confirmed: ${message(error)}`,
+            );
+      this.#fail(fault);
+      throw fault;
+    }
+  }
+
+  async steer(message: string): Promise<void> {
+    if (!this.#child || !this.#state || this.#closed || this.#failed) {
+      throw new Error("Pi RPC Session is unavailable");
+    }
+    if (message.length === 0) throw new Error("Pi steer text must not be empty");
+    const target = this.#activeTurn;
+    if (!target || target.origin !== "requested" || target.settlement !== "pending") {
+      throw new PiRpcSteerRejectedError("Pi Turn is not accepting native input");
+    }
+    let admitted = false;
+    const response = await this.#send("steer", { message }, () => {
+      // Capture native frame order, not the state after an awaiting continuation runs.
+      admitted = this.#activeTurn === target && target.settlement === "pending";
+    });
+    if (
+      isRecord(response.data) &&
+      response.data.disposition !== undefined &&
+      response.data.disposition !== "queued"
+    ) {
+      // An input hook may have handled it already; retrying could repeat its effects.
+      throw new Error("Pi steer was handled without confirming same-Turn queue admission");
+    }
+    if (!admitted) {
+      // Native input hooks may outlive the run and then enqueue into an idle Session.
+      // Preserve the terminal history before closing this owned process and its queue.
+      let history: PiSessionHistory | undefined;
+      try {
+        history = await this.getEntries();
+      } finally {
+        try {
+          await this.close();
+        } catch (error) {
+          if (history !== undefined) throw error;
+        }
+      }
+      throw new PiRpcSteerTargetEndedError(history);
+    }
+  }
+
+  async runTurn(text: string, onEvent: (event: PiTurnEvent) => void): Promise<PiTurnResult> {
+    if (!this.#child || !this.#state || this.#closed || this.#failed) {
+      throw new Error("Pi RPC Session is unavailable");
+    }
+    if (this.isBusy) throw new PiRpcBusyError();
+    if (text.length === 0) throw new Error("Pi text Turn must not be empty");
+
+    const settled = new Promise<PiTurnResult>((resolve, reject) => {
+      this.#activeTurn = {
+        origin: "requested",
+        autonomousRunId: null,
+        runGeneration: this.#runGeneration,
+        autonomousEvents: null,
+        nativeTurnKey: null,
+        nativeCancellationObserved: false,
+        text: "",
+        assistantMessageId: null,
+        assistantNativeMessageIdentity: undefined,
+        textStream: new PiContentStream("text"),
+        reasoningStream: new PiContentStream("reasoning"),
+        sawStreamedMessageText: false,
+        sawStreamedMessageReasoning: false,
+        lastFinalizedMessageText: null,
+        lastFinalizedMessageReasoning: null,
+        reasoningMessageOpen: false,
+        onEvent,
+        resolve,
+        reject,
+        failure: null,
+        sawTool: false,
+        tools: new Map(),
+        interactions: new Map(),
+        settlement: "pending",
+        cancellation: "none",
+        cancellationTimeout: null,
+        abortPromise: null,
+      };
+    });
+    const active = this.#activeTurn;
+    try {
+      this.#drainProgress(onEvent);
+      await this.#send("prompt", { message: text });
+    } catch (error) {
+      if (this.#activeTurn === active) {
+        this.#rejectActiveTurn(error instanceof Error ? error : new Error(message(error)));
+      }
+    }
+    return settled;
+  }
+
+  respondToInteraction(response: PiInteractionResponse): Promise<void> {
+    return this.#resolveInteraction(response, "cancelled" in response ? "cancelled" : "responded");
+  }
+
+  async #resolveInteraction(
+    response: PiInteractionResponse,
+    reason: "responded" | "cancelled" | "expired",
+  ): Promise<void> {
+    const active = this.#activeTurn;
+    const pending = active?.interactions.get(response.requestId);
+    if (!active || !pending || this.#closed || this.#failed) {
+      throw new Error("Pi RPC interaction is not pending");
+    }
+    if ("value" in response && !["select", "input", "editor"].includes(pending.request.method)) {
+      throw new Error("Pi RPC interaction response type does not match the request");
+    }
+    if ("confirmed" in response && pending.request.method !== "confirm") {
+      throw new Error("Pi RPC confirmation does not match the request");
+    }
+    const frame =
+      "cancelled" in response
+        ? { type: "extension_ui_response", id: response.requestId, cancelled: true }
+        : "confirmed" in response
+          ? { type: "extension_ui_response", id: response.requestId, confirmed: response.confirmed }
+          : { type: "extension_ui_response", id: response.requestId, value: response.value };
+    if (!active.interactions.delete(response.requestId)) {
+      throw new Error("Pi RPC interaction is not pending");
+    }
+    if (pending.timeout) clearTimeout(pending.timeout);
+    active.onEvent({ type: "interaction.closed", requestId: response.requestId, reason });
+    try {
+      await this.#write(frame);
+    } catch (error) {
+      const fault = new PiRpcFaultError(
+        "protocolError",
+        `Pi RPC interaction response failed: ${message(error)}`,
+      );
+      this.#fail(fault);
+      throw fault;
+    }
+  }
+
+  abort(): Promise<void> {
+    const active = this.#activeTurn;
+    if (!active || this.#closed || this.#failed) {
+      return Promise.reject(new Error("Pi RPC Session has no cancellable Turn"));
+    }
+    if (active.abortPromise) return active.abortPromise;
+    active.cancellation = "requesting";
+    active.cancellationTimeout = setTimeout(() => {
+      this.#terminateFailedCancellation(
+        active,
+        new PiRpcFaultError(
+          "protocolError",
+          "Pi Turn cancellation did not settle within its bound",
+        ),
+      );
+    }, this.#options.cancelTimeoutMs);
+    const aborting = this.#send("abort", {})
+      .then(() => {
+        if (this.#activeTurn !== active) return;
+        active.cancellation = "accepted";
+        this.#finishSettledTurn(active);
+      })
+      .catch((error: unknown) => {
+        if (this.#activeTurn !== active) {
+          if (active.cancellation === "abandoned") return;
+          throw error;
+        }
+        const fault =
+          error instanceof PiRpcFaultError
+            ? error
+            : new PiRpcFaultError("protocolError", `Pi RPC Abort failed: ${message(error)}`);
+        this.#terminateFailedCancellation(active, fault);
+      });
+    active.abortPromise = aborting;
+    return aborting;
+  }
+
+  #terminateFailedCancellation(active: ActiveTurn, fault: PiRpcFaultError): void {
+    if (this.#activeTurn !== active) return;
+    if (active.cancellationTimeout) clearTimeout(active.cancellationTimeout);
+    active.cancellationTimeout = null;
+    // Pi reports idle while an input hook is still preparing an unacknowledged Prompt or Steer.
+    // An Abort acknowledgement can therefore precede that input enqueuing or starting a native run.
+    if (this.#hasPendingCommand(["prompt", "steer"])) {
+      void this.#faultAfterProcessCleanup(fault, "Pi RPC unacknowledged input cleanup failed");
+      return;
+    }
+    active.cancellation = "abandoned";
+    const recovery: CancellationRecovery = {
+      probe: null,
+      nativeStartGeneration: 0,
+      timer: setTimeout(() => {
+        void this.#expireCancellationRecovery(recovery, fault);
+      }, CANCELLATION_RECOVERY_TIMEOUT_MS).unref(),
+    };
+    this.#cancellationRecovery = recovery;
+    this.#activeTurn = null;
+    this.#deferredRunFrames = [];
+    this.#deferredRunBytes = 0;
+    for (const waiter of this.#runWaiters) waiter.reject(fault);
+    for (const [id, pending] of this.#pending) {
+      if (
+        pending.command !== "abort" &&
+        pending.command !== "prompt" &&
+        pending.command !== "steer"
+      ) {
+        continue;
+      }
+      if (pending.timeout) clearTimeout(pending.timeout);
+      this.#pending.delete(id);
+      this.#rememberExpiredCommand(id);
+      pending.reject(fault);
+    }
+    if (this.#compactionActive) {
+      this.#compactionActive = false;
+      this.#compactionTurn = null;
+      active.onEvent({ type: "compaction.completed", outcome: "cancelled" });
+    }
+    this.#closeInteractions(active, "cancelled");
+    if (active.origin === "autonomous") {
+      this.#emitAutonomousTurn(active, {
+        status: "cancelled",
+        text: active.text,
+        reason: fault.message,
+      });
+    } else {
+      active.resolve({ text: active.text, cancelled: true });
+    }
+    void this.#probeCancellationRecovery(recovery);
+  }
+
+  #probeCancellationRecovery(recovery: CancellationRecovery): Promise<void> {
+    const generation = recovery.nativeStartGeneration;
+    recovery.probe ??= this.#send("get_state", {}, undefined, this.#options.closeTimeoutMs)
+      .then((response) => {
+        const state = sessionStateData(response);
+        if (
+          this.#cancellationRecovery === recovery &&
+          recovery.nativeStartGeneration === generation &&
+          state.isStreaming === false &&
+          state.isCompacting === false
+        ) {
+          this.#clearCancellationRecovery();
+        }
+      })
+      .catch(() => {
+        // A failed probe leaves admission closed until another probe or the recovery deadline.
+      })
+      .finally(() => {
+        recovery.probe = null;
+      });
+    return recovery.probe;
+  }
+
+  async #expireCancellationRecovery(
+    recovery: CancellationRecovery,
+    cancellationFault: PiRpcFaultError,
+  ): Promise<void> {
+    await recovery.probe;
+    if (this.#cancellationRecovery !== recovery) return;
+    await this.#probeCancellationRecovery(recovery);
+    if (this.#cancellationRecovery !== recovery) return;
+    const fault = new PiRpcFaultError(
+      "protocolError",
+      `Pi RPC Session did not return to confirmed idle after an unconfirmed cancellation: ${cancellationFault.message}`,
+    );
+    await this.#faultAfterProcessCleanup(fault, "Pi RPC cancellation recovery cleanup failed");
+  }
+
+  #clearCancellationRecovery(): void {
+    if (!this.#cancellationRecovery) return;
+    clearTimeout(this.#cancellationRecovery.timer);
+    this.#cancellationRecovery = null;
+  }
+
+  close(): Promise<void> {
+    this.#clearCancellationRecovery();
+    this.#pendingProgress = [];
+    this.#omittedProgress = 0;
+    this.#seenNoticeFrames.clear();
+    this.#extensionStatuses.clear();
+    if (!this.#closed) {
+      this.#closed = true;
+      this.#rejectAll(new Error("Pi RPC Session closed"));
+    }
+    // Closed admission is not proof of process exit. Every caller awaits the same cleanup,
+    // including calls racing cancellation or a timed-out Prompt.
+    this.#closePromise ??= this.#stopProcess();
+    return this.#closePromise;
+  }
+
+  async #stopProcess(): Promise<void> {
+    const child = this.#child;
+    if (!child) return;
+    if (child.stdin.writable) child.stdin.end();
+    if (await waitForExit(child, this.#options.closeTimeoutMs)) return;
+    signalProcessTree(child, "SIGTERM");
+    if (await waitForExit(child, this.#options.closeTimeoutMs)) return;
+    signalProcessTree(child, "SIGKILL");
+    if (!(await waitForExit(child, this.#options.closeTimeoutMs))) {
+      throw new Error("Pi RPC process tree did not exit within cleanup bounds");
+    }
+  }
+
+  #push(chunk: Buffer<ArrayBufferLike>): void {
+    let rest = chunk;
+    let newline = rest.indexOf(0x0a);
+    while (newline >= 0) {
+      const tail = rest.subarray(0, newline);
+      const frame = this.#buffer.length === 0 ? tail : Buffer.concat([...this.#buffer, tail]);
+      this.#buffer = [];
+      rest = rest.subarray(newline + 1);
+      try {
+        const value = JSON.parse(textDecoder.decode(frame));
+        if (!isRecord(value) || typeof value.type !== "string") {
+          throw new PiRpcFaultError("protocolError", "Pi RPC returned an invalid envelope");
+        }
+        this.#handle(value);
+      } catch (error) {
+        this.#fail(
+          error instanceof PiRpcFaultError
+            ? error
+            : new PiRpcFaultError(
+                "protocolError",
+                error instanceof PiContentStreamConflictError
+                  ? error.message
+                  : `Pi RPC returned invalid JSONL: ${message(error)}`,
+              ),
+        );
+      }
+      newline = rest.indexOf(0x0a);
+    }
+    if (rest.length !== 0) this.#buffer.push(rest);
+  }
+
+  #handle(value: Record<string, unknown>, observedGeneration?: number): void {
+    if (observedGeneration === undefined && value.type === "agent_start") {
+      this.#runGeneration += 1;
+      for (const waiter of this.#runWaiters) waiter.check();
+    }
+    const generation = observedGeneration ?? this.#runGeneration;
+    if (
+      value.type === "extension_ui_request" &&
+      value.method === "notify" &&
+      typeof value.message === "string" &&
+      value.message.startsWith(PI_FAST_ACK)
+    ) {
+      if (this.#fastAcknowledgement?.message === value.message)
+        this.#fastAcknowledgement.received = true;
+      return;
+    }
+    if (this.#closed || this.#failed) return;
+    if (value.type === "response") {
+      this.#handleResponse(value);
+      return;
+    }
+    if (this.#subagents.handle(value)) return;
+    const recovery = this.#cancellationRecovery;
+    if (recovery) {
+      if (this.#handleGotgenesWidget(value)) return;
+      if (this.#handleProgress(value)) return;
+      this.#observeUsage(value);
+      if (value.type === "agent_start" || value.type === "compaction_start") {
+        recovery.nativeStartGeneration += 1;
+      }
+      if (value.type === "agent_settled" || value.type === "compaction_end") {
+        // An in-flight probe may describe the state before this terminal frame.
+        void Promise.resolve(recovery.probe).then(() => {
+          if (this.#cancellationRecovery === recovery) {
+            return this.#probeCancellationRecovery(recovery);
+          }
+        });
+      }
+      return;
+    }
+    const settling = this.#activeTurn;
+    if (settling && settling.settlement !== "pending" && generation > settling.runGeneration) {
+      this.#deferredRunBytes += Buffer.byteLength(JSON.stringify(value));
+      if (this.#deferredRunBytes > 8 * 1024 * 1024) {
+        this.#fail(
+          new PiRpcFaultError("protocolError", "Pi deferred run exceeded its event buffer bound"),
+        );
+        return;
+      }
+      this.#deferredRunFrames.push({ value, generation });
+      return;
+    }
+    if (value.type === "agent_start") {
+      if (this.#activeTurn) this.#activeTurn.runGeneration = generation;
+      else if (
+        !this.#manualCompaction &&
+        !this.#compactionActive &&
+        (this.#autonomousTurnHandler || this.#autonomousLifecycleHandler)
+      )
+        this.#startAutonomousTurn(undefined, generation);
+      return;
+    }
+    if (this.#handleGotgenesWidget(value)) return;
+    if (this.#handleProgress(value)) return;
+    this.#observeUsage(value);
+    if (value.type === "compaction_start") {
+      this.#compactionActive = true;
+      this.#compactionTurn = this.#activeTurn;
+      const onEvent = this.#activeTurn?.onEvent ?? this.#manualCompaction?.onEvent;
+      onEvent?.({ type: "compaction.started" });
+      // Pi owns compaction duration; keep Prompt/Compact correlation until its terminal event.
+      for (const pending of this.#pending.values()) {
+        if ((pending.command !== "prompt" && pending.command !== "compact") || !pending.timeout)
+          continue;
+        clearTimeout(pending.timeout);
+        pending.timeout = null;
+      }
+      return;
+    }
+    if (value.type === "compaction_end") {
+      this.#compactionActive = false;
+      const compactionTurn = this.#compactionTurn;
+      this.#compactionTurn = null;
+      for (const [id, pending] of this.#pending) {
+        if (pending.command === "prompt" || pending.command === "compact") {
+          this.#armCommandTimeout(id, pending);
+        }
+      }
+      const outcome =
+        value.aborted === true ? "cancelled" : isRecord(value.result) ? "succeeded" : "failed";
+      const event: PiTurnEvent = {
+        type: "compaction.completed",
+        outcome,
+        ...(nonBlankString(value.errorMessage) ? { errorMessage: value.errorMessage } : {}),
+      };
+      compactionTurn?.onEvent(event);
+      const manual = this.#manualCompaction;
+      this.#manualCompaction = null;
+      manual?.onEvent(event);
+      manual?.resolve({
+        outcome,
+        ...(event.errorMessage ? { errorMessage: event.errorMessage } : {}),
+      });
+      return;
+    }
+    let active = this.#activeTurn;
+    if (
+      !active &&
+      !this.#manualCompaction &&
+      !this.#compactionActive &&
+      (this.#autonomousTurnHandler || this.#autonomousLifecycleHandler) &&
+      value.type === "message_start" &&
+      assistantText(value.message) !== null
+    ) {
+      active = this.#startAutonomousTurn(value.message, generation);
+    }
+    if (!active) {
+      if (value.type === "extension_ui_request" && this.#isBlockingInteraction(value)) {
+        this.#fail(
+          new PiRpcFaultError(
+            "protocolError",
+            "Pi RPC requested blocking Extension UI outside an active Turn",
+          ),
+        );
+      }
+      return;
+    }
+    if (value.type === "extension_ui_request") {
+      if (active.origin === "autonomous" && this.#isBlockingInteraction(value)) {
+        this.#fail(
+          new PiRpcFaultError(
+            "protocolError",
+            "Pi RPC requested blocking Extension UI during an autonomous Turn",
+          ),
+        );
+        return;
+      }
+      this.#startInteraction(active, value);
+      return;
+    }
+    if (value.type === "message_start" && assistantText(value.message) !== null) {
+      this.#startAssistantMessage(active, value.message);
+      return;
+    }
+    if (value.type === "message_update" && isRecord(value.assistantMessageEvent)) {
+      const event = value.assistantMessageEvent;
+      const eventType = String(event.type ?? "");
+      const isThinking =
+        eventType === "thinking_delta" ||
+        eventType === "reasoning_delta" ||
+        eventType === "thought_delta" ||
+        eventType === "thinking" ||
+        eventType === "reasoning";
+      const isText =
+        eventType === "text_delta" || eventType === "text" || eventType === "content_block_delta";
+
+      const delta =
+        typeof event.delta === "string"
+          ? event.delta
+          : typeof event.thinking === "string"
+            ? event.thinking
+            : typeof event.reasoning === "string"
+              ? event.reasoning
+              : typeof event.text === "string"
+                ? event.text
+                : isRecord(event.delta) && typeof event.delta.thinking === "string"
+                  ? event.delta.thinking
+                  : isRecord(event.delta) && typeof event.delta.text === "string"
+                    ? event.delta.text
+                    : null;
+
+      const endingReasoning = eventType === "thinking_end" || eventType === "reasoning_end";
+      const endingText = eventType === "text_end";
+      if ((endingReasoning || endingText) && typeof event.content === "string") {
+        this.#ensureAssistantMessage(active, value.message);
+        const stream = endingReasoning ? active.reasoningStream : active.textStream;
+        this.#emitContent(
+          active,
+          endingReasoning,
+          stream.complete(event.contentIndex, event.content),
+        );
+      } else if ((isThinking || isText) && delta !== null && delta.length > 0) {
+        this.#ensureAssistantMessage(active, value.message);
+        if (isThinking) active.sawStreamedMessageReasoning = true;
+        else active.sawStreamedMessageText = true;
+        const stream = isThinking ? active.reasoningStream : active.textStream;
+        this.#emitContent(active, isThinking, stream.append(event.contentIndex, delta));
+      } else if (event.type === "error") {
+        this.#ensureAssistantMessage(active, value.message);
+        active.failure =
+          assistantFailure(event.error) ??
+          assistantFailure(value.message) ??
+          new Error("Pi assistant message failed");
+      }
+      return;
+    }
+    if (value.type === "message_end") {
+      this.#finalizeAssistantMessage(active, value.message);
+      return;
+    }
+    if (value.type === "turn_end") {
+      this.#finalizeAssistantMessage(active, value.message);
+      return;
+    }
+    if (value.type === "tool_execution_start") {
+      this.#startTool(active, value);
+      return;
+    }
+    if (value.type === "tool_execution_update") {
+      this.#updateTool(active, value);
+      return;
+    }
+    if (value.type === "tool_execution_end") {
+      this.#completeTool(active, value);
+      return;
+    }
+    if (value.type === "agent_settled") {
+      if (active.settlement !== "pending") return;
+      active.settlement = "confirming";
+      void this.#confirmSettledTurn(active, active.runGeneration);
+    }
+  }
+
+  #startAutonomousTurn(value: unknown, generation: number): ActiveTurn {
+    const events: PiTurnEvent[] = [];
+    const runId = randomUUID();
+    const active: ActiveTurn = {
+      origin: "autonomous",
+      autonomousRunId: runId,
+      runGeneration: generation,
+      autonomousEvents: events,
+      ...(isRecord(value) ? { autonomousMessage: value } : {}),
+      nativeTurnKey: null,
+      nativeCancellationObserved: false,
+      text: "",
+      assistantMessageId: null,
+      assistantNativeMessageIdentity: undefined,
+      textStream: new PiContentStream("text"),
+      reasoningStream: new PiContentStream("reasoning"),
+      sawStreamedMessageText: false,
+      sawStreamedMessageReasoning: false,
+      lastFinalizedMessageText: null,
+      lastFinalizedMessageReasoning: null,
+      reasoningMessageOpen: false,
+      onEvent: (event) => {
+        if (this.#autonomousLifecycleHandler)
+          this.#autonomousLifecycleHandler({ type: "event", runId, event });
+        else events.push(event);
+      },
+      resolve: () => undefined,
+      reject: () => undefined,
+      failure: null,
+      sawTool: false,
+      tools: new Map(),
+      interactions: new Map(),
+      settlement: "pending",
+      cancellation: "none",
+      cancellationTimeout: null,
+      abortPromise: null,
+    };
+    this.#activeTurn = active;
+    this.#autonomousLifecycleHandler?.({ type: "started", runId });
+    this.#drainProgress(active.onEvent);
+    return active;
+  }
+
+  #handleGotgenesWidget(value: Record<string, unknown>): boolean {
+    if (
+      value.type !== "extension_ui_request" ||
+      value.method !== "setWidget" ||
+      value.widgetKey !== GOTGENES_WIDGET
+    ) {
+      return false;
+    }
+    const records = parseGotgenesWidget(value);
+    if (records) {
+      this.#gotgenesLatest = records;
+      this.#gotgenesHandler?.(records, this.#activeTurn?.origin ?? "idle");
+    }
+    return true;
+  }
+
+  #handleProgress(value: Record<string, unknown>): boolean {
+    if (
+      (value.type === "message_start" || value.type === "message_end") &&
+      isRecord(value.message) &&
+      value.message.role === "custom"
+    ) {
+      // Start/end describe the same complete custom message. Only publish the terminal frame.
+      if (value.type !== "message_end" || !this.#state) return true;
+      const key = piCustomNoticeKey(value.message);
+      if (!key) return true;
+      const timestamp = value.message.timestamp;
+      if (
+        (typeof timestamp === "number" || typeof timestamp === "string") &&
+        !this.#acceptNoticeFrame(JSON.stringify([key, timestamp]))
+      )
+        return true;
+      const progress = piCustomNotice(value.message, this.state.sessionId, this.#noticeOccurrences);
+      if (progress) this.#publishProgress(progress);
+      return true;
+    }
+    if (value.type === "extension_ui_request" && value.method === "setStatus") {
+      if (typeof value.statusKey !== "string") return true;
+      if (typeof value.statusText !== "string" || !value.statusText.trim()) {
+        if (!this.#extensionStatuses.has(value.statusKey)) return true;
+        this.#extensionStatuses.delete(value.statusKey);
+      } else {
+        if (this.#extensionStatuses.get(value.statusKey) === value.statusText) return true;
+        this.#extensionStatuses.set(value.statusKey, value.statusText);
+      }
+      // Native footer updates are ephemeral; progress messages create permanent Items.
+      return true;
+    }
+    const text = piStatusText(value);
+    if (!text) return false;
+    if (
+      value.type === "extension_ui_request" &&
+      typeof value.id === "string" &&
+      !this.#acceptNoticeFrame(JSON.stringify([value.type, value.id]))
+    )
+      return true;
+    this.#publishProgress(
+      {
+        type: "progress.message",
+        itemId: hostItemIdSchema.parse(`pi-progress-${randomUUID()}`),
+        text,
+      },
+      value.method === "setStatus" && typeof value.statusKey === "string"
+        ? value.statusKey
+        : undefined,
+    );
+    return true;
+  }
+
+  #acceptNoticeFrame(key: string): boolean {
+    if (this.#seenNoticeFrames.has(key)) return false;
+    this.#seenNoticeFrames.add(key);
+    if (this.#seenNoticeFrames.size > 512)
+      this.#seenNoticeFrames.delete(this.#seenNoticeFrames.values().next().value as string);
+    return true;
+  }
+
+  #publishProgress(progress: PiProgressMessage, statusKey?: string): void {
+    if (this.#activeTurn?.settlement === "pending") {
+      this.#activeTurn.onEvent(progress);
+      return;
+    }
+    // Session-level notices have no public Item owner. Retain them until a real Turn opens.
+    if (statusKey !== undefined) {
+      const previous = this.#pendingProgress.findIndex(
+        (pending) => pending.statusKey === statusKey,
+      );
+      if (previous >= 0) this.#pendingProgress.splice(previous, 1);
+    }
+    if (this.#pendingProgress.length >= 128) {
+      this.#pendingProgress.shift();
+      this.#omittedProgress += 1;
+    }
+    this.#pendingProgress.push({
+      event: progress,
+      ...(statusKey !== undefined ? { statusKey } : {}),
+    });
+  }
+
+  #drainProgress(onEvent: (event: PiTurnEvent) => void): void {
+    if (this.#omittedProgress > 0) {
+      onEvent({
+        type: "progress.message",
+        itemId: hostItemIdSchema.parse(`pi-progress-${randomUUID()}`),
+        text: `Pi notifications: ${this.#omittedProgress} earlier updates were not retained while idle. Persisted notifications remain available in conversation history.`,
+      });
+      this.#omittedProgress = 0;
+    }
+    for (const pending of this.#pendingProgress.splice(0)) onEvent(pending.event);
+  }
+
+  #emitAutonomousTurn(active: ActiveTurn, result: PiAutonomousTurnResult): void {
+    const handler = this.#autonomousTurnHandler;
+    if (active.origin !== "autonomous" || !active.autonomousEvents || !active.autonomousRunId) {
+      return;
+    }
+    try {
+      const turn: PiAutonomousTurn = {
+        nativeTurnKey: active.nativeTurnKey,
+        events: [...active.autonomousEvents],
+        result,
+      };
+      if (this.#autonomousLifecycleHandler)
+        this.#autonomousLifecycleHandler({
+          type: "completed",
+          runId: active.autonomousRunId,
+          turn,
+        });
+      else handler?.(turn);
+    } catch (error) {
+      this.#fail(
+        new PiRpcFaultError(
+          "protocolError",
+          `Pi autonomous Turn handler failed: ${message(error)}`,
+        ),
+      );
+    }
+  }
+
+  #isBlockingInteraction(value: Record<string, unknown>): boolean {
+    return ["select", "confirm", "input", "editor"].includes(String(value.method));
+  }
+
+  #startInteraction(active: ActiveTurn, value: Record<string, unknown>): void {
+    if (!this.#isBlockingInteraction(value)) return;
+    const requestId = value.id;
+    const method = value.method;
+    const title = value.title;
+    const timeoutMs = value.timeout;
+    if (
+      typeof requestId !== "string" ||
+      requestId.length === 0 ||
+      typeof method !== "string" ||
+      typeof title !== "string" ||
+      title.length === 0 ||
+      (timeoutMs !== undefined &&
+        (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs < 0)) ||
+      active.interactions.has(requestId)
+    ) {
+      throw new PiRpcFaultError("protocolError", "Pi RPC returned an invalid Interaction request");
+    }
+
+    let request: PiInteractionRequest;
+    if (method === "select") {
+      if (
+        !Array.isArray(value.options) ||
+        value.options.length === 0 ||
+        !value.options.every(
+          (option): option is string => typeof option === "string" && option.length > 0,
+        )
+      ) {
+        throw new PiRpcFaultError("protocolError", "Pi RPC select request has invalid options");
+      }
+      request = {
+        requestId,
+        method,
+        title,
+        options: [...value.options],
+        ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
+      };
+    } else if (method === "confirm") {
+      if (typeof value.message !== "string") {
+        throw new PiRpcFaultError("protocolError", "Pi RPC confirm request has no message");
+      }
+      request = {
+        requestId,
+        method,
+        title,
+        message: value.message,
+        ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
+      };
+    } else if (method === "input") {
+      if (value.placeholder !== undefined && typeof value.placeholder !== "string") {
+        throw new PiRpcFaultError("protocolError", "Pi RPC input placeholder is invalid");
+      }
+      request = {
+        requestId,
+        method,
+        title,
+        ...(typeof value.placeholder === "string" ? { placeholder: value.placeholder } : {}),
+        ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
+      };
+    } else {
+      if (value.prefill !== undefined && typeof value.prefill !== "string") {
+        throw new PiRpcFaultError("protocolError", "Pi RPC editor prefill is invalid");
+      }
+      request = {
+        requestId,
+        method: "editor",
+        title,
+        ...(typeof value.prefill === "string" ? { prefill: value.prefill } : {}),
+        ...(typeof timeoutMs === "number" ? { timeoutMs } : {}),
+      };
+    }
+
+    const pending = { request, timeout: null as NodeJS.Timeout | null };
+    if (request.timeoutMs !== undefined) {
+      pending.timeout = setTimeout(() => {
+        if (this.#activeTurn !== active || !active.interactions.has(requestId)) return;
+        void this.#resolveInteraction({ requestId, cancelled: true }, "expired").catch((error) => {
+          if (this.#closed || this.#failed) return;
+          this.#fail(
+            new PiRpcFaultError(
+              "protocolError",
+              `Pi RPC Interaction timeout handling failed: ${message(error)}`,
+            ),
+          );
+        });
+      }, request.timeoutMs);
+    }
+    active.interactions.set(requestId, pending);
+    active.onEvent({ type: "interaction.requested", request });
+  }
+
+  #handleResponse(value: Record<string, unknown>): void {
+    const id = value.id;
+    if (typeof id !== "string") {
+      this.#fail(new PiRpcFaultError("protocolError", "Pi RPC response has no id"));
+      return;
+    }
+    const pending = this.#pending.get(id);
+    if (!pending && this.#expired.delete(id)) return;
+    if (!pending) {
+      this.#fail(new PiRpcFaultError("protocolError", "Pi RPC response id is not pending"));
+      return;
+    }
+    if (pending.timeout) clearTimeout(pending.timeout);
+    this.#pending.delete(id);
+    if (value.success === true) pending.resolve(value);
+    else {
+      const error = typeof value.error === "string" ? value.error : "Pi RPC command failed";
+      if (pending.command === "steer" && value.command === "steer" && value.success === false) {
+        pending.reject(new PiRpcSteerRejectedError(error));
+      } else if (
+        value.command === pending.command &&
+        error === `Unknown command: ${pending.command}`
+      ) {
+        pending.reject(new PiRpcUnsupportedCommandError(pending.command));
+      } else {
+        pending.reject(new Error(error));
+      }
+    }
+  }
+
+  #startTool(active: ActiveTurn, value: Record<string, unknown>): void {
+    const callId = value.toolCallId;
+    const toolName = value.toolName;
+    const argumentsResult = jsonValueSchema.safeParse(value.args);
+    if (
+      typeof callId !== "string" ||
+      callId.length === 0 ||
+      typeof toolName !== "string" ||
+      toolName.length === 0 ||
+      !argumentsResult.success ||
+      active.tools.has(callId)
+    ) {
+      throw new PiRpcFaultError("protocolError", "Pi RPC returned an invalid Tool start");
+    }
+    active.sawTool = true;
+    active.tools.set(callId, toolName);
+    active.onEvent({
+      type: "tool.started",
+      callId,
+      toolName,
+      arguments: argumentsResult.data,
+    });
+  }
+
+  #updateTool(active: ActiveTurn, value: Record<string, unknown>): void {
+    const callId = value.toolCallId;
+    const outputResult = jsonValueSchema.safeParse(value.partialResult);
+    if (typeof callId !== "string" || !active.tools.has(callId) || !outputResult.success) {
+      throw new PiRpcFaultError("protocolError", "Pi RPC returned an invalid Tool update");
+    }
+    active.onEvent({ type: "tool.updated", callId, output: outputResult.data });
+  }
+
+  #completeTool(active: ActiveTurn, value: Record<string, unknown>): void {
+    const callId = value.toolCallId;
+    const toolName = value.toolName;
+    const result = jsonValueSchema.safeParse(value.result);
+    const expectedName = typeof callId === "string" ? active.tools.get(callId) : undefined;
+    if (
+      typeof callId !== "string" ||
+      typeof toolName !== "string" ||
+      expectedName !== toolName ||
+      typeof value.isError !== "boolean" ||
+      !result.success
+    ) {
+      throw new PiRpcFaultError("protocolError", "Pi RPC returned an invalid Tool end");
+    }
+    active.tools.delete(callId);
+    active.onEvent({
+      type: "tool.completed",
+      callId,
+      toolName,
+      result: result.data,
+      isError: value.isError,
+    });
+  }
+
+  #isSettlementCurrent(active: ActiveTurn, generation: number): boolean {
+    return (
+      this.#activeTurn === active &&
+      active.runGeneration === generation &&
+      active.settlement === "confirming"
+    );
+  }
+
+  #waitForNextRun(generation: number): Promise<void> {
+    if (this.#runGeneration > generation) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const finish = (error?: Error): void => {
+        clearTimeout(timer);
+        this.#runWaiters.delete(waiter);
+        if (error) reject(error);
+        else resolve();
+      };
+      const waiter = {
+        check: () => {
+          if (this.#runGeneration > generation) finish();
+        },
+        reject: (error: Error) => finish(error),
+      };
+      const timer = setTimeout(
+        () =>
+          finish(
+            new PiRpcFaultError(
+              "protocolError",
+              "Pi RPC agent_settled state is still Streaming without a subsequent agent_start",
+            ),
+          ),
+        this.#options.commandTimeoutMs,
+      );
+      this.#runWaiters.add(waiter);
+    });
+  }
+
+  #drainDeferredRunFrames(): void {
+    const frames = this.#deferredRunFrames;
+    this.#deferredRunFrames = [];
+    this.#deferredRunBytes = 0;
+    for (const frame of frames) {
+      if (this.#closed || this.#failed) break;
+      this.#handle(frame.value, frame.generation);
+    }
+  }
+
+  async #confirmSettledTurn(active: ActiveTurn, generation: number): Promise<void> {
+    try {
+      const response = await this.#send("get_state", {});
+      const state = parseSessionState(response);
+      if (!this.#isSettlementCurrent(active, generation)) return;
+      // Pi's deferred settled actions may already have opened the next native run.
+      // Require its ordered agent_start fence; a bare Streaming disagreement still faults.
+      if (parseSessionStreaming(response)) await this.#waitForNextRun(generation);
+      if (!this.#isSettlementCurrent(active, generation)) return;
+      if (active.origin === "autonomous" && active.autonomousMessage) {
+        const history = await this.getEntries();
+        const snapshot = mapPiSnapshot(history, { sessionId: state.sessionId, model: null });
+        if (!this.#isSettlementCurrent(active, generation)) return;
+        const entries = activePiEntries(history);
+        const live = active.autonomousMessage;
+        const responseId = assistantMessageId(live);
+        const matches = snapshot.turns.filter((turn) => {
+          if (turn.input.length !== 0) return false;
+          const start = entries.findIndex((entry) => entry.id === turn.nativeTurnRef.nativeTurnKey);
+          const firstAssistant = entries
+            .slice(start + 1)
+            .find(
+              (entry) => isRecord(entry.message) && entry.message.role === "assistant",
+            )?.message;
+          return (
+            isRecord(firstAssistant) &&
+            (responseId
+              ? assistantMessageId(firstAssistant) === responseId
+              : typeof live?.timestamp === "number" && firstAssistant.timestamp === live.timestamp)
+          );
+        });
+        const turn = matches.length === 1 ? matches[0] : undefined;
+        if (!turn)
+          throw new PiRpcFaultError(
+            "protocolError",
+            "Pi autonomous Turn has no matching persisted custom Entry",
+          );
+        active.nativeTurnKey = turn.nativeTurnRef.nativeTurnKey;
+      }
+      if (!this.#isSettlementCurrent(active, generation)) return;
+      this.#state = state;
+      active.settlement = "confirmed";
+      this.#finishSettledTurn(active);
+    } catch (error) {
+      if (this.#activeTurn !== active) return;
+      const fault =
+        error instanceof PiRpcFaultError
+          ? error
+          : new PiRpcFaultError(
+              "protocolError",
+              `Pi RPC stable Turn state could not be confirmed: ${message(error)}`,
+            );
+      this.#fail(fault);
+    }
+  }
+
+  #finishSettledTurn(active: ActiveTurn): void {
+    if (
+      this.#activeTurn !== active ||
+      active.settlement !== "confirmed" ||
+      active.cancellation === "requesting"
+    ) {
+      return;
+    }
+    if (active.cancellationTimeout) clearTimeout(active.cancellationTimeout);
+    active.cancellationTimeout = null;
+    this.#closeInteractions(
+      active,
+      active.cancellation === "accepted" ? "cancelled" : "superseded",
+    );
+    if (active.tools.size > 0) {
+      this.#fail(
+        new PiRpcFaultError("protocolError", "Pi RPC settled with active Tool executions"),
+      );
+      return;
+    }
+    this.#activeTurn = null;
+    if (active.origin === "autonomous") {
+      if (active.cancellation === "accepted") {
+        this.#emitAutonomousTurn(active, {
+          status: "cancelled",
+          text: active.text,
+          reason: "Cancelled by user",
+        });
+      } else if (active.failure) {
+        this.#emitAutonomousTurn(
+          active,
+          active.nativeCancellationObserved
+            ? {
+                status: "cancelled",
+                text: active.text,
+                reason: "Pi autonomous Assistant was aborted",
+              }
+            : { status: "failed", text: active.text, error: active.failure },
+        );
+      } else if (active.text.trim().length === 0 && !active.sawTool) {
+        this.#emitAutonomousTurn(active, {
+          status: "failed",
+          text: active.text,
+          error: new Error("Pi RPC autonomous Turn settled without displayable output"),
+        });
+      } else {
+        this.#emitAutonomousTurn(active, { status: "succeeded", text: active.text });
+      }
+      this.#drainDeferredRunFrames();
+      return;
+    }
+    if (active.cancellation === "accepted") {
+      active.resolve({ text: active.text, cancelled: true });
+    } else if (active.failure) {
+      active.reject(active.failure);
+    } else if (active.text.trim().length === 0 && !active.sawTool) {
+      active.reject(new Error("Pi RPC settled without displayable output"));
+    } else {
+      active.resolve({ text: active.text, cancelled: false });
+    }
+    this.#drainDeferredRunFrames();
+  }
+
+  #emitContent(active: ActiveTurn, reasoning: boolean, delta: string): void {
+    if (delta.length === 0) return;
+    const messageId = active.assistantMessageId;
+    if (messageId === null) throw new Error("Pi content arrived outside an Assistant message");
+    if (reasoning) {
+      active.reasoningMessageOpen = true;
+      active.sawStreamedMessageReasoning = true;
+    } else {
+      active.text += delta;
+      active.sawStreamedMessageText = true;
+    }
+    active.onEvent({
+      type: reasoning ? "reasoning.delta" : "text.delta",
+      messageId,
+      ...nativeMessageIdentity(active),
+      delta,
+    });
+  }
+
+  #startAssistantMessage(active: ActiveTurn, value: unknown): string {
+    if (active.origin === "autonomous" && !active.autonomousMessage && isRecord(value))
+      active.autonomousMessage = value;
+    if (active.assistantMessageId !== null && active.reasoningMessageOpen) {
+      active.onEvent({ type: "reasoning.completed", messageId: active.assistantMessageId });
+    }
+    const nativeResponseId = assistantMessageId(value);
+    const messageId = nativeResponseId ?? randomUUID();
+    active.assistantMessageId = messageId;
+    active.assistantNativeMessageIdentity = piMessageIdentity(
+      this.state.sessionId,
+      value,
+      this.#messageTimestampCounts,
+    );
+    active.textStream = new PiContentStream("text");
+    active.reasoningStream = new PiContentStream("reasoning");
+    active.sawStreamedMessageText = false;
+    active.sawStreamedMessageReasoning = false;
+    active.reasoningMessageOpen = false;
+    return messageId;
+  }
+
+  #ensureAssistantMessage(active: ActiveTurn, value: unknown): string {
+    if (active.assistantMessageId === null) return this.#startAssistantMessage(active, value);
+    // Pi can emit message_start before the provider's response.created frame.
+    // Select its durable identity before publishing text or reasoning, never mid-item.
+    if (!active.sawStreamedMessageText && !active.sawStreamedMessageReasoning) {
+      const nativeResponseId = assistantMessageId(value);
+      if (nativeResponseId) {
+        active.assistantMessageId = nativeResponseId;
+        active.assistantNativeMessageIdentity ??= { responseId: nativeResponseId };
+      }
+    }
+    return active.assistantMessageId;
+  }
+
+  #finalizeAssistantMessage(active: ActiveTurn, value: unknown): void {
+    const finalText = assistantText(value);
+    const finalReasoning = assistantReasoning(value);
+    const failure = assistantFailure(value);
+    const cacheHitRatePercent = optionalPiCacheHitRatePercent(value);
+    if (finalText === null || finalReasoning === null || failure === undefined) return;
+    if (
+      active.assistantMessageId === null &&
+      finalText === active.lastFinalizedMessageText &&
+      finalReasoning === active.lastFinalizedMessageReasoning &&
+      !active.sawStreamedMessageText &&
+      !active.sawStreamedMessageReasoning
+    ) {
+      return;
+    }
+
+    active.failure = failure;
+    if (active.origin === "autonomous" && piAssistantWasAborted(value)) {
+      active.nativeCancellationObserved = true;
+    }
+    this.#latestCacheHitRatePercent = cacheHitRatePercent;
+    const messageId = this.#ensureAssistantMessage(active, value);
+    const content = (value as { content: unknown[] }).content;
+    if (failure === null || !active.sawStreamedMessageReasoning) {
+      this.#emitContent(
+        active,
+        true,
+        active.reasoningStream.finalize(
+          content.flatMap((part, index) => {
+            const text = extractReasoningText(part);
+            return text === null ? [] : [{ index, text }];
+          }),
+        ),
+      );
+    }
+    if (active.reasoningMessageOpen && active.failure === null) {
+      active.onEvent({ type: "reasoning.completed", messageId });
+    }
+    if (failure === null || !active.sawStreamedMessageText) {
+      this.#emitContent(
+        active,
+        false,
+        active.textStream.finalize(
+          content.flatMap((part, index) =>
+            isRecord(part) && part.type === "text" && typeof part.text === "string"
+              ? [{ index, text: part.text }]
+              : [],
+          ),
+        ),
+      );
+    }
+
+    active.assistantMessageId = null;
+    active.assistantNativeMessageIdentity = undefined;
+    active.sawStreamedMessageText = false;
+    active.sawStreamedMessageReasoning = false;
+    active.reasoningMessageOpen = false;
+    active.lastFinalizedMessageText = finalText;
+    active.lastFinalizedMessageReasoning = finalReasoning;
+    const phase = piAssistantPhase(value);
+    active.onEvent({ type: "message.completed", messageId, ...(phase ? { phase } : {}) });
+  }
+
+  #write(value: Record<string, unknown>): Promise<void> {
+    const child = this.#child;
+    if (!child?.stdin.writable || this.#closed || this.#failed) {
+      return Promise.reject(new Error("Pi RPC stdin is unavailable"));
+    }
+    return new Promise((resolve, reject) => {
+      const frame = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+      child.stdin.write(frame, (error) => (error ? reject(error) : resolve()));
+    });
+  }
+
+  #send(
+    type: string,
+    payload: Record<string, unknown>,
+    onResponse?: () => void,
+    timeoutMs = this.#options.commandTimeoutMs,
+  ): Promise<Record<string, unknown>> {
+    const child = this.#child;
+    if (!child?.stdin.writable || this.#closed || this.#failed) {
+      return Promise.reject(new Error("Pi RPC stdin is unavailable"));
+    }
+    const id = `codexhost-${randomUUID()}`;
+    return new Promise((resolve, reject) => {
+      const pending: PendingCommand = {
+        command: type,
+        resolve: (response) => {
+          onResponse?.();
+          resolve(response);
+        },
+        reject,
+        timeout: null,
+      };
+      this.#pending.set(id, pending);
+      this.#armCommandTimeout(id, pending, timeoutMs);
+      const frame = Buffer.from(`${JSON.stringify({ id, type, ...payload })}\n`, "utf8");
+      child.stdin.write(frame, (error) => {
+        if (error) {
+          if (pending.timeout) clearTimeout(pending.timeout);
+          this.#pending.delete(id);
+          reject(error);
+        }
+      });
+    });
+  }
+
+  #armCommandTimeout(
+    id: string,
+    pending: PendingCommand,
+    timeoutMs = this.#options.commandTimeoutMs,
+  ): void {
+    if (
+      pending.timeout ||
+      this.#pending.get(id) !== pending ||
+      ((pending.command === "prompt" || pending.command === "compact") && this.#compactionActive)
+    ) {
+      return;
+    }
+    pending.timeout = setTimeout(() => {
+      if (this.#pending.get(id) !== pending) return;
+      pending.timeout = null;
+      const error = new Error(`Pi RPC '${pending.command}' command timed out`);
+      if (pending.command !== "prompt" && pending.command !== "steer") {
+        this.#pending.delete(id);
+        // A timed-out Abort also enters recovery, where native idle is proved separately.
+        if (READ_ONLY_COMMANDS.has(pending.command) || pending.command === "abort") {
+          this.#rememberExpiredCommand(id);
+        }
+        pending.reject(error);
+        return;
+      }
+      const fault = new PiRpcFaultError("protocolError", error.message);
+      void this.#faultAfterProcessCleanup(
+        fault,
+        pending.command === "steer"
+          ? "Pi RPC timed-out Steer cleanup failed"
+          : "Pi RPC timed-out Prompt cleanup failed",
+      );
+    }, timeoutMs);
+  }
+
+  #rememberExpiredCommand(id: string): void {
+    this.#expired.add(id);
+    if (this.#expired.size > MAX_EXPIRED_IDS) {
+      this.#expired.delete(this.#expired.values().next().value as string);
+    }
+  }
+
+  async #faultAfterProcessCleanup(fault: PiRpcFaultError, context: string): Promise<void> {
+    if (this.#closed || this.#failed) return;
+    this.#failed = true;
+    this.#closed = true;
+    for (const pending of this.#pending.values()) {
+      if (pending.timeout) clearTimeout(pending.timeout);
+      pending.timeout = null;
+    }
+    let finalFault = fault;
+    try {
+      await this.close();
+    } catch (error) {
+      finalFault = new PiRpcFaultError("processExited", `${context}: ${message(error)}`);
+    }
+    this.#rejectAll(finalFault);
+    this.#options.onFault?.(finalFault);
+  }
+
+  #closeInteractions(active: ActiveTurn, reason: "cancelled" | "expired" | "superseded"): void {
+    for (const [requestId, pending] of active.interactions) {
+      active.interactions.delete(requestId);
+      if (pending.timeout) clearTimeout(pending.timeout);
+      active.onEvent({
+        type: "interaction.closed",
+        requestId,
+        reason,
+      });
+    }
+  }
+
+  #rejectActiveTurn(error: Error): void {
+    const active = this.#activeTurn;
+    if (!active) return;
+    if (active.cancellationTimeout) clearTimeout(active.cancellationTimeout);
+    this.#closeInteractions(active, "cancelled");
+    this.#activeTurn = null;
+    if (active.origin === "autonomous") {
+      this.#emitAutonomousTurn(active, { status: "failed", text: active.text, error });
+    } else {
+      active.reject(error);
+    }
+    this.#drainDeferredRunFrames();
+  }
+
+  #rejectAll(error: Error): void {
+    for (const waiter of this.#runWaiters) waiter.reject(error);
+    this.#deferredRunFrames = [];
+    this.#deferredRunBytes = 0;
+    this.#subagents.close(error);
+    this.#gotgenesHandler = undefined;
+    this.#gotgenesLatest = undefined;
+    for (const pending of this.#pending.values()) {
+      if (pending.timeout) clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.#pending.clear();
+    const manual = this.#manualCompaction;
+    this.#manualCompaction = null;
+    manual?.reject(error);
+    this.#rejectActiveTurn(error);
+  }
+
+  #fail(error: PiRpcFaultError): void {
+    if (this.#closed || this.#failed) return;
+    this.#failed = true;
+    this.#clearCancellationRecovery();
+    this.#rejectAll(error);
+    this.#options.onFault?.(error);
+  }
+}

@@ -1,0 +1,847 @@
+import {
+  createUsageStatisticsPage,
+  type RendererUsageStatisticsHostsProvider,
+  type RendererUsageStatisticsRequest,
+} from "../console/pages/usage-statistics.js";
+import { consoleMessages } from "../console/messages.js";
+import { createRemoteConnectionsPage } from "./remote-connections-page.js";
+import { createMobileWebPage } from "./mobile-web-page.js";
+import type { RemoteConnectionsControl } from "../remote-connections-control.js";
+import type {
+  ReleaseAnnouncement,
+  ReleaseAnnouncementAcknowledgeParams,
+  ReleaseAnnouncementGetParams,
+  ReleaseAnnouncementGetResult,
+  UpdateCheckResult,
+  UpdateInstallation,
+  UpdateStartResult,
+  UpdateStatus,
+  UpdateStatusResult,
+} from "@codexhost/shared-contracts";
+
+import {
+  createRendererSettingsPageRegistry,
+  type RendererSettingsPageDefinition,
+  type RendererSettingsPageMountContext,
+  type RendererSettingsPageRegistry,
+} from "./core.js";
+import { createRendererSettingsIcon, type RendererSettingsIconName } from "./icons.js";
+import {
+  DEFAULT_RENDERER_SETTINGS_MESSAGES,
+  type RendererSettingsMessages,
+} from "./localization.js";
+import {
+  createConnectionsSettingsPage,
+  type RendererConnectionDiagnostics,
+} from "./connections-page.js";
+import {
+  createSessionImportSettingsPage,
+  type RendererSessionImportClient,
+  type RendererImportedThreadOpener,
+} from "./session-import-page.js";
+import { createAppearanceSettingsPage } from "./appearance-page.js";
+import {
+  createDesktopExtensionsSettingsPage,
+  type RendererDesktopExtensionsClient,
+} from "./desktop-extensions-page.js";
+import type { RendererSettingsPluginPagesSource } from "./desktop-extension-settings-pages.js";
+import type { LoadedSessionsClient } from "./loaded-sessions-table.js";
+import { createReleaseNotesElement } from "./release-notes.js";
+import {
+  openReleaseAnnouncementDialog,
+  type ReleaseAnnouncementDialogHandle,
+} from "./release-announcement-dialog.js";
+import { createAccountsSettingsPage, type RendererCodexAccountClient } from "./accounts-page.js";
+import { createDelegationSettingsPage, type RendererDelegationClient } from "./delegation-page.js";
+import {
+  createHarnessSchedulesPage,
+  type HarnessSchedulesPageOptions,
+} from "./harness-schedules-page.js";
+
+export type {
+  RendererConnectionAgentSnapshot,
+  RendererConnectionDiagnostics,
+  RendererConnectionHostSnapshot,
+  RendererConnectionSnapshot,
+} from "./connections-page.js";
+import {
+  RendererUpdateRequestTimeoutError,
+  runBoundedRendererUpdateRequest,
+} from "./update-request.js";
+
+import { createRendererUpdateStatusPoll } from "./update-status-poll.js";
+import { describeUpdateFailure } from "./update-failure-messages.js";
+import { RendererRequestTransportError } from "../renderer-request-sender.js";
+
+export const CODEXHOST_GITHUB_REPOSITORY_URL = "https://github.com/BytePioneer-AI/codex-host";
+export const CODEXHOST_RELEASES_LATEST_URL = `${CODEXHOST_GITHUB_REPOSITORY_URL}/releases/latest`;
+export const CODEXHOST_NPM_MANUAL_UPDATE_COMMAND = "npm install -g @codexhost/cli@latest";
+
+interface RendererUserAgentData {
+  readonly platform?: string;
+  readonly architecture?: string;
+  readonly bitness?: string;
+}
+
+function rendererUserAgentData(navigator: Navigator): RendererUserAgentData | undefined {
+  return (navigator as Navigator & { userAgentData?: RendererUserAgentData }).userAgentData;
+}
+
+function isWindowsRenderer(window: Window | null | undefined): boolean {
+  const navigator = window?.navigator;
+  if (!navigator) return false;
+  const identity = `${rendererUserAgentData(navigator)?.platform ?? ""} ${navigator.platform ?? ""} ${navigator.userAgent}`;
+  return /windows|win32|win64/iu.test(identity);
+}
+
+function windowsInstallerDownloadUrl(window: Window | null | undefined, version: string): string {
+  const navigator = window?.navigator;
+  const hints = navigator ? rendererUserAgentData(navigator) : undefined;
+  const identity = `${hints?.architecture ?? ""} ${hints?.platform ?? ""} ${navigator?.platform ?? ""} ${navigator?.userAgent ?? ""}`;
+  const architecture = /arm64|aarch64|\barm\b/iu.test(identity) ? "arm64" : "x64";
+  return `https://github.com/BytePioneer-AI/codex-host/releases/download/v${version}/codexhost-${version}-windows-${architecture}.exe`;
+}
+
+export const DEFAULT_RENDERER_SETTINGS_PAGE_IDS = [
+  "connections",
+  "desktop-extensions",
+  "mobile-web",
+  "remote-connections",
+  "accounts",
+  "delegation",
+  "session-import",
+  "usage-statistics",
+  "appearance",
+  "updates",
+  "about",
+] as const;
+
+export type DefaultRendererSettingsPageId = (typeof DEFAULT_RENDERER_SETTINGS_PAGE_IDS)[number];
+
+export interface RendererUpdateClient {
+  checkUpdate(): Promise<UpdateCheckResult | null>;
+  startUpdate(): Promise<UpdateStartResult>;
+  readUpdateStatus(): Promise<UpdateStatusResult>;
+  getReleaseAnnouncement?(
+    params?: ReleaseAnnouncementGetParams,
+  ): Promise<ReleaseAnnouncementGetResult | null>;
+  acknowledgeReleaseAnnouncement?(params: ReleaseAnnouncementAcknowledgeParams): Promise<void>;
+  /** Opens the local codexhost console; absent on Hosts that cannot. */
+  openConsole?(): Promise<unknown>;
+  openWeb?(): Promise<unknown>;
+}
+
+function panelIconName(view: string): RendererSettingsIconName {
+  if (view === "failed" || view === "error") return "alert";
+  if (view === "unavailable") return "unavailable";
+  if (view === "current") return "check";
+  return "updates";
+}
+
+function createPanelHead(document: Document, view: string, title: string): HTMLElement {
+  const head = document.createElement("div");
+  head.className = "settings-update-panel__head";
+  const label = document.createElement("strong");
+  label.className = "settings-update-panel__title";
+  label.textContent = title;
+  head.append(createRendererSettingsIcon(panelIconName(view), 16), label);
+  return head;
+}
+
+function createPanelActions(document: Document, ...buttons: readonly HTMLElement[]): HTMLElement {
+  const actions = document.createElement("div");
+  actions.className = "settings-update-actions";
+  actions.append(...buttons);
+  return actions;
+}
+
+function installationLabel(
+  installation: UpdateInstallation | null,
+  messages: RendererSettingsMessages,
+): string {
+  if (installation === "npm") return messages.updateInstallationNpm;
+  if (installation === "windows-installer") {
+    return messages.updateInstallationWindowsInstaller;
+  }
+  if (installation === "macos-dmg") return messages.updateInstallationMacOsDmg;
+  if (installation === "linux-archive") return messages.updateInstallationLinuxArchive;
+  return messages.updateInstallationUnknown;
+}
+
+function isPendingStatus(status: UpdateStatus | null): boolean {
+  return status !== null && status.phase !== "succeeded" && status.phase !== "failed";
+}
+
+function statusMessage(
+  status: UpdateStatus | null,
+  messages: RendererSettingsMessages,
+): string | null {
+  if (!status) return null;
+  if (status.phase === "succeeded") return messages.updateSucceeded;
+  if (status.phase === "failed") return describeUpdateFailure(status.error, messages);
+  if (status.phase === "waiting-for-exit") return messages.updateWaitingForExit;
+  if (status.phase === "installing") {
+    return status.installation === "npm" ? messages.updateInstallingNpm : messages.updateInstalling;
+  }
+  if (status.phase === "restarting") return messages.updateRestarting;
+  if (status.phase === "downloading") return messages.updateDownloading;
+  return messages.updatePreparing;
+}
+
+function formatUpdateBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  const units = ["KB", "MB", "GB"];
+  let scaled = value;
+  let unit = "B";
+  for (const nextUnit of units) {
+    scaled /= 1024;
+    unit = nextUnit;
+    if (scaled < 1024 || nextUnit === units.at(-1)) break;
+  }
+  return `${scaled.toFixed(scaled >= 10 ? 0 : 1)} ${unit}`;
+}
+
+function consoleSection(
+  document: Document,
+  messages: RendererSettingsMessages,
+  client: RendererUpdateClient | null,
+): HTMLElement | null {
+  if (!client?.openConsole) return null;
+  const openConsole = client.openConsole.bind(client);
+  const section = document.createElement("div");
+  section.className = "settings-about-repository";
+  const copy = document.createElement("p");
+  copy.textContent = messages.aboutConsole;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "settings-command-button settings-command-button--secondary";
+  button.textContent = messages.aboutConsoleOpen;
+  const status = document.createElement("p");
+  status.setAttribute("role", "status");
+  status.hidden = true;
+  button.addEventListener("click", () => {
+    button.disabled = true;
+    button.textContent = messages.aboutConsoleOpening;
+    status.hidden = true;
+    void openConsole()
+      .catch((error: unknown) => {
+        status.textContent = `${messages.aboutConsoleFailed}: ${error instanceof Error ? error.message : String(error)}`;
+        status.hidden = false;
+      })
+      .finally(() => {
+        button.disabled = false;
+        button.textContent = messages.aboutConsoleOpen;
+      });
+  });
+  section.append(copy, button, status);
+  return section;
+}
+
+function aboutPage(
+  messages: RendererSettingsMessages,
+  getClient: () => RendererUpdateClient | null = () => null,
+): RendererSettingsPageDefinition {
+  return Object.freeze({
+    id: "about",
+    label: messages.pageLabels.about,
+    icon: "about",
+    mount(context: RendererSettingsPageMountContext) {
+      const document = context.content.ownerDocument;
+      const heading = document.createElement("div");
+      heading.className = "settings-section-label";
+      heading.textContent = messages.pageLabels.about;
+
+      const panel = document.createElement("section");
+      panel.className = "settings-about-panel";
+      const product = document.createElement("strong");
+      product.className = "settings-about-product";
+      product.textContent = "CodexHost";
+      const tagline = document.createElement("strong");
+      tagline.className = "settings-about-tagline";
+      tagline.textContent = messages.aboutTagline;
+      const introduction = document.createElement("div");
+      introduction.className = "settings-about-copy";
+      for (const paragraphText of messages.aboutParagraphs) {
+        const paragraph = document.createElement("p");
+        paragraph.textContent = paragraphText;
+        introduction.append(paragraph);
+      }
+      const starCallout = document.createElement("p");
+      starCallout.className = "settings-about-star-callout";
+      starCallout.textContent = messages.aboutStarCallout;
+      const repositorySection = document.createElement("div");
+      repositorySection.className = "settings-about-repository";
+      const openSource = document.createElement("p");
+      openSource.textContent = messages.aboutOpenSource;
+      const repository = document.createElement("a");
+      repository.className = "settings-about-repository-link";
+      repository.href = CODEXHOST_GITHUB_REPOSITORY_URL;
+      repository.target = "_blank";
+      repository.rel = "noopener noreferrer";
+      const repositoryUrl = document.createElement("code");
+      repositoryUrl.textContent = CODEXHOST_GITHUB_REPOSITORY_URL;
+      repository.append(
+        createRendererSettingsIcon("external-link", 14),
+        messages.aboutRepository,
+        repositoryUrl,
+      );
+      repositorySection.append(openSource, repository);
+      panel.append(product, tagline, introduction, starCallout, repositorySection);
+      const consoleEntry = consoleSection(document, messages, getClient());
+      if (consoleEntry) panel.append(consoleEntry);
+      context.content.append(heading, panel);
+      return undefined;
+    },
+  });
+}
+
+function updateStarBanner(document: Document, messages: RendererSettingsMessages): HTMLElement {
+  const banner = document.createElement("div");
+  banner.className = "settings-update-star";
+  const copy = document.createElement("p");
+  copy.className = "settings-update-star__copy";
+  copy.textContent = messages.updateStarCallout;
+  const link = document.createElement("a");
+  link.className = "settings-update-link settings-update-star__link";
+  link.href = CODEXHOST_GITHUB_REPOSITORY_URL;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  const star = createRendererSettingsIcon("star", 14);
+  star.classList.add("settings-update-star__mark");
+  link.append(createRendererSettingsIcon("github", 15), messages.updateStarLink, star);
+  banner.append(copy, link);
+  return banner;
+}
+
+function updatesPage(
+  messages: RendererSettingsMessages,
+  getClient: () => RendererUpdateClient | null,
+): RendererSettingsPageDefinition {
+  return Object.freeze({
+    id: "updates",
+    label: messages.pageLabels.updates,
+    icon: "updates",
+    mount(context: RendererSettingsPageMountContext) {
+      const document = context.content.ownerDocument;
+      const windows = isWindowsRenderer(document.defaultView);
+      const header = document.createElement("div");
+      header.className = "settings-update-header";
+      const heading = document.createElement("div");
+      heading.className = "settings-section-label";
+      heading.textContent = messages.pageLabels.updates;
+      const announcementButton = document.createElement("button");
+      announcementButton.type = "button";
+      announcementButton.className = "settings-command-button settings-command-button--secondary";
+      announcementButton.hidden = true;
+      announcementButton.append(
+        createRendererSettingsIcon("sparkles", 14),
+        messages.updateViewAnnouncement,
+      );
+      header.append(heading, announcementButton);
+
+      let currentAnnouncement: ReleaseAnnouncement | null = null;
+      let announcementDialog: ReleaseAnnouncementDialogHandle | null = null;
+      announcementButton.addEventListener("click", () => {
+        if (!currentAnnouncement || context.signal.aborted) return;
+        const rootNode = context.content.getRootNode();
+        const hostScheme =
+          rootNode instanceof ShadowRoot && rootNode.host instanceof HTMLElement
+            ? rootNode.host.style.colorScheme
+            : "";
+        const colorScheme =
+          hostScheme === "light" || hostScheme === "dark" ? hostScheme : "inherit";
+        announcementDialog?.dispose();
+        announcementDialog = openReleaseAnnouncementDialog({
+          announcement: currentAnnouncement,
+          locale: messages.locale,
+          ownerDocument: document,
+          colorScheme,
+          onClose() {
+            announcementDialog = null;
+          },
+        });
+      });
+
+      // Version summary: current, latest, and installation sit side by side so the
+      // comparison is readable without scrolling.
+      const metadata = document.createElement("div");
+      metadata.className = "settings-update-metadata";
+      const createMetadataItem = (label: string): HTMLElement => {
+        const item = document.createElement("div");
+        item.className = "settings-update-metadata__item";
+        const name = document.createElement("span");
+        name.textContent = label;
+        const value = document.createElement("strong");
+        value.textContent = "-";
+        item.append(name, value);
+        metadata.append(item);
+        return value;
+      };
+      const currentVersionValue = createMetadataItem(messages.updateCurrentVersion);
+      const latestVersionValue = createMetadataItem(messages.updateLatestVersion);
+      const installationValue = createMetadataItem(messages.updateInstallation);
+
+      const panel = document.createElement("section");
+      panel.className = "settings-update-panel";
+      panel.setAttribute("aria-live", "polite");
+
+      // Manual update stays visible directly under the status panel: automatic
+      // updates can fail for reasons local to the machine, and the fallback path
+      // should never be more than a glance away.
+      const controls = document.createElement("div");
+      controls.className = "settings-update-controls";
+      const manualTitle = document.createElement("div");
+      manualTitle.className = "settings-update-manual-title";
+      manualTitle.textContent = messages.updateManualTitle;
+      const manualNpm = document.createElement("div");
+      manualNpm.className = "settings-update-manual";
+      manualNpm.hidden = true;
+      const manualNpmDescription = document.createElement("p");
+      manualNpmDescription.className = "settings-update-manual-description";
+      manualNpmDescription.textContent = messages.updateManualNpmDescription;
+      const manualNpmCommandRow = document.createElement("div");
+      manualNpmCommandRow.className = "settings-update-command";
+      const manualNpmCommand = document.createElement("code");
+      manualNpmCommand.textContent = CODEXHOST_NPM_MANUAL_UPDATE_COMMAND;
+      const copyCommand = document.createElement("button");
+      copyCommand.type = "button";
+      copyCommand.className = "settings-update-command__copy";
+      const setCopyLabel = (label: string): void => {
+        copyCommand.replaceChildren(createRendererSettingsIcon("copy", 14), label);
+      };
+      setCopyLabel(messages.updateCopyCommand);
+      copyCommand.addEventListener("click", () => {
+        const clipboard = document.defaultView?.navigator.clipboard;
+        const restore = (label: string): void => {
+          setCopyLabel(label);
+          document.defaultView?.setTimeout(() => setCopyLabel(messages.updateCopyCommand), 2_000);
+        };
+        if (!clipboard) {
+          restore(messages.updateCopyFailed);
+          return;
+        }
+        void clipboard.writeText(CODEXHOST_NPM_MANUAL_UPDATE_COMMAND).then(
+          () => restore(messages.updateCommandCopied),
+          () => restore(messages.updateCopyFailed),
+        );
+      });
+      manualNpmCommandRow.append(manualNpmCommand, copyCommand);
+      manualNpm.append(manualNpmDescription, manualNpmCommandRow);
+      const manualWindowsInstaller = document.createElement("div");
+      manualWindowsInstaller.className = "settings-update-manual";
+      manualWindowsInstaller.hidden = true;
+      const manualWindowsInstallerDescription = document.createElement("p");
+      manualWindowsInstallerDescription.className = "settings-update-manual-description";
+      manualWindowsInstallerDescription.textContent = messages.updateWindowsInstallerDescription;
+      const manualWindowsInstallerActions = document.createElement("div");
+      manualWindowsInstallerActions.className = "settings-update-actions";
+      const manualWindowsInstallerLink = document.createElement("a");
+      manualWindowsInstallerLink.className = "settings-update-link";
+      manualWindowsInstallerLink.href = CODEXHOST_RELEASES_LATEST_URL;
+      manualWindowsInstallerLink.target = "_blank";
+      manualWindowsInstallerLink.rel = "noopener noreferrer";
+      manualWindowsInstallerLink.append(
+        messages.updateDownloadWindowsInstaller,
+        createRendererSettingsIcon("external-link", 14),
+      );
+      manualWindowsInstallerActions.append(manualWindowsInstallerLink);
+      manualWindowsInstaller.append(
+        manualWindowsInstallerDescription,
+        manualWindowsInstallerActions,
+      );
+      const actions = document.createElement("div");
+      actions.className = "settings-update-actions";
+      const releaseLink = document.createElement("a");
+      releaseLink.className = "settings-update-link";
+      releaseLink.href = CODEXHOST_RELEASES_LATEST_URL;
+      releaseLink.target = "_blank";
+      releaseLink.rel = "noopener noreferrer";
+      releaseLink.append(
+        messages.updateDownloadFromReleases,
+        createRendererSettingsIcon("external-link", 14),
+      );
+      actions.append(releaseLink);
+      controls.append(manualTitle, manualNpm, manualWindowsInstaller, actions);
+
+      // Release notes render below the fold, in the page scroller rather than a
+      // nested one. The Star banner stays above them so it remains visible
+      // without scrolling past the notes.
+      const notes = document.createElement("div");
+      notes.className = "settings-update-notes-section";
+      const starBanner = updateStarBanner(document, messages);
+
+      context.content.append(header, metadata, panel, controls, starBanner, notes);
+
+      // Presentation-only: emphasise the manual path once the automatic one has
+      // visibly failed.
+      const setManualFallback = (fallback: boolean): void => {
+        // While automatic update works, manual download is a one-line escape hatch;
+        // once it fails, the section returns at full weight.
+        controls.className = fallback
+          ? "settings-update-controls"
+          : "settings-update-controls is-quiet";
+        manualNpmDescription.textContent = fallback
+          ? messages.updateManualFallbackDescription
+          : messages.updateManualNpmDescription;
+        manualNpmDescription.className = fallback
+          ? "settings-update-manual-description is-fallback"
+          : "settings-update-manual-description";
+      };
+      let pending = false;
+      let checkedStatus: UpdateStatus | null = null;
+      const statusPoll = createRendererUpdateStatusPoll(context, {
+        status(status) {
+          const message = statusMessage(status, messages);
+          if (message) renderPendingStatus(status, message);
+          if (status?.phase === "succeeded") {
+            currentVersionValue.textContent = `v${status.version}`;
+            latestVersionValue.className = "";
+          }
+        },
+        reconnecting() {
+          renderPendingStatus(null, messages.updateReconnecting);
+        },
+        unavailable() {
+          renderPendingStatus(null, messages.updateResultUnavailable, "unavailable");
+        },
+      });
+
+      // Unavailable can follow a rendered check (Retry after an error), so it
+      // restores the metadata and manual controls to their unchecked state.
+      const renderUnavailable = (detail: string): void => {
+        currentVersionValue.textContent = "-";
+        latestVersionValue.textContent = "-";
+        latestVersionValue.className = "";
+        installationValue.textContent = "-";
+        manualTitle.hidden = false;
+        manualNpm.hidden = true;
+        manualWindowsInstaller.hidden = true;
+        manualWindowsInstallerLink.href = CODEXHOST_RELEASES_LATEST_URL;
+        releaseLink.hidden = false;
+        releaseLink.href = CODEXHOST_RELEASES_LATEST_URL;
+        controls.className = "settings-update-controls";
+        panel.dataset.updateState = "unavailable";
+        delete panel.dataset.inline;
+        panel.replaceChildren();
+        const copy = document.createElement("p");
+        copy.className = "settings-update-summary";
+        copy.textContent = detail;
+        panel.append(createPanelHead(document, "unavailable", messages.notAvailable), copy);
+        notes.replaceChildren();
+      };
+
+      // Failed requests point at the manual download without exposing internal
+      // detail. An interrupted start response cannot establish the outcome;
+      // status reads can recover it without submitting another update.
+      const renderRequestFailure = (error: unknown): void => {
+        console.error("codexhost update request failed", error);
+        renderPendingStatus(
+          null,
+          error instanceof RendererUpdateRequestTimeoutError
+            ? messages.updateRequestTimeout
+            : messages.updateServiceUnavailable,
+          "failed",
+        );
+      };
+
+      const appendServiceStopOutput = (status: UpdateStatus | null): void => {
+        if (!status?.serviceStopOutput) return;
+        const output = document.createElement("pre");
+        output.className = "settings-update-service-stop-output";
+        output.textContent = status.serviceStopOutput;
+        panel.append(output);
+      };
+
+      const renderPendingStatus = (
+        status: UpdateStatus | null,
+        message: string,
+        viewPhase: UpdateStatus["phase"] | "pending" | "unavailable" = status?.phase ?? "pending",
+      ): void => {
+        panel.dataset.updateState = viewPhase;
+        delete panel.dataset.inline;
+        panel.replaceChildren();
+        panel.append(createPanelHead(document, viewPhase, message));
+        appendServiceStopOutput(status);
+        setManualFallback(viewPhase === "failed");
+        if (
+          status?.phase === "downloading" &&
+          status.totalBytes !== undefined &&
+          status.downloadedBytes !== undefined
+        ) {
+          const progress = document.createElement("progress");
+          progress.className = "settings-update-progress";
+          progress.max = status.totalBytes;
+          progress.value = Math.min(status.downloadedBytes, status.totalBytes);
+          progress.setAttribute("aria-label", messages.updateDownloading);
+          const detail = document.createElement("span");
+          detail.className = "settings-update-progress-detail";
+          const percent = Math.min(
+            100,
+            Math.round((status.downloadedBytes / status.totalBytes) * 1000) / 10,
+          );
+          detail.textContent = `${percent}% · ${formatUpdateBytes(status.downloadedBytes)} / ${formatUpdateBytes(status.totalBytes)}`;
+          panel.append(progress, detail);
+        }
+      };
+
+      const start = (client: RendererUpdateClient): void => {
+        if (pending) return;
+        pending = true;
+        const previousStatus = checkedStatus;
+        renderPendingStatus(null, messages.updatePreparing);
+        void context.runLatest(
+          (signal) => runBoundedRendererUpdateRequest(() => client.startUpdate(), signal),
+          {
+            success(result) {
+              pending = false;
+              renderPendingStatus(
+                result.status,
+                statusMessage(result.status, messages) ?? messages.updatePreparing,
+              );
+              if (isPendingStatus(result.status)) statusPoll.start(() => client.readUpdateStatus());
+            },
+            failure(error) {
+              pending = false;
+              if (
+                error instanceof RendererUpdateRequestTimeoutError ||
+                error instanceof RendererRequestTransportError
+              ) {
+                renderPendingStatus(null, messages.updateReconnecting);
+                statusPoll.start(() => client.readUpdateStatus(), previousStatus);
+              } else {
+                renderRequestFailure(error);
+              }
+            },
+          },
+        );
+      };
+
+      const renderCheck = (
+        result: UpdateCheckResult | null,
+        client: RendererUpdateClient,
+      ): void => {
+        if (result === null) {
+          renderUnavailable(messages.runtimeCapabilityNotInstalled);
+          return;
+        }
+        checkedStatus = result.status;
+        currentVersionValue.textContent = `v${result.currentVersion}`;
+        latestVersionValue.textContent = result.latestVersion ? `v${result.latestVersion}` : "-";
+        latestVersionValue.className = result.updateAvailable
+          ? "settings-update-metadata__value--newer"
+          : "";
+        installationValue.textContent = installationLabel(result.installation, messages);
+        manualNpm.hidden = result.installation !== "npm";
+        manualWindowsInstaller.hidden = !windows || result.installation !== "windows-installer";
+        releaseLink.hidden = windows;
+        manualTitle.hidden =
+          windows && !["npm", "windows-installer"].includes(result.installation ?? "");
+        if (windows && result.installation === "windows-installer" && result.latestVersion) {
+          manualWindowsInstallerLink.href = windowsInstallerDownloadUrl(
+            document.defaultView,
+            result.latestVersion,
+          );
+        }
+        if (result.releaseNotesUrl) releaseLink.href = result.releaseNotesUrl;
+        const operationMessage = statusMessage(result.status, messages);
+        if (isPendingStatus(result.status)) {
+          renderPendingStatus(result.status, operationMessage ?? messages.updatePreparing);
+          statusPoll.start(() => client.readUpdateStatus());
+          return;
+        }
+        const actionableStatus =
+          result.status?.phase === "failed" && result.status.version === result.latestVersion
+            ? result.status
+            : null;
+        const view = result.error ? "error" : result.updateAvailable ? "available" : "current";
+        panel.dataset.updateState = view;
+        panel.replaceChildren();
+        setManualFallback(Boolean(result.error) || actionableStatus !== null);
+        // Every state gets a status line; a bare button in an empty card reads as unfinished.
+        const inlineUpdate = !result.error && !actionableStatus && result.updateAvailable;
+        if (inlineUpdate) panel.dataset.inline = "";
+        else delete panel.dataset.inline;
+        panel.append(
+          createPanelHead(
+            document,
+            view,
+            actionableStatus
+              ? (statusMessage(actionableStatus, messages) ?? messages.updateFailed)
+              : result.error
+                ? messages.updateFailed
+                : result.updateAvailable
+                  ? // Not installable without an error: the npm registry has not synced it yet.
+                    result.installationAvailable
+                    ? messages.updateAvailable
+                    : messages.updateWaitingForRegistry
+                  : messages.updateUpToDate,
+          ),
+        );
+        appendServiceStopOutput(result.status);
+        if (actionableStatus?.error) {
+          const error = document.createElement("p");
+          error.className = "settings-update-error";
+          error.textContent = actionableStatus.error;
+          panel.append(error);
+        }
+        if (result.error) {
+          const error = document.createElement("p");
+          error.className = "settings-update-error";
+          error.textContent = result.error;
+          panel.append(error);
+        }
+        const buttons: HTMLElement[] = [];
+        if (result.updateAvailable && result.installationAvailable) {
+          const update = document.createElement("button");
+          update.type = "button";
+          update.className = "settings-command-button";
+          update.append(createRendererSettingsIcon("updates", 16), messages.updateAndRestart);
+          update.addEventListener("click", () => start(client));
+          buttons.push(update);
+        }
+        if (result.error) {
+          const retry = document.createElement("button");
+          retry.type = "button";
+          retry.className = "settings-command-button settings-command-button--secondary";
+          retry.append(createRendererSettingsIcon("refresh", 16), messages.updateRetry);
+          retry.addEventListener("click", () => void load());
+          buttons.push(retry);
+        }
+        if (buttons.length > 0) panel.append(createPanelActions(document, ...buttons));
+        notes.replaceChildren();
+        if (result.releaseNotes) {
+          notes.append(createReleaseNotesElement(document, result.releaseNotes));
+        }
+      };
+
+      const load = (): Promise<void> => {
+        const client = getClient();
+        if (!client) {
+          renderUnavailable(messages.runtimeCapabilityNotInstalled);
+          return Promise.resolve();
+        }
+        pending = true;
+        renderPendingStatus(null, messages.updateChecking);
+        return context.runLatest(
+          (signal) => runBoundedRendererUpdateRequest(() => client.checkUpdate(), signal),
+          {
+            success(result) {
+              pending = false;
+              renderCheck(result, client);
+            },
+            failure(error) {
+              pending = false;
+              renderRequestFailure(error);
+            },
+          },
+        );
+      };
+
+      const loadAnnouncement = (): void => {
+        const client = getClient();
+        if (!client?.getReleaseAnnouncement) return;
+        void client
+          .getReleaseAnnouncement({ manual: true })
+          .then((result) => {
+            if (context.signal.aborted || !result?.announcement) return;
+            currentAnnouncement = result.announcement;
+            announcementButton.hidden = false;
+          })
+          .catch(() => {
+            // Unimplemented RPC or missing release keeps the manual entry hidden.
+          });
+      };
+
+      void load();
+      loadAnnouncement();
+      return () => {
+        announcementDialog?.dispose();
+        announcementDialog = null;
+        statusPoll.dispose();
+      };
+    },
+  });
+}
+
+export function createDefaultRendererSettingsPages(
+  messages: RendererSettingsMessages = DEFAULT_RENDERER_SETTINGS_MESSAGES,
+  getUpdateClient: () => RendererUpdateClient | null = () => null,
+  getDiagnostics: () => RendererConnectionDiagnostics | null = () => null,
+  getAccountClient: () => RendererCodexAccountClient | null = () => null,
+  getSessionImportClient: (hostId?: string) => RendererSessionImportClient | null = () => null,
+  openImportedThread: RendererImportedThreadOpener | null = () =>
+    Promise.reject(new Error("Imported Thread navigation is unavailable")),
+  getLoadedSessionsClient: () => LoadedSessionsClient | null = () => null,
+  getRemoteConnections: () => RemoteConnectionsControl | null = () => null,
+  requestUsageStatistics: RendererUsageStatisticsRequest = () =>
+    Promise.reject(new Error("Local Host connection is unavailable")),
+  usageStatisticsHosts?: RendererUsageStatisticsHostsProvider,
+  harnessSchedules?: HarnessSchedulesPageOptions,
+  getDesktopExtensionsClient: () => RendererDesktopExtensionsClient | null = () => null,
+  pluginPages?: RendererSettingsPluginPagesSource,
+  getDelegationClient: () => RendererDelegationClient | null = () => null,
+): readonly RendererSettingsPageDefinition[] {
+  return Object.freeze([
+    createConnectionsSettingsPage(messages, getDiagnostics, undefined, getRemoteConnections),
+    createDesktopExtensionsSettingsPage(messages, getDesktopExtensionsClient, pluginPages),
+    createMobileWebPage(messages, () => {
+      const client = getUpdateClient();
+      return client?.openWeb?.bind(client);
+    }),
+    createRemoteConnectionsPage(messages, getRemoteConnections),
+    createAccountsSettingsPage(messages, getAccountClient),
+    createDelegationSettingsPage(messages, getDiagnostics, getDelegationClient),
+    ...(harnessSchedules ? [createHarnessSchedulesPage(messages, harnessSchedules)] : []),
+    createSessionImportSettingsPage(
+      messages,
+      getSessionImportClient,
+      openImportedThread,
+      getDiagnostics,
+    ),
+    createUsageStatisticsPage(
+      consoleMessages(messages.locale),
+      requestUsageStatistics,
+      messages.locale,
+      usageStatisticsHosts,
+    ),
+    createAppearanceSettingsPage(messages, getLoadedSessionsClient),
+    updatesPage(messages, getUpdateClient),
+    aboutPage(messages, getUpdateClient),
+  ]);
+}
+
+export function createDefaultRendererSettingsRegistry(
+  messages: RendererSettingsMessages = DEFAULT_RENDERER_SETTINGS_MESSAGES,
+  getUpdateClient: () => RendererUpdateClient | null = () => null,
+  getDiagnostics: () => RendererConnectionDiagnostics | null = () => null,
+  getAccountClient: () => RendererCodexAccountClient | null = () => null,
+  getSessionImportClient: (hostId?: string) => RendererSessionImportClient | null = () => null,
+  openImportedThread?: RendererImportedThreadOpener,
+  requestUsageStatistics?: RendererUsageStatisticsRequest,
+  usageStatisticsHosts?: RendererUsageStatisticsHostsProvider,
+  getDesktopExtensionsClient?: () => RendererDesktopExtensionsClient | null,
+  getDelegationClient?: () => RendererDelegationClient | null,
+): RendererSettingsPageRegistry {
+  return createRendererSettingsPageRegistry(
+    createDefaultRendererSettingsPages(
+      messages,
+      getUpdateClient,
+      getDiagnostics,
+      getAccountClient,
+      getSessionImportClient,
+      openImportedThread,
+      undefined,
+      undefined,
+      requestUsageStatistics,
+      usageStatisticsHosts,
+      undefined,
+      getDesktopExtensionsClient,
+      undefined,
+      getDelegationClient,
+    ),
+  );
+}
+
+export type { RendererCodexAccountClient } from "./accounts-page.js";
+export type { RendererDelegationClient } from "./delegation-page.js";
+export type { RendererDesktopExtensionsClient } from "./desktop-extensions-page.js";

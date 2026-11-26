@@ -1,0 +1,206 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  decodeThreadForkRequest,
+  decodeThreadRevertRequest,
+  decodeThreadRollbackRequest,
+  mapExternalThreadHarnessError,
+  threadForkResult,
+  threadRevertResult,
+  threadRollbackResult,
+} from "../src/index.js";
+
+describe("Codex thread/fork protocol boundary", () => {
+  it("decodes current inclusive, exclusive, and tail request fields", () => {
+    expect(
+      decodeThreadForkRequest({
+        id: 1,
+        method: "thread/fork",
+        params: {
+          threadId: "thread-1",
+          lastTurnId: "turn-1",
+          path: "",
+          model: "pi-native",
+          modelProvider: "codexhost",
+          cwd: "/workspace",
+          excludeTurns: true,
+          runtimeWorkspaceRoots: ["/workspace"],
+          approvalPolicy: "never",
+          sandbox: "workspace-write",
+        },
+      }),
+    ).toEqual({
+      threadId: "thread-1",
+      lastTurnId: "turn-1",
+      model: "pi-native",
+      modelProvider: "codexhost",
+      cwd: "/workspace",
+      excludeTurns: true,
+      runtimeWorkspaceRoots: ["/workspace"],
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+    });
+    expect(
+      decodeThreadForkRequest({
+        id: 2,
+        method: "thread/fork",
+        params: { threadId: "thread-1", beforeTurnId: "turn-2" },
+      }),
+    ).toMatchObject({ beforeTurnId: "turn-2", excludeTurns: false });
+    expect(
+      decodeThreadForkRequest({
+        id: 4,
+        method: "thread/fork",
+        params: { threadId: "thread-1", attachToSource: true, excludeTurns: true },
+      }),
+    ).toMatchObject({ attachToSource: true, excludeTurns: true });
+    expect(decodeThreadForkRequest({ id: 3, method: "thread/read", params: {} })).toBeNull();
+  });
+
+  it("rejects conflicting or malformed external Fork boundaries", () => {
+    expect(() =>
+      decodeThreadForkRequest({
+        id: 1,
+        method: "thread/fork",
+        params: { threadId: "thread-1", lastTurnId: "one", beforeTurnId: "two" },
+      }),
+    ).toThrow("cannot combine");
+    expect(() =>
+      decodeThreadForkRequest({
+        id: 2,
+        method: "thread/fork",
+        params: { threadId: "thread-1", excludeTurns: "yes" },
+      }),
+    ).toThrow("excludeTurns must be boolean");
+    expect(() =>
+      decodeThreadForkRequest({
+        id: 3,
+        method: "thread/fork",
+        params: { threadId: "thread-1", attachToSource: true, ephemeral: true },
+      }),
+    ).toThrow("cannot combine attachToSource with ephemeral");
+  });
+
+  it("decodes the current paginated thread/revert boundary", () => {
+    expect(
+      decodeThreadRevertRequest({
+        id: 4,
+        method: "thread/revert",
+        params: { threadId: "thread-1", beforeTurnId: "turn-2" },
+      }),
+    ).toEqual({ threadId: "thread-1", beforeTurnId: "turn-2" });
+    expect(decodeThreadRevertRequest({ id: 5, method: "thread/read", params: {} })).toBeNull();
+    for (const params of [
+      { threadId: "", beforeTurnId: "turn-2" },
+      { threadId: "thread-1", beforeTurnId: "" },
+      { threadId: "thread-1", beforeTurnId: 2 },
+    ]) {
+      expect(() => decodeThreadRevertRequest({ id: 6, method: "thread/revert", params })).toThrow();
+    }
+  });
+
+  it("decodes the current bounded thread/rollback request", () => {
+    expect(
+      decodeThreadRollbackRequest({
+        id: 4,
+        method: "thread/rollback",
+        params: { threadId: "derived-thread", numTurns: 2 },
+      }),
+    ).toEqual({ threadId: "derived-thread", numTurns: 2 });
+    expect(decodeThreadRollbackRequest({ id: 5, method: "thread/read", params: {} })).toBeNull();
+    for (const numTurns of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "2"]) {
+      expect(() =>
+        decodeThreadRollbackRequest({
+          id: 6,
+          method: "thread/rollback",
+          params: { threadId: "derived-thread", numTurns },
+        }),
+      ).toThrow("positive safe integer");
+    }
+  });
+
+  it("maps Harness failures to bounded external errors", () => {
+    expect(
+      mapExternalThreadHarnessError(
+        {
+          code: "sessionNotFound",
+          message: "D:/private/session.jsonl is missing",
+          retryable: false,
+        },
+        "resume",
+      ),
+    ).toEqual({ code: -32079, message: "External Native Session is unavailable" });
+    expect(
+      mapExternalThreadHarnessError(
+        { code: "checkpointNotFound", message: "native entry secret", retryable: false },
+        "fork",
+      ),
+    ).toEqual({ code: -32080, message: "External Fork Checkpoint is unavailable" });
+  });
+
+  it("maps missing Harness configuration without exposing native diagnostics", () => {
+    expect(
+      mapExternalThreadHarnessError(
+        {
+          code: "configurationRequired",
+          message: "private model configuration",
+          retryable: false,
+        },
+        "create",
+      ),
+    ).toEqual({ code: -32077, message: "External Harness is unavailable" });
+  });
+
+  it("explains a busy native resume without exposing diagnostics or changing active-Turn errors", () => {
+    const error = {
+      code: "sessionBusy" as const,
+      message: "private native Session path and diagnostics",
+      retryable: true,
+    };
+    expect(mapExternalThreadHarnessError(error, "resume")).toEqual({
+      code: -32072,
+      message:
+        "External Native Session is busy. Close it in the other client or wait for its active operation to finish, then retry.",
+    });
+    expect(mapExternalThreadHarnessError(error, "turn")).toEqual({
+      code: -32072,
+      message: "External Thread has an active operation",
+    });
+  });
+
+  it("builds the paginated ThreadRevertResponse without embedding history", () => {
+    expect(threadRevertResult({ id: "thread-1", turns: [{ id: "turn-1" }] })).toEqual({
+      thread: { id: "thread-1", turns: [] },
+    });
+  });
+
+  it("builds the current ThreadRollbackResponse envelope", () => {
+    expect(threadRollbackResult({ id: "derived", turns: [{}] })).toEqual({
+      thread: { id: "derived", turns: [{}] },
+    });
+  });
+
+  it("builds the current ThreadForkResponse envelope", () => {
+    expect(
+      threadForkResult(
+        { id: "derived", turns: [] },
+        {
+          model: "pi-native",
+          cwd: "/workspace",
+          runtimeWorkspaceRoots: ["/workspace"],
+          approvalPolicy: "never",
+          sandbox: { type: "workspaceWrite" },
+        },
+      ),
+    ).toMatchObject({
+      thread: { id: "derived", turns: [] },
+      model: "pi-native",
+      modelProvider: "codexhost",
+      cwd: "/workspace",
+      runtimeWorkspaceRoots: ["/workspace"],
+      instructionSources: [],
+      approvalsReviewer: "user",
+      multiAgentMode: "explicitRequestOnly",
+    });
+  });
+});

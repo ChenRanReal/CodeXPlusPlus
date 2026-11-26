@@ -1,0 +1,2775 @@
+import {
+  configureSubagentEvent,
+  configureSubagentSnapshot,
+  type SubagentConfiguration,
+} from "@codexhost/harness-adapter";
+import { createPiUsageStatistics } from "./pi-usage-statistics.js";
+import { fetchPiAccounts } from "./account-balance.js";
+import { createPiCredentialImports } from "./pi-credential-imports.js";
+import { PI_FAST_COMMAND, supportsPiFastModel } from "./pi-fast-mode.js";
+import { persistEmptyPiSession, readPiEmptySessionConfiguration } from "./pi-empty-session.js";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+
+import {
+  HarnessOutputChannel,
+  validateHostQuestionResponse,
+  type HarnessAdapter,
+  type HarnessCredentialImports,
+  type HarnessCommandAccepted,
+  type HarnessCommandCapability,
+  type HarnessCommandInvocation,
+  type HarnessError,
+  type HarnessInspection,
+  type HarnessModelRef,
+  type HarnessOutput,
+  type HarnessResult,
+  type HarnessSession,
+  type HarnessSessionCapabilities,
+  type HarnessSessionImportCapability,
+  type HarnessSubagentCapability,
+  type HarnessSessionState,
+  type HarnessThinkingOptionId,
+  type InspectHarnessInput,
+  type HostAgentMessageItem,
+  type HostCommand,
+  type HostCommandExecutionItem,
+  type HostContextCompactionItem,
+  type HostEvent,
+  type HostItem,
+  type HostItemOutcome,
+  type HostQuestionInteraction,
+  type HostReasoningItem,
+  type HostToolExecutionItem,
+  type HostToolOutput,
+  type InteractionRespondAccepted,
+  type InteractionRespondCommand,
+  type ModelSelectCommand,
+  type ModelSelectCompleted,
+  type OpenSessionInput,
+  type PermissionModeSelectCommand,
+  type PermissionModeSelectCompleted,
+  type HostThreadSnapshot,
+  type HostUsage,
+  type HostUsageRequest,
+  type ThinkingSelectCommand,
+  type ThinkingSelectCompleted,
+  type TurnCancelAccepted,
+  type TurnCancelCommand,
+  type TurnOutcome,
+  type TurnStartAccepted,
+  type TurnSteerAccepted,
+  type TurnSteerCommand,
+  type TurnStartCommand,
+} from "@codexhost/harness-adapter";
+import {
+  harnessCommandCatalogSchema,
+  type HarnessCommandCatalog,
+  harnessIdSchema,
+  harnessModelRefSchema,
+  harnessThinkingOptionIdSchema,
+  hostInteractionIdSchema,
+  hostItemIdSchema,
+  hostTurnIdSchema,
+  nativeCheckpointRefSchema,
+  nativeSessionRefSchema,
+  nativeTurnRefSchema,
+  sameHarnessModelRef,
+  type HarnessId,
+  type HostInteractionId,
+  type HostItemId,
+  type HostTurnId,
+  type JsonValue,
+  type NativeCheckpointRef,
+  type NativeSessionRef,
+  type NativeTurnRef,
+} from "@codexhost/shared-contracts";
+
+import { piMessageItemId, type PiMessageIdentity } from "./pi-message-item-id.js";
+import { resolvePiInspectCwd } from "./command.js";
+import { mapPiSnapshot, resolvePiForkBoundary, type PiSessionHistory } from "./pi-history.js";
+import { piToolFileChanges } from "./pi-file-change.js";
+import { piToolCommand } from "./pi-tool-command.js";
+import {
+  PiSubagents,
+  parsePiSubagentId,
+  piSubagentSnapshot,
+  type PiSubagentInspection,
+  type PiSubagentNode,
+} from "./pi-subagents.js";
+import { parsePiWorkflowSubagentId } from "./pi-subagent-workflow.js";
+import { readPiWorkflowChild } from "./pi-workflow-child-history.js";
+import {
+  parseGotgenesId,
+  type GotgenesRecord,
+  type GotgenesObservationOwner,
+} from "./pi-gotgenes-subagents.js";
+import { readGotgenesChild } from "./pi-gotgenes-history.js";
+import { restorePiSubagents } from "./pi-subagent-history.js";
+import { rollbackPiLastTurn } from "./pi-last-turn-rollback.js";
+import { PiSessionImportIndex } from "./pi-session-import.js";
+import { SessionImportScope } from "@codexhost/harness-adapter/session-import";
+import {
+  PiRpcFaultError,
+  PiRpcBusyError,
+  PiRpcSession,
+  PiRpcSteerRejectedError,
+  PiRpcSteerTargetEndedError,
+  PiRpcUnsupportedCommandError,
+  type PiInteractionRequest,
+  type PiInteractionResponse,
+  type PiRpcSessionOptions,
+  type PiSessionState,
+  type PiAutonomousTurn,
+  type PiAutonomousTurnLifecycle,
+  type PiCompactResult,
+  type PiTurnEvent,
+  type PiTurnResult,
+} from "./pi-rpc-session.js";
+import {
+  createPiModelIndex,
+  normalizePiModelCatalog,
+  normalizeStoredPiModelRef,
+  resolvePiModelRef,
+  normalizePiThinkingOptions,
+  samePiModel,
+  type PiNativeModel,
+  type PiNativeModelRef,
+} from "./pi-model-catalog.js";
+import { piUsageHistory, piUsageRecord, type PiUsageObservation } from "./pi-usage.js";
+import {
+  piDynamicCommandPrompt,
+  piLiveCommandCatalog,
+  type PiNativeCommand,
+} from "./pi-slash-commands.js";
+
+export interface PiAdapterOptions {
+  command?: string;
+  environment?: NodeJS.ProcessEnv;
+  commandTimeoutMs?: number;
+  cancelTimeoutMs?: number;
+  closeTimeoutMs?: number;
+  toolOutputLimit?: number;
+}
+
+export interface PiTurnTransport {
+  readonly state: PiSessionState;
+  readonly stderrTail?: string;
+  readonly isBusy?: boolean;
+  setGotgenesStatusHandler?(
+    handler: (records: GotgenesRecord[], owner: GotgenesObservationOwner) => void,
+  ): void;
+  setSubagentStatusHandler?(handler: (runs: PiSubagentNode[]) => void): void;
+  inspectSubagent?(id: string): Promise<PiSubagentInspection>;
+  setAutonomousTurnHandler(handler: (turn: PiAutonomousTurn) => void): void;
+  setAutonomousTurnLifecycleHandler?(handler: (update: PiAutonomousTurnLifecycle) => void): void;
+  /** Finished assistant messages, for Host usage metering; absent on transports without it. */
+  setUsageHandler?(handler: (observation: PiUsageObservation) => void): void;
+  start(): Promise<unknown>;
+  getAvailableModels(): Promise<PiNativeModel[]>;
+  getAvailableThinkingLevels(): Promise<HarnessThinkingOptionId[] | null>;
+  getEntries(): Promise<PiSessionHistory>;
+  /** Live commands of the running Session; absent on transports without RPC listing. */
+  getCommands?(): Promise<PiNativeCommand[]>;
+  getSessionUsage(): Promise<HostUsage | null>;
+  fork(entryId: string): Promise<PiSessionState>;
+  clone(): Promise<PiSessionState>;
+  verifySessionCwd(expectedCwd: string): Promise<void>;
+  selectModel(model: PiNativeModelRef): Promise<PiSessionState>;
+  supportsFastMode?(): Promise<boolean>;
+  selectFastMode?(enabled: boolean): Promise<PiSessionState>;
+  selectThinkingOption(thinkingOptionId: HarnessThinkingOptionId): Promise<PiSessionState>;
+  compact(
+    customInstructions: string | undefined,
+    onEvent: (event: PiTurnEvent) => void,
+  ): Promise<PiCompactResult>;
+  runTurn(text: string, onEvent: (event: PiTurnEvent) => void): Promise<PiTurnResult>;
+  steer(message: string): Promise<void>;
+  respondToInteraction(response: PiInteractionResponse): Promise<void>;
+  abort(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface PiAdapterDependencies {
+  createTransport(options: PiRpcSessionOptions): PiTurnTransport;
+}
+
+interface ActiveTool {
+  item: HostCommandExecutionItem | HostToolExecutionItem;
+  nativeName: string;
+  startedAtMs: number;
+}
+
+interface ActiveInteraction {
+  interaction: HostQuestionInteraction;
+  nativeRequest: PiInteractionRequest;
+}
+
+interface ActiveTurn {
+  command: TurnStartCommand;
+  autonomousRunId?: string;
+  agentItem: HostAgentMessageItem | null;
+  agentMessageId: string | null;
+  compactionItem: HostContextCompactionItem | null;
+  sawAssistantMessage: boolean;
+  acceptedSteerCount: number;
+  acceptingSteers: boolean;
+  pendingSteers: Set<Promise<void>>;
+  steerFailure?: PiRpcSteerTargetEndedError;
+  reasoningItem: HostReasoningItem | null;
+  tools: Map<string, ActiveTool>;
+  interactions: Map<HostInteractionId, ActiveInteraction>;
+  interactionByNativeId: Map<string, HostInteractionId>;
+  cancellationRequested: boolean;
+  settling: boolean;
+  beforeNativeTurnKeys: Set<string>;
+  progressItems: Set<HostItemId>;
+  completion: Promise<void>;
+  resolveCompletion(): void;
+}
+
+type SessionPhase = "open" | "closing" | "closed" | "faulted";
+
+const piHarnessId = harnessIdSchema.parse("pi");
+const piCommandCatalog = harnessCommandCatalogSchema.parse({
+  commands: [
+    {
+      id: "pi.compact",
+      invocation: "/compact",
+      localizations: { "zh-CN": { label: "压缩上下文", description: "压缩当前对话上下文" } },
+      label: "Compact context",
+      description: "Compact the current conversation context",
+      argumentMode: "text",
+    },
+  ],
+});
+const DEFAULT_TOOL_OUTPUT_LIMIT = 64_000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+class PiAdapterFaultError extends Error {
+  constructor(readonly harnessError: HarnessError) {
+    super(harnessError.message);
+    this.name = "PiAdapterFaultError";
+  }
+}
+
+function normalizedError(error: unknown, fallbackCode: HarnessError["code"]): HarnessError {
+  if (error instanceof PiRpcBusyError)
+    return { code: "sessionBusy", message: error.message, retryable: true };
+  if (isRecord(error) && error.code === "ENOENT") {
+    return { code: "notInstalled", message: errorMessage(error), retryable: false };
+  }
+  if (error instanceof PiAdapterFaultError) return error.harnessError;
+  if (error instanceof PiRpcUnsupportedCommandError) {
+    return {
+      code: "unsupported",
+      message: error.message,
+      retryable: false,
+    };
+  }
+  if (error instanceof PiRpcFaultError) {
+    return {
+      code: error.kind,
+      message: error.message,
+      retryable: error.kind !== "notInstalled",
+      ...(error.diagnostic ? { stderrTail: error.diagnostic } : {}),
+    };
+  }
+  return {
+    code: fallbackCode,
+    message: errorMessage(error),
+    retryable: fallbackCode === "unavailable" || fallbackCode === "nativeFailure",
+  };
+}
+
+function invalidState(message: string): HarnessError {
+  return { code: "invalidState", message, retryable: false };
+}
+
+function nativeModelFromState(state: PiSessionState): PiNativeModelRef | null {
+  if (state.provider === null && state.modelId === null) return null;
+  if (state.provider === null || state.modelId === null) {
+    throw new PiRpcFaultError("protocolError", "Pi state contains a partial Model identity");
+  }
+  return { provider: state.provider, id: state.modelId };
+}
+
+function livePiModelIndex(models: readonly PiNativeModel[], state: PiSessionState) {
+  const current = nativeModelFromState(state);
+  return createPiModelIndex(current ? [...models, current] : models);
+}
+
+async function isFastSupported(
+  model: PiNativeModelRef,
+  models: readonly PiNativeModel[],
+  transport: PiTurnTransport,
+): Promise<boolean> {
+  return (
+    models.some((entry) => samePiModel(entry, model) && supportsPiFastModel(entry)) &&
+    (await transport.supportsFastMode?.()) === true
+  );
+}
+
+function harnessStateFromPi(
+  state: PiSessionState,
+  thinkingLevels: readonly HarnessThinkingOptionId[] | null,
+  index: ReturnType<typeof createPiModelIndex>,
+): HarnessSessionState {
+  const model = nativeModelFromState(state);
+  const effectiveModel = model
+    ? index.ref({ ...model, ...(state.fast ? { fast: true } : {}) })
+    : undefined;
+  const availableThinkingOptions = thinkingLevels
+    ? normalizePiThinkingOptions(thinkingLevels)
+    : undefined;
+  if (
+    availableThinkingOptions &&
+    (!state.thinkingLevel || !thinkingLevels?.includes(state.thinkingLevel))
+  ) {
+    throw new PiRpcFaultError(
+      "protocolError",
+      "Pi effective Thinking level is absent from its available levels",
+    );
+  }
+  return {
+    nativeRef: nativeSessionRefSchema.parse({
+      harnessId: piHarnessId,
+      nativeSessionId: state.sessionId,
+      ...(state.sessionFile ? { locator: { sessionFile: state.sessionFile } } : {}),
+      formatVersion: 1,
+    }) as NativeSessionRef,
+    ...(effectiveModel ? { effectiveModel } : {}),
+    ...(state.thinkingLevel ? { effectiveThinkingOptionId: state.thinkingLevel } : {}),
+    ...(availableThinkingOptions ? { availableThinkingOptions } : {}),
+  };
+}
+
+function nativeModelForHistory(state: PiSessionState): PiNativeModelRef | null {
+  return nativeModelFromState(state);
+}
+
+function sessionFileFromRef(ref: NativeSessionRef): string {
+  if (
+    ref.harnessId !== piHarnessId ||
+    !isRecord(ref.locator) ||
+    typeof ref.locator.sessionFile !== "string" ||
+    ref.locator.sessionFile.length === 0
+  ) {
+    throw new Error("Pi Native Session Ref has no resumable Session file");
+  }
+  return ref.locator.sessionFile;
+}
+
+function toolFailure(toolName: string): HarnessError {
+  return {
+    code: "nativeFailure",
+    message: `Pi Tool '${toolName}' failed`,
+    retryable: false,
+  };
+}
+
+function nativeText(value: JsonValue): string {
+  if (typeof value === "string") return value;
+  if (!isRecord(value) || !Array.isArray(value.content)) return "";
+  return value.content
+    .filter(
+      (content): content is Record<string, JsonValue> =>
+        isRecord(content) && content.type === "text" && typeof content.text === "string",
+    )
+    .map(({ text }) => text as string)
+    .join("");
+}
+
+function boundedOutput(value: JsonValue, limit: number): HostToolOutput | undefined {
+  const text = nativeText(value);
+  if (text.length === 0) return undefined;
+  const truncated = text.length > limit;
+  return {
+    content: [{ type: "text", text: truncated ? text.slice(0, limit) : text }],
+    ...(truncated ? { truncated: true } : {}),
+  };
+}
+
+function outputText(output: HostToolOutput | undefined): string {
+  return (
+    output?.content
+      .filter(
+        (content): content is Extract<(typeof output.content)[number], { type: "text" }> =>
+          content.type === "text",
+      )
+      .map(({ text }) => text)
+      .join("") ?? ""
+  );
+}
+
+function numberField(value: JsonValue, key: string): number | null | undefined {
+  if (!isRecord(value)) return undefined;
+  const field = value[key];
+  return typeof field === "number" || field === null ? field : undefined;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+class PiHarnessSession implements HarnessSession {
+  readonly harnessId: HarnessId = piHarnessId;
+  readonly capabilities: HarnessSessionCapabilities;
+  readonly commands: HarnessCommandCapability;
+  readonly initialState: HarnessSessionState;
+  readonly initialUsage: HostUsage | null;
+  readonly outputs: AsyncIterable<HarnessOutput>;
+  readonly #channel = new HarnessOutputChannel<HarnessOutput>();
+  readonly #subagents = new PiSubagents((event) => this.#event(event));
+  #pendingSubagentStatus: PiSubagentNode[] | null = null;
+  readonly #closeTimeoutMs: number;
+  readonly #createTransport: PiAdapterDependencies["createTransport"];
+  readonly #cwd: string;
+  readonly #onClosed: () => void;
+  readonly #requestedModel: HarnessModelRef | undefined;
+  readonly #requestedThinkingOptionId: HarnessThinkingOptionId | undefined;
+  readonly #toolOutputLimit: number;
+  #modelIndex: ReturnType<typeof createPiModelIndex>;
+  #acceptingTurn = false;
+  #active: ActiveTurn | null = null;
+  #closePromise: Promise<void> | null = null;
+  #configuring = false;
+  #phase: SessionPhase = "open";
+  #pendingAutonomousTurns: Array<{ transport: PiTurnTransport; turn: PiAutonomousTurn }> = [];
+  #pendingAutonomousLifecycle: Array<{
+    transport: PiTurnTransport;
+    update: PiAutonomousTurnLifecycle;
+    bytes: number;
+  }> = [];
+  #pendingAutonomousLifecycleBytes = 0;
+  #starting: Promise<PiTurnTransport> | null = null;
+  #state: HarnessSessionState = {};
+  #transport: PiTurnTransport | null = null;
+  #liveCommands: HarnessCommandCatalog = piCommandCatalog;
+  #usage: HostUsage | null;
+  #usageGeneration = 0;
+  #usageRefreshSequence = 0;
+
+  constructor(
+    cwd: string,
+    createTransport: PiAdapterDependencies["createTransport"],
+    onClosed: () => void,
+    options: {
+      closeTimeoutMs: number;
+      model?: HarnessModelRef;
+      thinkingOptionId?: HarnessThinkingOptionId;
+      toolOutputLimit: number;
+      supportsThinkingSelection: boolean;
+      startedTransport?: PiTurnTransport;
+      startedModels?: readonly PiNativeModel[];
+      startedThinkingLevels?: HarnessThinkingOptionId[] | null;
+      initialUsage?: HostUsage | null;
+      usageHistory?: { requests: HostUsageRequest[]; complete: boolean };
+    },
+  ) {
+    this.#cwd = cwd;
+    this.#createTransport = createTransport;
+    this.#onClosed = onClosed;
+    this.#closeTimeoutMs = options.closeTimeoutMs;
+    this.#requestedModel = options.model;
+    this.#requestedThinkingOptionId = options.thinkingOptionId;
+    this.#toolOutputLimit = options.toolOutputLimit;
+    this.capabilities = ((session) => ({
+      configuration: {
+        selectModel: true,
+        selectThinkingOption: options.supportsThinkingSelection,
+        selectPermissionMode: false,
+        permissionModeScope: "live" as const,
+      },
+      history: { fork: true, forkAcrossCwd: true, rollbackLastTurn: true },
+      autonomousTurns: { observe: true },
+      subagents: { observe: true, readTranscript: true },
+      // Root Tools provide an admission window; the transport also checks native receipt order.
+      get steer(): boolean {
+        return session.#canSteerActiveTurn();
+      },
+    }))(this);
+    this.commands = {
+      list: async () => ({ ok: true, value: await this.#refreshLiveCommands() }),
+      execute: (command) => this.#executeHarnessCommand(command),
+    };
+    this.#transport = options.startedTransport ?? null;
+    this.#modelIndex = this.#transport
+      ? livePiModelIndex(options.startedModels ?? [], this.#transport.state)
+      : createPiModelIndex([]);
+    this.initialState = this.#transport
+      ? harnessStateFromPi(
+          this.#transport.state,
+          options.startedThinkingLevels ?? null,
+          this.#modelIndex,
+        )
+      : {};
+    this.initialUsage = options.initialUsage ?? null;
+    this.#usage = this.initialUsage;
+    this.#state = this.initialState;
+    this.outputs = this.#channel.outputs;
+    // A created Session has no native history yet; an opened one replays it for Host metering.
+    const usageHistory =
+      options.usageHistory ??
+      (options.startedTransport
+        ? { requests: [], complete: false }
+        : { requests: [], complete: true });
+    for (const request of usageHistory.requests) this.#event({ type: "usage.request", request });
+    this.#event({ type: "usage.history", complete: usageHistory.complete });
+    if (this.#transport) this.#bindAutonomousTurnHandler(this.#transport);
+  }
+
+  ownsNativeSession(id: string): boolean {
+    return this.#transport?.state.sessionId === id;
+  }
+
+  async readSubagentHistory(cwd: string): Promise<PiSessionHistory> {
+    if (this.#phase !== "open" || path.resolve(cwd) !== path.resolve(this.#cwd)) {
+      throw new Error("Pi Subagent parent workspace or Session is unavailable");
+    }
+    return (await this.#ensureTransport()).getEntries();
+  }
+
+  async readGotgenesChild(id: string, cwd: string): Promise<HarnessResult<HostThreadSnapshot>> {
+    const history = await this.readSubagentHistory(cwd);
+    const transport = this.#transport;
+    if (!transport) throw new Error("Pi parent Session is closed");
+    return readGotgenesChild(
+      history,
+      transport.state.sessionId,
+      id,
+      this.#subagents.gotgenes.records.get(id),
+    );
+  }
+
+  async inspectSubagent(id: string, cwd: string): Promise<PiSubagentInspection> {
+    if (this.#phase !== "open" || path.resolve(cwd) !== path.resolve(this.#cwd)) {
+      throw new Error("Pi Subagent parent workspace or Session is unavailable");
+    }
+    const transport = await this.#ensureTransport();
+    if (!transport.inspectSubagent)
+      throw new Error("Pi transport does not support Subagent inspection");
+    return transport.inspectSubagent(id);
+  }
+
+  handleTransportFault(error: PiRpcFaultError): void {
+    queueMicrotask(() => this.#fault(error));
+  }
+
+  #subagentConfiguration(): SubagentConfiguration {
+    const state = this.#state;
+    const model = this.#transport?.state.modelId;
+    return {
+      ...(model ? { model } : {}),
+      ...(state.effectiveThinkingOptionId
+        ? { reasoningEffort: state.effectiveThinkingOptionId }
+        : {}),
+    };
+  }
+
+  async readSnapshot(): Promise<HarnessResult<HostThreadSnapshot>> {
+    const result = await this.#readSnapshot();
+    return result.ok
+      ? { ok: true, value: configureSubagentSnapshot(result.value, this.#subagentConfiguration()) }
+      : result;
+  }
+
+  async #readSnapshot(): Promise<HarnessResult<HostThreadSnapshot>> {
+    if (this.#phase !== "open") {
+      return { ok: false, error: invalidState("Pi Session is not open") };
+    }
+    if (this.#active || this.#acceptingTurn || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Pi Session cannot read history while another operation is active",
+          retryable: true,
+        },
+      };
+    }
+    try {
+      const transport = await this.#ensureTransport();
+      const history = await transport.getEntries();
+      const { sessionId, sessionFile } = transport.state;
+      await restorePiSubagents(
+        history,
+        new Set(sessionFile ? [sessionId, sessionFile] : [sessionId]),
+        this.#subagents,
+      );
+      return {
+        ok: true,
+        value: {
+          ...mapPiSnapshot(
+            history,
+            {
+              sessionId: transport.state.sessionId,
+              model: nativeModelForHistory(transport.state),
+              models: this.#modelIndex.models,
+              cwd: this.#cwd,
+            },
+            this.#subagents,
+          ),
+          state: this.#state,
+        },
+      };
+    } catch (error) {
+      return { ok: false, error: normalizedError(error, "nativeFailure") };
+    }
+  }
+
+  execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
+  execute(command: TurnSteerCommand): Promise<HarnessResult<TurnSteerAccepted>>;
+  execute(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>>;
+  execute(command: InteractionRespondCommand): Promise<HarnessResult<InteractionRespondAccepted>>;
+  execute(command: ModelSelectCommand): Promise<HarnessResult<ModelSelectCompleted>>;
+  execute(command: ThinkingSelectCommand): Promise<HarnessResult<ThinkingSelectCompleted>>;
+  execute(
+    command: PermissionModeSelectCommand,
+  ): Promise<HarnessResult<PermissionModeSelectCompleted>>;
+  async execute(
+    command: HostCommand,
+  ): Promise<
+    HarnessResult<
+      | TurnStartAccepted
+      | TurnSteerAccepted
+      | TurnCancelAccepted
+      | InteractionRespondAccepted
+      | ModelSelectCompleted
+      | ThinkingSelectCompleted
+      | PermissionModeSelectCompleted
+    >
+  > {
+    if (this.#phase !== "open") {
+      return { ok: false, error: invalidState("Pi Session is not open") };
+    }
+    if (command.type === "turn.cancel") return this.#cancel(command);
+    if (command.type === "interaction.respond") return this.#respond(command);
+    if (command.type === "model.select") return this.#selectModel(command);
+    if (command.type === "thinking.select") return this.#selectThinking(command);
+    if (command.type === "permissionMode.select") {
+      return {
+        ok: false,
+        error: {
+          code: "unsupported",
+          message: "Pi does not expose a selectable Permission Mode",
+          retryable: false,
+        },
+      };
+    }
+    if (command.type === "turn.steer") return this.#steer(command);
+    if (this.#acceptingTurn || this.#active || this.#configuring || this.#transport?.isBusy) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Pi Session already has an active Turn",
+          retryable: true,
+        },
+      };
+    }
+    const text = command.input.map((input) => input.text).join("\n");
+    if (text.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi text Turn must not be empty",
+          retryable: false,
+        },
+      };
+    }
+
+    this.#acceptingTurn = true;
+    try {
+      let transport: PiTurnTransport;
+      try {
+        transport = await this.#ensureTransport();
+      } catch (error) {
+        return { ok: false, error: normalizedError(error, "unavailable") };
+      }
+      if (this.#phase !== "open") {
+        return { ok: false, error: invalidState("Pi Session became unavailable during startup") };
+      }
+
+      let beforeHistory: HostThreadSnapshot;
+      try {
+        beforeHistory = mapPiSnapshot(await transport.getEntries(), {
+          sessionId: transport.state.sessionId,
+          model: nativeModelForHistory(transport.state),
+        });
+      } catch (error) {
+        return { ok: false, error: normalizedError(error, "protocolError") };
+      }
+
+      // A native autonomous run can begin while startup/history preflight is awaiting RPC.
+      // Reject before publishing acceptance; do not resend the user's input behind that run.
+      if (
+        this.#active ||
+        transport.isBusy ||
+        this.#pendingAutonomousLifecycle.length > 0 ||
+        this.#pendingAutonomousTurns.length > 0
+      ) {
+        return { ok: false, error: normalizedError(new PiRpcBusyError(), "sessionBusy") };
+      }
+
+      let resolveCompletion = (): void => undefined;
+      const completion = new Promise<void>((resolve) => {
+        resolveCompletion = resolve;
+      });
+      const item: HostAgentMessageItem = {
+        type: "agentMessage",
+        itemId: this.#newItemId(),
+        text: "",
+      };
+      const active: ActiveTurn = {
+        command,
+        agentItem: item,
+        agentMessageId: null,
+        compactionItem: null,
+        sawAssistantMessage: false,
+        acceptedSteerCount: 0,
+        acceptingSteers: true,
+        pendingSteers: new Set(),
+        reasoningItem: null,
+        tools: new Map(),
+        interactions: new Map(),
+        interactionByNativeId: new Map(),
+        cancellationRequested: false,
+        settling: false,
+        beforeNativeTurnKeys: new Set(
+          beforeHistory.turns.map((turn) => turn.nativeTurnRef.nativeTurnKey),
+        ),
+        progressItems: new Set(),
+        completion,
+        resolveCompletion,
+      };
+      this.#active = active;
+      this.#event({ type: "turn.started", turnId: command.turnId });
+      this.#event({ type: "item.started", turnId: command.turnId, item });
+
+      void transport
+        .runTurn(text, (event) => this.#handleTurnEvent(active, event))
+        .then(async (result) => {
+          active.settling = true;
+          try {
+            const identity = await this.#completedTurnIdentity(active, transport);
+            this.#completeTurn(
+              active,
+              result.cancelled
+                ? {
+                    status: "cancelled",
+                    reason: "Cancelled by user",
+                    ...(identity.checkpoint ? { checkpoint: identity.checkpoint } : {}),
+                  }
+                : {
+                    status: "succeeded",
+                    ...(identity.checkpoint ? { checkpoint: identity.checkpoint } : {}),
+                  },
+              result.text,
+              identity.nativeTurnRef,
+            );
+          } catch (error) {
+            this.#completeTurn(active, {
+              status: "failed",
+              error: normalizedError(error, "protocolError"),
+            });
+          }
+        })
+        .catch(async (error: unknown) => {
+          active.settling = true;
+          let identity:
+            { nativeTurnRef: NativeTurnRef; checkpoint?: NativeCheckpointRef } | undefined;
+          try {
+            identity = await this.#completedTurnIdentity(active, transport);
+          } catch {
+            // A failed native Turn may not have persisted a stable User Entry.
+          }
+          this.#completeTurn(
+            active,
+            active.cancellationRequested
+              ? {
+                  status: "cancelled",
+                  reason: "Cancelled by user",
+                  ...(identity?.checkpoint ? { checkpoint: identity.checkpoint } : {}),
+                }
+              : {
+                  status: "failed",
+                  error: normalizedError(error, "nativeFailure"),
+                  ...(identity?.checkpoint ? { checkpoint: identity.checkpoint } : {}),
+                },
+            undefined,
+            identity?.nativeTurnRef,
+          );
+        });
+
+      return { ok: true, value: { turnId: command.turnId } };
+    } finally {
+      this.#acceptingTurn = false;
+      if (this.#transport) this.#drainPendingAutonomousTurns(this.#transport);
+    }
+  }
+
+  close(): Promise<void> {
+    if (!this.#closePromise) {
+      this.#closePromise = this.#close().finally(this.#onClosed);
+    }
+    return this.#closePromise;
+  }
+
+  async #respond(
+    command: InteractionRespondCommand,
+  ): Promise<HarnessResult<InteractionRespondAccepted>> {
+    const active = this.#active;
+    const pending = active?.interactions.get(command.interactionId);
+    if (!active || !pending) {
+      return {
+        ok: false,
+        error: invalidState("Pi Interaction Response must reference a pending Question"),
+      };
+    }
+    if (command.response.type !== "question") {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi Question requires a Question Response",
+          retryable: false,
+        },
+      };
+    }
+    const validationError = validateHostQuestionResponse(pending.interaction, command.response);
+    if (validationError) return { ok: false, error: validationError };
+    const transport = this.#transport;
+    if (!transport) return { ok: false, error: invalidState("Pi transport is unavailable") };
+    const answers = command.response.answers.answer ?? [];
+    let response: PiInteractionResponse;
+    if (command.response.cancelled) {
+      response = { requestId: pending.nativeRequest.requestId, cancelled: true };
+    } else if (pending.nativeRequest.method === "confirm") {
+      response = {
+        requestId: pending.nativeRequest.requestId,
+        confirmed: answers[0] === "yes",
+      };
+    } else {
+      const value = answers[0];
+      if (value === undefined) {
+        return {
+          ok: false,
+          error: {
+            code: "invalidRequest",
+            message: "Pi Question Response has no answer",
+            retryable: false,
+          },
+        };
+      }
+      response = { requestId: pending.nativeRequest.requestId, value };
+    }
+    try {
+      await transport.respondToInteraction(response);
+      return { ok: true, value: { accepted: true } };
+    } catch (error) {
+      return { ok: false, error: normalizedError(error, "nativeFailure") };
+    }
+  }
+
+  async #selectModel(command: ModelSelectCommand): Promise<HarnessResult<ModelSelectCompleted>> {
+    if (this.#acceptingTurn || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Pi Session cannot select a Model while another operation is active",
+          retryable: true,
+        },
+      };
+    }
+    const transport = this.#transport;
+    if (!transport) {
+      return {
+        ok: false,
+        error: invalidState("Pi Model selection requires a started Native Session"),
+      };
+    }
+    const previousModel = this.#state.effectiveModel;
+    this.#configuring = true;
+    try {
+      let requested: PiNativeModelRef;
+      try {
+        const models = await transport.getAvailableModels();
+        const index = livePiModelIndex(models, transport.state);
+        requested = resolvePiModelRef(harnessModelRefSchema.parse(command.model), index);
+        if (requested.fast && !(await isFastSupported(requested, models, transport)))
+          throw new Error("Fast is unavailable for this Pi Model");
+        this.#modelIndex = index;
+      } catch (error) {
+        return { ok: false, error: normalizedError(error, "invalidRequest") };
+      }
+      let state: PiSessionState;
+      let thinkingLevels: HarnessThinkingOptionId[] | null;
+      try {
+        state = samePiModel(nativeModelFromState(transport.state), requested)
+          ? transport.state
+          : await transport.selectModel(requested);
+        // Complete fallible discovery before changing request policy, then publish immediately.
+        thinkingLevels = await transport.getAvailableThinkingLevels();
+        if (requested.fast || state.fast) {
+          if (!transport.selectFastMode) throw new Error("Pi Fast extension is unavailable");
+          state = await transport.selectFastMode(requested.fast === true);
+        }
+        this.#publishTransportState(state, thinkingLevels);
+      } catch (error) {
+        if (error instanceof PiRpcFaultError) this.#fault(error);
+        return { ok: false, error: normalizedError(error, "nativeFailure") };
+      }
+      const actual = nativeModelFromState(state);
+      if (!sameHarnessModelRef(previousModel, this.#state.effectiveModel)) {
+        this.#invalidateUsage();
+        void this.#refreshUsage();
+      }
+      if (!samePiModel(actual, requested)) {
+        return {
+          ok: false,
+          error: {
+            code: "nativeFailure",
+            message: "Pi did not activate the requested Model",
+            retryable: false,
+          },
+        };
+      }
+      return { ok: true, value: { completed: true } };
+    } finally {
+      this.#configuring = false;
+      if (this.#transport) this.#drainPendingAutonomousTurns(this.#transport);
+    }
+  }
+
+  async #selectThinking(
+    command: ThinkingSelectCommand,
+  ): Promise<HarnessResult<ThinkingSelectCompleted>> {
+    if (!this.capabilities.configuration.selectThinkingOption) {
+      return {
+        ok: false,
+        error: {
+          code: "unsupported",
+          message: "Pi Thinking selection is unavailable",
+          retryable: false,
+        },
+      };
+    }
+    if (this.#acceptingTurn || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Pi Session cannot select Thinking while another operation is active",
+          retryable: true,
+        },
+      };
+    }
+    const transport = this.#transport;
+    if (!transport) {
+      return {
+        ok: false,
+        error: invalidState("Pi Thinking selection requires a started Native Session"),
+      };
+    }
+    const parsedThinkingOptionId = harnessThinkingOptionIdSchema.safeParse(
+      command.thinkingOptionId,
+    );
+    if (!parsedThinkingOptionId.success) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi Thinking option is invalid",
+          retryable: false,
+        },
+      };
+    }
+    const thinkingOptionId = parsedThinkingOptionId.data;
+    this.#configuring = true;
+    try {
+      let state: PiSessionState;
+      let thinkingLevels: HarnessThinkingOptionId[] | null;
+      try {
+        state = await transport.selectThinkingOption(thinkingOptionId);
+        thinkingLevels = await transport.getAvailableThinkingLevels();
+      } catch (error) {
+        if (error instanceof PiRpcFaultError) this.#fault(error);
+        return { ok: false, error: normalizedError(error, "nativeFailure") };
+      }
+      if (!thinkingLevels) {
+        return {
+          ok: false,
+          error: {
+            code: "unsupported",
+            message: "Pi Thinking discovery became unavailable",
+            retryable: false,
+          },
+        };
+      }
+      try {
+        this.#publishTransportState(state, thinkingLevels);
+      } catch (error) {
+        if (error instanceof PiRpcFaultError) this.#fault(error);
+        return { ok: false, error: normalizedError(error, "protocolError") };
+      }
+      return { ok: true, value: { completed: true } };
+    } finally {
+      this.#configuring = false;
+      if (this.#transport) this.#drainPendingAutonomousTurns(this.#transport);
+    }
+  }
+
+  #canSteerActiveTurn(): boolean {
+    const active = this.#active;
+    return Boolean(
+      this.#phase === "open" &&
+      active &&
+      !active.cancellationRequested &&
+      active.acceptingSteers &&
+      active.tools.size > 0 &&
+      this.#transport,
+    );
+  }
+
+  async #steer(command: TurnSteerCommand): Promise<HarnessResult<TurnSteerAccepted>> {
+    const text = command.input.map((input) => input.text).join("\n");
+    if (text.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi steer text must not be empty",
+          retryable: false,
+        },
+      };
+    }
+    const active = this.#active;
+    const transport = this.#transport;
+    if (
+      !active ||
+      !transport ||
+      active.command.turnId !== command.turnId ||
+      !this.#canSteerActiveTurn()
+    ) {
+      return { ok: false, error: invalidState("Pi Turn is not accepting native input") };
+    }
+    let accepted: Promise<void> | undefined;
+    try {
+      accepted = transport.steer(text).then(() => {
+        active.acceptedSteerCount += 1;
+      });
+      active.pendingSteers.add(accepted);
+      await accepted;
+      return { ok: true, value: { accepted: true } };
+    } catch (error) {
+      if (error instanceof PiRpcSteerRejectedError) {
+        return { ok: false, error: invalidState(error.message) };
+      }
+      if (error instanceof PiRpcSteerTargetEndedError) active.steerFailure = error;
+      // A missing acknowledgement may follow native acceptance; never invite stop-and-resend.
+      throw error;
+    } finally {
+      if (accepted) active.pendingSteers.delete(accepted);
+    }
+  }
+
+  async #cancel(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>> {
+    const active = this.#active;
+    if (!active || active.command.turnId !== command.turnId) {
+      return {
+        ok: false,
+        error: invalidState("Pi Turn Cancel must reference the active Turn"),
+      };
+    }
+    if (active.settling) {
+      // Native execution has ended; abort may now target a deferred autonomous successor.
+      return {
+        ok: false,
+        error: invalidState(
+          "Pi Turn has finished native execution and is recording its completion",
+        ),
+      };
+    }
+    if (active.cancellationRequested) {
+      return { ok: true, value: { cancellationRequested: true } };
+    }
+    const transport = this.#transport;
+    if (!transport) return { ok: false, error: invalidState("Pi transport is unavailable") };
+    active.cancellationRequested = true;
+    try {
+      await transport.abort();
+      return { ok: true, value: { cancellationRequested: true } };
+    } catch (error) {
+      const normalized = normalizedError(error, "nativeFailure");
+      if (this.#active === active) {
+        this.#fault(new PiAdapterFaultError(normalized));
+        void transport.close().catch(() => undefined);
+      }
+      return { ok: false, error: normalized };
+    }
+  }
+
+  /**
+   * Built-ins plus the running Session's commands. Never starts the process
+   * just to list commands; an unstarted Session reports the built-ins.
+   */
+  async #refreshLiveCommands(): Promise<HarnessCommandCatalog> {
+    const transport = this.#transport;
+    if (this.#phase === "open" && transport?.getCommands) {
+      try {
+        this.#liveCommands = piLiveCommandCatalog(
+          piCommandCatalog,
+          (await transport.getCommands()).filter((command) => command.name !== PI_FAST_COMMAND),
+        );
+      } catch {
+        // Keep the last known catalog.
+      }
+    }
+    return this.#liveCommands;
+  }
+
+  async #executeHarnessCommand(
+    command: HarnessCommandInvocation,
+  ): Promise<HarnessResult<HarnessCommandAccepted>> {
+    const argumentText = command.arguments?.text;
+    const dynamicPrompt = piDynamicCommandPrompt(
+      this.#liveCommands,
+      command.commandId,
+      typeof argumentText === "string" ? argumentText : undefined,
+    );
+    if (dynamicPrompt !== null) {
+      // Pi expands extension commands, prompt templates and skills from prompt text.
+      const started = await this.execute({
+        type: "turn.start",
+        turnId: command.turnId,
+        input: [{ type: "text", text: dynamicPrompt }],
+      });
+      return started.ok ? { ok: true, value: { turnId: command.turnId } } : started;
+    }
+    if (command.commandId !== "pi.compact") {
+      return {
+        ok: false,
+        error: {
+          code: "unsupported",
+          message: `Pi does not expose Harness command '${command.commandId}'`,
+          retryable: false,
+        },
+      };
+    }
+    if (this.#acceptingTurn || this.#active || this.#configuring) {
+      return {
+        ok: false,
+        error: {
+          code: "sessionBusy",
+          message: "Pi Session already has an active operation",
+          retryable: true,
+        },
+      };
+    }
+    const arguments_ = command.arguments;
+    const customInstructions = arguments_?.text;
+    if (customInstructions !== undefined && typeof customInstructions !== "string") {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi compact command argument 'text' must be a string",
+          retryable: false,
+        },
+      };
+    }
+    if (arguments_ && Object.keys(arguments_).some((key) => key !== "text")) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi compact command has an unknown argument",
+          retryable: false,
+        },
+      };
+    }
+
+    this.#acceptingTurn = true;
+    try {
+      let transport: PiTurnTransport;
+      try {
+        transport = await this.#ensureTransport();
+      } catch (error) {
+        return { ok: false, error: normalizedError(error, "unavailable") };
+      }
+      const turnCommand: TurnStartCommand = {
+        type: "turn.start",
+        turnId: command.turnId,
+        input: [],
+      };
+      let resolveCompletion = (): void => undefined;
+      const completion = new Promise<void>((resolve) => {
+        resolveCompletion = resolve;
+      });
+      const active: ActiveTurn = {
+        command: turnCommand,
+        agentItem: null,
+        agentMessageId: null,
+        compactionItem: null,
+        sawAssistantMessage: false,
+        acceptedSteerCount: 0,
+        acceptingSteers: false,
+        pendingSteers: new Set(),
+        reasoningItem: null,
+        tools: new Map(),
+        interactions: new Map(),
+        interactionByNativeId: new Map(),
+        cancellationRequested: false,
+        settling: false,
+        beforeNativeTurnKeys: new Set(),
+        progressItems: new Set(),
+        completion,
+        resolveCompletion,
+      };
+      this.#active = active;
+      this.#event({ type: "turn.started", turnId: command.turnId });
+      void transport
+        .compact(customInstructions, (event) => this.#handleTurnEvent(active, event))
+        .then((result) => {
+          if (result.outcome === "succeeded") {
+            this.#completeTurn(active, { status: "succeeded" });
+          } else if (result.outcome === "cancelled") {
+            this.#completeTurn(active, {
+              status: "cancelled",
+              reason: "Context compaction was cancelled",
+            });
+          } else {
+            this.#completeTurn(active, {
+              status: "failed",
+              error: {
+                code: "nativeFailure",
+                message: result.errorMessage ?? "Pi context compaction failed",
+                retryable: true,
+              },
+            });
+          }
+        })
+        .catch((error: unknown) => {
+          this.#completeTurn(active, {
+            status: "failed",
+            error: normalizedError(error, "nativeFailure"),
+          });
+        });
+      return { ok: true, value: { turnId: command.turnId } };
+    } finally {
+      this.#acceptingTurn = false;
+      if (this.#transport) this.#drainPendingAutonomousTurns(this.#transport);
+    }
+  }
+
+  async #ensureTransport(): Promise<PiTurnTransport> {
+    if (this.#transport) return this.#transport;
+    if (this.#starting) return this.#starting;
+    const transport = this.#createTransport({
+      cwd: this.#cwd,
+      onFault: (error) => queueMicrotask(() => this.#fault(error)),
+    });
+    this.#bindAutonomousTurnHandler(transport);
+    const starting = transport
+      .start()
+      .then(async () => {
+        if (this.#phase !== "open") throw new Error("Pi Session closed during startup");
+        let state = transport.state;
+        const models = await transport.getAvailableModels();
+        this.#modelIndex = livePiModelIndex(models, state);
+        let thinkingLevels = await transport.getAvailableThinkingLevels();
+        if (this.#requestedModel) {
+          const requested = resolvePiModelRef(this.#requestedModel, this.#modelIndex);
+          if (requested.fast && !(await isFastSupported(requested, models, transport))) {
+            throw new Error("Fast is unavailable for this Pi Model");
+          }
+          const current = nativeModelFromState(state);
+          if (!samePiModel(current, requested)) state = await transport.selectModel(requested);
+          thinkingLevels = await transport.getAvailableThinkingLevels();
+          if (!samePiModel(nativeModelFromState(state), requested)) {
+            this.#publishTransportState(state, thinkingLevels);
+            throw new Error("Pi did not activate the requested create Model");
+          }
+          if (requested.fast) {
+            if (!transport.selectFastMode) throw new Error("Pi Fast extension is unavailable");
+            state = await transport.selectFastMode(true);
+          }
+        }
+        if (this.#requestedThinkingOptionId) {
+          if (!thinkingLevels) {
+            throw new PiAdapterFaultError({
+              code: "unsupported",
+              message: "Installed Pi does not support Thinking selection",
+              retryable: false,
+            });
+          }
+          state = await transport.selectThinkingOption(this.#requestedThinkingOptionId);
+          thinkingLevels = await transport.getAvailableThinkingLevels();
+        }
+        this.#transport = transport;
+        this.#publishTransportState(state, thinkingLevels);
+        this.#drainPendingAutonomousTurns(transport);
+        return transport;
+      })
+      .catch(async (error: unknown) => {
+        this.#pendingAutonomousTurns = this.#pendingAutonomousTurns.filter(
+          (pending) => pending.transport !== transport,
+        );
+        this.#pendingAutonomousLifecycle = this.#pendingAutonomousLifecycle.filter(
+          (pending) => pending.transport !== transport,
+        );
+        this.#pendingAutonomousLifecycleBytes = this.#pendingAutonomousLifecycle.reduce(
+          (total, pending) => total + pending.bytes,
+          0,
+        );
+        await transport.close().catch(() => undefined);
+        if (this.#phase === "open") this.#fault(error);
+        throw error;
+      })
+      .finally(() => {
+        if (this.#starting === starting) this.#starting = null;
+      });
+    this.#starting = starting;
+    return starting;
+  }
+
+  #bindAutonomousTurnHandler(transport: PiTurnTransport): void {
+    transport.setGotgenesStatusHandler?.((records, owner) => {
+      if (this.#phase !== "open") return;
+      this.#subagents.observeGotgenes(
+        records,
+        owner === "requested" && this.#active && !this.#active.settling
+          ? { turnId: this.#active.command.turnId, nextItemId: () => this.#newItemId() }
+          : undefined,
+      );
+    });
+    transport.setSubagentStatusHandler?.((runs) => {
+      if (this.#phase !== "open") return;
+      if (this.#transport !== transport) this.#pendingSubagentStatus = runs;
+      else this.#subagents.observe(runs);
+    });
+    transport.setUsageHandler?.((observation) => {
+      if (this.#phase !== "open") return;
+      const record = piUsageRecord(observation.message, observation);
+      if (record?.kind === "request")
+        this.#event({ type: "usage.request", request: record.request });
+      else if (record?.kind === "missing") this.#event({ type: "usage.history", complete: false });
+    });
+    if (transport.setAutonomousTurnLifecycleHandler) {
+      transport.setAutonomousTurnLifecycleHandler((update) =>
+        this.#handleAutonomousLifecycle(transport, update),
+      );
+      return;
+    }
+    transport.setAutonomousTurnHandler((turn) => {
+      if (this.#phase !== "open") return;
+      if (this.#transport !== transport) {
+        this.#pendingAutonomousTurns.push({ transport, turn });
+        return;
+      }
+      this.#handleAutonomousTurn(transport, turn);
+    });
+  }
+
+  #drainPendingAutonomousTurns(transport: PiTurnTransport): void {
+    if (this.#phase !== "open" || this.#acceptingTurn || this.#configuring) return;
+    for (;;) {
+      const pending = this.#pendingAutonomousLifecycle[0];
+      if (
+        !pending ||
+        pending.transport !== transport ||
+        (this.#active && this.#active.autonomousRunId !== pending.update.runId)
+      )
+        break;
+      this.#pendingAutonomousLifecycle.shift();
+      this.#pendingAutonomousLifecycleBytes -= pending.bytes;
+      this.#applyAutonomousLifecycle(transport, pending.update);
+      if (this.#phase !== "open") return;
+    }
+    if (this.#active) return;
+    if (this.#pendingSubagentStatus) {
+      this.#subagents.observe(this.#pendingSubagentStatus);
+      this.#pendingSubagentStatus = null;
+    }
+    const pending = this.#pendingAutonomousTurns.filter(
+      (candidate) => candidate.transport === transport,
+    );
+    this.#pendingAutonomousTurns = this.#pendingAutonomousTurns.filter(
+      (candidate) => candidate.transport !== transport,
+    );
+    for (const candidate of pending) {
+      if (this.#phase !== "open") return;
+      this.#handleAutonomousTurn(transport, candidate.turn);
+    }
+  }
+
+  #handleAutonomousLifecycle(transport: PiTurnTransport, update: PiAutonomousTurnLifecycle): void {
+    if (
+      this.#phase === "closing" &&
+      this.#transport === transport &&
+      update.type !== "started" &&
+      this.#active?.autonomousRunId === update.runId
+    ) {
+      // Closing stops admission, but the current native run still owes its cancellation terminal.
+      this.#applyAutonomousLifecycle(transport, update);
+      return;
+    }
+    if (this.#phase !== "open") return;
+    if (
+      this.#transport !== transport ||
+      this.#acceptingTurn ||
+      this.#configuring ||
+      this.#pendingAutonomousLifecycle.length > 0 ||
+      (this.#active && this.#active.autonomousRunId !== update.runId)
+    ) {
+      const bytes = Buffer.byteLength(JSON.stringify(update));
+      if (this.#pendingAutonomousLifecycleBytes + bytes > 8 * 1024 * 1024) {
+        this.#fault(
+          new PiAdapterFaultError({
+            code: "protocolError",
+            message: "Pi autonomous lifecycle exceeded its ordered event buffer bound",
+            retryable: false,
+          }),
+        );
+        return;
+      }
+      this.#pendingAutonomousLifecycle.push({ transport, update, bytes });
+      this.#pendingAutonomousLifecycleBytes += bytes;
+      if (this.#transport === transport) this.#drainPendingAutonomousTurns(transport);
+      return;
+    }
+    this.#applyAutonomousLifecycle(transport, update);
+  }
+
+  #applyAutonomousLifecycle(transport: PiTurnTransport, update: PiAutonomousTurnLifecycle): void {
+    if (update.type === "started" && !this.#active) {
+      this.#startAutonomousHostTurn(update.runId);
+      return;
+    }
+    const active = this.#active;
+    if (!active || active.autonomousRunId !== update.runId || update.type === "started") {
+      this.#fault(
+        new PiAdapterFaultError({
+          code: "protocolError",
+          message: "Pi autonomous event has no matching active run",
+          retryable: false,
+        }),
+      );
+      return;
+    }
+    if (update.type === "event") this.#handleTurnEvent(active, update.event);
+    else {
+      active.settling = true;
+      this.#finishAutonomousHostTurn(transport, active, update.turn);
+    }
+  }
+
+  #handleAutonomousTurn(transport: PiTurnTransport, turn: PiAutonomousTurn): void {
+    if (this.#phase !== "open") return;
+    if (this.#transport !== transport) {
+      this.#fault(
+        new PiAdapterFaultError({
+          code: "protocolError",
+          message: "Pi autonomous Turn came from a non-active transport",
+          retryable: false,
+        }),
+      );
+      return;
+    }
+    if (this.#active && !this.#active.settling) {
+      this.#fault(
+        new PiAdapterFaultError({
+          code: "protocolError",
+          message: "Pi autonomous Turn overlapped another Host operation",
+          retryable: false,
+        }),
+      );
+      return;
+    }
+    if (this.#active || this.#acceptingTurn || this.#configuring) {
+      // Native deferred actions may finish while the prior requested Turn reads its identity.
+      // Preserve their own boundary and publish only after that Host operation has ended.
+      if (this.#pendingAutonomousTurns.length >= 128) {
+        this.#fault(
+          new PiAdapterFaultError({
+            code: "protocolError",
+            message: "Pi autonomous completion queue exceeded its bound",
+            retryable: false,
+          }),
+        );
+      } else this.#pendingAutonomousTurns.push({ transport, turn });
+      return;
+    }
+
+    const active = this.#startAutonomousHostTurn();
+    this.#finishAutonomousHostTurn(transport, active, turn);
+  }
+
+  #startAutonomousHostTurn(runId?: string): ActiveTurn {
+    const turnId = hostTurnIdSchema.parse(randomUUID());
+    let resolveCompletion = (): void => undefined;
+    const completion = new Promise<void>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const item: HostAgentMessageItem = {
+      type: "agentMessage",
+      itemId: this.#newItemId(),
+      text: "",
+    };
+    const active: ActiveTurn = {
+      command: { type: "turn.start", turnId, input: [] },
+      ...(runId ? { autonomousRunId: runId } : {}),
+      agentItem: item,
+      agentMessageId: null,
+      compactionItem: null,
+      sawAssistantMessage: false,
+      acceptedSteerCount: 0,
+      acceptingSteers: false,
+      pendingSteers: new Set(),
+      reasoningItem: null,
+      tools: new Map(),
+      interactions: new Map(),
+      interactionByNativeId: new Map(),
+      cancellationRequested: false,
+      settling: false,
+      beforeNativeTurnKeys: new Set(),
+      progressItems: new Set(),
+      completion,
+      resolveCompletion,
+    };
+    this.#active = active;
+    this.#event({ type: "turn.autonomous.started", turnId, input: [] });
+    this.#event({ type: "turn.started", turnId });
+    this.#event({ type: "item.started", turnId, item });
+
+    return active;
+  }
+
+  #finishAutonomousHostTurn(
+    transport: PiTurnTransport,
+    active: ActiveTurn,
+    turn: PiAutonomousTurn,
+  ): void {
+    const nativeTurnRef = turn.nativeTurnKey
+      ? nativeTurnRefSchema.parse({
+          harnessId: this.harnessId,
+          nativeSessionId: transport.state.sessionId,
+          nativeTurnKey: turn.nativeTurnKey,
+          formatVersion: 1,
+        })
+      : undefined;
+    const checkpoint = nativeTurnRef
+      ? nativeCheckpointRefSchema.parse({
+          harnessId: this.harnessId,
+          nativeSessionId: transport.state.sessionId,
+          checkpointId: nativeTurnRef.nativeTurnKey,
+          formatVersion: 1,
+        })
+      : undefined;
+
+    try {
+      for (const event of turn.events) this.#handleTurnEvent(active, event);
+      if (turn.result.status === "succeeded") {
+        if (!nativeTurnRef) throw new Error("Pi autonomous Turn has no native identity");
+        this.#completeTurn(
+          active,
+          { status: "succeeded", ...(checkpoint ? { checkpoint } : {}) },
+          turn.result.text,
+          nativeTurnRef,
+        );
+      } else if (turn.result.status === "cancelled") {
+        this.#completeTurn(
+          active,
+          {
+            status: "cancelled",
+            reason: turn.result.reason,
+            ...(checkpoint ? { checkpoint } : {}),
+          },
+          turn.result.text,
+          nativeTurnRef,
+        );
+      } else {
+        this.#completeTurn(
+          active,
+          {
+            status: "failed",
+            error: normalizedError(turn.result.error, "nativeFailure"),
+            ...(checkpoint ? { checkpoint } : {}),
+          },
+          turn.result.text,
+          nativeTurnRef,
+        );
+      }
+    } catch (error) {
+      const normalized = normalizedError(error, "protocolError");
+      if (this.#active === active) {
+        this.#completeTurn(
+          active,
+          { status: "failed", error: normalized },
+          undefined,
+          nativeTurnRef,
+        );
+      }
+      this.#fault(new PiAdapterFaultError(normalized));
+    }
+  }
+
+  #publishTransportState(
+    state: PiSessionState,
+    thinkingLevels: readonly HarnessThinkingOptionId[] | null,
+  ): void {
+    this.#state = harnessStateFromPi(state, thinkingLevels, this.#modelIndex);
+    this.#event({ type: "session.state.changed", state: this.#state });
+  }
+
+  #invalidateUsage(): void {
+    this.#usageGeneration += 1;
+    if (this.#usage === null) return;
+    this.#usage = null;
+    this.#event({ type: "session.usage.changed", usage: null });
+  }
+
+  async #refreshUsage(observedForTurnId?: HostTurnId): Promise<void> {
+    const transport = this.#transport;
+    if (!transport || this.#phase !== "open") return;
+    const generation = this.#usageGeneration;
+    const refreshSequence = ++this.#usageRefreshSequence;
+    const sessionId = transport.state.sessionId;
+    const model = `${transport.state.provider ?? ""}\u0000${transport.state.modelId ?? ""}`;
+    let usage: HostUsage | null;
+    try {
+      usage = await transport.getSessionUsage();
+    } catch {
+      return;
+    }
+    if (
+      usage === null ||
+      this.#phase !== "open" ||
+      this.#transport !== transport ||
+      this.#usageGeneration !== generation ||
+      this.#usageRefreshSequence !== refreshSequence ||
+      transport.state.sessionId !== sessionId ||
+      `${transport.state.provider ?? ""}\u0000${transport.state.modelId ?? ""}` !== model
+    ) {
+      return;
+    }
+    if (JSON.stringify(usage) === JSON.stringify(this.#usage)) return;
+    this.#usage = usage;
+    this.#event({
+      type: "session.usage.changed",
+      usage,
+      ...(observedForTurnId ? { observedForTurnId } : {}),
+    });
+  }
+
+  #handleTurnEvent(active: ActiveTurn, event: PiTurnEvent): void {
+    if (this.#active !== active || this.#phase === "closed" || this.#phase === "faulted") return;
+    switch (event.type) {
+      case "progress.message": {
+        if (active.progressItems.has(event.itemId)) return;
+        active.progressItems.add(event.itemId);
+        const item: HostAgentMessageItem = {
+          type: "agentMessage",
+          itemId: event.itemId,
+          text: event.text,
+          phase: "commentary",
+        };
+        this.#event({ type: "item.started", turnId: active.command.turnId, item });
+        this.#completeItem(active, item, { status: "succeeded" });
+        return;
+      }
+      case "text.delta":
+        this.#activateAgentMessage(active, event.messageId, event.nativeMessageIdentity);
+        active.sawAssistantMessage = true;
+        this.#appendText(active, event.delta);
+        return;
+      case "reasoning.delta":
+        this.#activateAgentMessage(active, event.messageId, event.nativeMessageIdentity);
+        this.#appendReasoning(active, event.delta, event.nativeMessageIdentity);
+        return;
+      case "reasoning.completed":
+        this.#completeReasoning(active, { status: "succeeded" });
+        return;
+      case "message.completed":
+        if (event.phase && active.agentMessageId === event.messageId && active.agentItem)
+          active.agentItem = { ...active.agentItem, phase: event.phase };
+        void this.#refreshUsage(active.command.turnId);
+        return;
+      case "compaction.started":
+        this.#startCompaction(active);
+        return;
+      case "compaction.completed":
+        this.#completeCompaction(active, event);
+        return;
+      case "interaction.requested":
+        this.#startInteraction(active, event.request);
+        return;
+      case "interaction.closed":
+        this.#closeInteraction(active, event.requestId, event.reason);
+        return;
+      case "tool.started":
+        this.#completeReasoning(active, { status: "succeeded" });
+        this.#completeAgentItem(active, { status: "succeeded" }, false);
+        this.#startTool(active, event);
+        return;
+      case "tool.updated":
+        this.#updateTool(active, event);
+        return;
+      case "tool.completed":
+        this.#completeTool(active, event);
+    }
+  }
+
+  #startCompaction(active: ActiveTurn): void {
+    if (active.compactionItem) throw new Error("Pi Compaction started more than once");
+    const item: HostContextCompactionItem = {
+      type: "contextCompaction",
+      itemId: this.#newItemId(),
+    };
+    active.compactionItem = item;
+    this.#event({ type: "item.started", turnId: active.command.turnId, item });
+  }
+
+  #completeCompaction(
+    active: ActiveTurn,
+    event: Extract<PiTurnEvent, { type: "compaction.completed" }>,
+  ): void {
+    const item = active.compactionItem;
+    if (!item) throw new Error("Pi Compaction completed without starting");
+    active.compactionItem = null;
+    const outcome: HostItemOutcome =
+      event.outcome === "succeeded"
+        ? { status: "succeeded" }
+        : event.outcome === "cancelled"
+          ? { status: "cancelled", reason: "Context compaction was cancelled" }
+          : {
+              status: "failed",
+              error: {
+                code: "nativeFailure",
+                message: event.errorMessage ?? "Pi context compaction failed",
+                retryable: true,
+              },
+            };
+    this.#completeItem(active, item, outcome);
+    if (event.outcome === "succeeded") void this.#refreshUsage(active.command.turnId);
+  }
+
+  #startInteraction(active: ActiveTurn, request: PiInteractionRequest): void {
+    if (active.interactionByNativeId.has(request.requestId)) {
+      throw new Error("Pi Interaction started more than once");
+    }
+    const interactionId = hostInteractionIdSchema.parse(randomUUID());
+    const question =
+      request.method === "select"
+        ? {
+            id: "answer",
+            type: "choice" as const,
+            prompt: request.title,
+            options: request.options.map((option) => ({ value: option, label: option })),
+            multiple: false,
+            allowOther: false,
+            optional: false,
+          }
+        : request.method === "confirm"
+          ? {
+              id: "answer",
+              type: "choice" as const,
+              prompt: request.message || request.title,
+              options: [
+                { value: "yes", label: "Yes" },
+                { value: "no", label: "No" },
+              ],
+              multiple: false,
+              allowOther: false,
+              optional: false,
+            }
+          : {
+              id: "answer",
+              type: "text" as const,
+              prompt: request.title,
+              multiline: request.method === "editor",
+              secret: false,
+              optional: false,
+              ...(request.method === "input" && request.placeholder
+                ? { placeholder: request.placeholder }
+                : {}),
+              ...(request.method === "editor" && request.prefill
+                ? { prefill: request.prefill }
+                : {}),
+            };
+    const associatedTool = active.tools.size === 1 ? [...active.tools.values()][0] : undefined;
+    const interaction: HostQuestionInteraction = {
+      type: "question",
+      interactionId,
+      turnId: active.command.turnId,
+      ...(associatedTool?.item.type === "toolExecution"
+        ? { itemId: associatedTool.item.itemId }
+        : {}),
+      title: "Pi",
+      questions: [question],
+      ...(request.timeoutMs !== undefined
+        ? { expiresAt: new Date(Date.now() + request.timeoutMs).toISOString() }
+        : {}),
+    };
+    active.interactions.set(interactionId, { interaction, nativeRequest: request });
+    active.interactionByNativeId.set(request.requestId, interactionId);
+    this.#channel.emit({ kind: "interaction", interaction });
+  }
+
+  #closeInteraction(
+    active: ActiveTurn,
+    nativeRequestId: string,
+    reason: "responded" | "cancelled" | "expired" | "superseded",
+  ): void {
+    const interactionId = active.interactionByNativeId.get(nativeRequestId);
+    if (!interactionId) throw new Error("Pi Interaction close references an unknown request");
+    active.interactionByNativeId.delete(nativeRequestId);
+    active.interactions.delete(interactionId);
+    this.#event({
+      type: "interaction.closed",
+      interactionId,
+      turnId: active.command.turnId,
+      reason,
+    });
+  }
+
+  #activateAgentMessage(
+    active: ActiveTurn,
+    messageId: string,
+    nativeMessageIdentity?: PiMessageIdentity,
+  ): void {
+    if (active.agentMessageId === messageId) return;
+    const nativeItemId = piMessageItemId(nativeMessageIdentity, "assistant");
+    if (nativeItemId && active.agentMessageId === null && active.agentItem?.text === "") {
+      // The projector has not put this empty placeholder on the wire.
+      this.#completeAgentItem(active, { status: "succeeded" }, true);
+    }
+    if (active.agentMessageId !== null) {
+      this.#completeReasoning(active, { status: "succeeded" });
+      this.#completeAgentItem(active, { status: "succeeded" }, true);
+    }
+    if (!active.agentItem) {
+      active.agentItem = {
+        type: "agentMessage",
+        itemId: nativeItemId ?? this.#newItemId(),
+        text: "",
+      };
+      this.#event({
+        type: "item.started",
+        turnId: active.command.turnId,
+        item: active.agentItem,
+      });
+    }
+    active.agentMessageId = messageId;
+  }
+
+  #appendText(active: ActiveTurn, text: string): void {
+    if (active.agentMessageId === null || !active.agentItem) {
+      throw new Error("Pi Assistant text arrived outside an active message");
+    }
+    active.agentItem = { ...active.agentItem, text: active.agentItem.text + text };
+    this.#event({
+      type: "item.updated",
+      turnId: active.command.turnId,
+      itemId: active.agentItem.itemId,
+      update: { type: "text.append", text },
+    });
+  }
+
+  #completeAgentItem(active: ActiveTurn, outcome: HostItemOutcome, completeEmpty: boolean): void {
+    active.agentMessageId = null;
+    const item = active.agentItem;
+    if (!item || (!completeEmpty && item.text.length === 0)) return;
+    active.agentItem = null;
+    this.#completeItem(active, item, outcome);
+  }
+
+  #appendReasoning(
+    active: ActiveTurn,
+    text: string,
+    nativeMessageIdentity?: PiMessageIdentity,
+  ): void {
+    if (text.length === 0) return;
+    if (!active.reasoningItem) {
+      active.reasoningItem = {
+        type: "reasoning",
+        itemId: piMessageItemId(nativeMessageIdentity, "reasoning") ?? this.#newItemId(),
+        text: "",
+      };
+      this.#event({
+        type: "item.started",
+        turnId: active.command.turnId,
+        item: active.reasoningItem,
+      });
+    }
+    active.reasoningItem = {
+      ...active.reasoningItem,
+      text: active.reasoningItem.text + text,
+    };
+    this.#event({
+      type: "item.updated",
+      turnId: active.command.turnId,
+      itemId: active.reasoningItem.itemId,
+      update: { type: "text.append", text },
+    });
+  }
+
+  #completeReasoning(active: ActiveTurn, outcome: HostItemOutcome): void {
+    const item = active.reasoningItem;
+    if (!item) return;
+    active.reasoningItem = null;
+    this.#completeItem(active, item, outcome);
+  }
+
+  #startTool(active: ActiveTurn, event: Extract<PiTurnEvent, { type: "tool.started" }>): void {
+    if (active.tools.has(event.callId)) throw new Error("Pi Tool started more than once");
+    const shell = piToolCommand(event.toolName, event.arguments);
+    const item: HostCommandExecutionItem | HostToolExecutionItem = shell
+      ? {
+          type: "commandExecution",
+          itemId: this.#newItemId(),
+          command: shell.command,
+          cwd: shell.cwd ?? this.#cwd,
+        }
+      : {
+          type: "toolExecution",
+          itemId: this.#newItemId(),
+          toolName: event.toolName,
+          arguments: event.arguments,
+        };
+    active.tools.set(event.callId, {
+      item,
+      nativeName: event.toolName,
+      startedAtMs: Date.now(),
+    });
+    this.#event({ type: "item.started", turnId: active.command.turnId, item });
+  }
+
+  #updateTool(active: ActiveTurn, event: Extract<PiTurnEvent, { type: "tool.updated" }>): void {
+    const tool = active.tools.get(event.callId);
+    if (!tool) throw new Error("Pi Tool update references an unknown Tool Call");
+    this.#subagents.start(
+      active.command.turnId,
+      tool.nativeName,
+      event.output,
+      this.#newItemId(),
+      event.callId,
+    );
+    const output = boundedOutput(event.output, this.#toolOutputLimit);
+    if (!output) return;
+    if (tool.item.type === "commandExecution") {
+      const previous = tool.item.output ?? "";
+      const next = outputText(output);
+      tool.item = {
+        ...tool.item,
+        output: next,
+        outputTruncated: output.truncated === true,
+      };
+      if (next.startsWith(previous)) {
+        const delta = next.slice(previous.length);
+        if (delta.length > 0) {
+          this.#event({
+            type: "item.updated",
+            turnId: active.command.turnId,
+            itemId: tool.item.itemId,
+            update: { type: "output.append", text: delta },
+          });
+        }
+      }
+      return;
+    }
+    tool.item = { ...tool.item, output };
+    this.#event({
+      type: "item.updated",
+      turnId: active.command.turnId,
+      itemId: tool.item.itemId,
+      update: { type: "output.replace", output },
+    });
+  }
+
+  #completeTool(active: ActiveTurn, event: Extract<PiTurnEvent, { type: "tool.completed" }>): void {
+    const tool = active.tools.get(event.callId);
+    if (!tool || tool.nativeName !== event.toolName) {
+      throw new Error("Pi Tool completion references an unknown Tool Call");
+    }
+    active.tools.delete(event.callId);
+    const durationMs = Math.max(0, Date.now() - tool.startedAtMs);
+    const output = boundedOutput(event.result, this.#toolOutputLimit);
+    if (tool.item.type === "commandExecution") {
+      const exitCode = numberField(event.result, "exitCode");
+      tool.item = {
+        ...tool.item,
+        ...(output
+          ? {
+              output: outputText(output),
+              outputTruncated: output.truncated === true,
+            }
+          : {}),
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        durationMs,
+      };
+    } else {
+      tool.item = { ...tool.item, ...(output ? { output } : {}), durationMs };
+    }
+    const outcome: HostItemOutcome = active.cancellationRequested
+      ? { status: "cancelled", reason: "Cancelled by user" }
+      : event.isError
+        ? { status: "failed", error: toolFailure(event.toolName) }
+        : { status: "succeeded" };
+    this.#completeItem(active, tool.item, outcome);
+    this.#subagents.start(
+      active.command.turnId,
+      event.toolName,
+      event.result,
+      this.#newItemId(),
+      event.callId,
+    );
+
+    if (!event.isError) {
+      try {
+        const args = tool.item.type === "toolExecution" ? tool.item.arguments : {};
+        const changes = piToolFileChanges(event.toolName, args, event.result, this.#cwd);
+        if (changes) {
+          const fileItem: HostItem = {
+            type: "fileChange",
+            itemId: this.#newItemId(),
+            sourceItemIds: [tool.item.itemId],
+            changes,
+          };
+          this.#event({ type: "item.started", turnId: active.command.turnId, item: fileItem });
+          this.#completeItem(active, fileItem, { status: "succeeded" });
+        }
+      } catch {
+        // Native Edit/Write results are often numbered snippets, not unified diffs.
+        // Never let file-change projection fault the live Session.
+      }
+    }
+  }
+
+  #completeItem(active: ActiveTurn, item: HostItem, outcome: HostItemOutcome): void {
+    this.#event({
+      type: "item.completed",
+      turnId: active.command.turnId,
+      snapshot: { item, outcome },
+    });
+  }
+
+  #closeActiveInteractions(
+    active: ActiveTurn,
+    reason: "cancelled" | "expired" | "superseded",
+  ): void {
+    for (const [interactionId, pending] of active.interactions) {
+      active.interactions.delete(interactionId);
+      active.interactionByNativeId.delete(pending.nativeRequest.requestId);
+      this.#event({
+        type: "interaction.closed",
+        interactionId,
+        turnId: active.command.turnId,
+        reason,
+      });
+    }
+  }
+
+  async #completedTurnIdentity(
+    active: ActiveTurn,
+    transport: PiTurnTransport,
+  ): Promise<{ nativeTurnRef: NativeTurnRef; checkpoint?: NativeCheckpointRef }> {
+    active.acceptingSteers = false;
+    await Promise.allSettled([...active.pendingSteers]);
+    const snapshot = mapPiSnapshot(active.steerFailure?.history ?? (await transport.getEntries()), {
+      sessionId: transport.state.sessionId,
+      model: nativeModelForHistory(transport.state),
+    });
+    const created = snapshot.turns.filter(
+      (turn) =>
+        turn.input.length > 0 && !active.beforeNativeTurnKeys.has(turn.nativeTurnRef.nativeTurnKey),
+    );
+    const expected = 1 + active.acceptedSteerCount;
+    if (created.length !== expected) {
+      throw new Error(
+        `Pi Turn persisted ${created.length} new User Entries; exactly ${expected} is required`,
+      );
+    }
+    const turn = created[0];
+    if (!turn) throw new Error("Pi Turn has no persisted User identity");
+    return {
+      nativeTurnRef: turn.nativeTurnRef,
+      ...(turn.checkpoint ? { checkpoint: turn.checkpoint } : {}),
+    };
+  }
+
+  #completeTurn(
+    active: ActiveTurn,
+    outcome: TurnOutcome,
+    finalText?: string,
+    nativeTurnRef?: NativeTurnRef,
+  ): void {
+    if (this.#active !== active) return;
+    this.#closeActiveInteractions(
+      active,
+      outcome.status === "succeeded" ? "superseded" : "cancelled",
+    );
+    this.#active = null;
+    const itemOutcome: HostItemOutcome =
+      outcome.status === "failed"
+        ? { status: "failed", error: outcome.error }
+        : outcome.status === "cancelled"
+          ? { status: "cancelled", ...(outcome.reason ? { reason: outcome.reason } : {}) }
+          : { status: "succeeded" };
+    this.#completeReasoning(active, itemOutcome);
+    if (active.compactionItem) {
+      this.#completeItem(active, active.compactionItem, itemOutcome);
+      active.compactionItem = null;
+    }
+    for (const tool of active.tools.values()) this.#completeItem(active, tool.item, itemOutcome);
+    active.tools.clear();
+    this.#subagents.finish(active.command.turnId);
+    if (!active.sawAssistantMessage && finalText !== undefined && active.agentItem) {
+      active.agentItem = { ...active.agentItem, text: finalText };
+    }
+    this.#completeAgentItem(active, itemOutcome, true);
+    this.#event({
+      type: "turn.completed",
+      turnId: active.command.turnId,
+      outcome,
+      ...(nativeTurnRef ? { nativeTurnRef } : {}),
+    });
+    active.resolveCompletion();
+    if (active.steerFailure) {
+      // The completed Turn keeps its real outcome; Host recovery reopens the same history.
+      this.#fault(active.steerFailure);
+      return;
+    }
+    queueMicrotask(() => {
+      if (this.#phase !== "open") return;
+      if (this.#transport) this.#drainPendingAutonomousTurns(this.#transport);
+      void this.#refreshUsage(active.command.turnId);
+    });
+  }
+
+  #fault(error: unknown): void {
+    if (this.#phase === "closed" || this.#phase === "faulted") return;
+    const normalized = normalizedError(error, "internalError");
+    this.#pendingAutonomousTurns = [];
+    this.#pendingAutonomousLifecycle = [];
+    this.#pendingAutonomousLifecycleBytes = 0;
+    if (this.#active) {
+      this.#completeTurn(this.#active, { status: "failed", error: normalized });
+    }
+    this.#phase = "faulted";
+    this.#event({ type: "session.faulted", error: normalized });
+    this.#channel.end();
+  }
+
+  async #close(): Promise<void> {
+    this.#pendingAutonomousTurns = [];
+    this.#pendingAutonomousLifecycle = [];
+    this.#pendingAutonomousLifecycleBytes = 0;
+    if (this.#phase === "closed") return;
+    const wasFaulted = this.#phase === "faulted";
+    if (!wasFaulted) this.#phase = "closing";
+    const transport =
+      this.#transport ?? (this.#starting ? await this.#starting.catch(() => null) : null);
+    const active = this.#active;
+    if (transport && active) {
+      active.cancellationRequested = true;
+      await transport.abort().catch(() => undefined);
+      await Promise.race([active.completion, delay(this.#closeTimeoutMs)]);
+    }
+    try {
+      if (transport) await transport.close();
+    } catch (error) {
+      this.#fault(error);
+      throw error;
+    }
+    if (this.#active) {
+      const error = invalidState("Pi Session closed before active Turn cancellation settled");
+      this.#completeTurn(this.#active, { status: "failed", error });
+    }
+    if (!wasFaulted) {
+      this.#phase = "closed";
+      this.#channel.end();
+    }
+  }
+
+  #event(event: HostEvent): void {
+    event = configureSubagentEvent(event, this.#subagentConfiguration());
+    this.#channel.emit({ kind: "event", event });
+  }
+
+  #newItemId(): HostItemId {
+    return hostItemIdSchema.parse(randomUUID());
+  }
+}
+
+export class PiAdapter implements HarnessAdapter {
+  readonly normalizeStoredModelRef = normalizeStoredPiModelRef;
+  readonly credentialImports: HarnessCredentialImports;
+  readonly commandCatalog = piCommandCatalog;
+  readonly liveCommandCatalog = true;
+  readonly harnessId: HarnessId = piHarnessId;
+  readonly subagents: HarnessSubagentCapability = {
+    readSnapshot: async ({ parent, nativeSubagentId, cwd }) => {
+      let transport: PiTurnTransport | undefined;
+      try {
+        if (this.#closePromise || parent.harnessId !== this.harnessId) {
+          return { ok: false, error: invalidState("Pi Subagent parent is unavailable") };
+        }
+        const gotgenes = parseGotgenesId(nativeSubagentId);
+        const workflow = parsePiWorkflowSubagentId(nativeSubagentId);
+        if (!workflow && !gotgenes) parsePiSubagentId(nativeSubagentId);
+        const live = [...this.#sessions].find((session) =>
+          session.ownsNativeSession(parent.nativeSessionId),
+        );
+        let reply: PiSubagentInspection;
+        if (live) {
+          if (gotgenes) return await live.readGotgenesChild(gotgenes, cwd);
+          if (workflow)
+            return await readPiWorkflowChild(
+              await live.readSubagentHistory(cwd),
+              parent.nativeSessionId,
+              workflow,
+            );
+          reply = await live.inspectSubagent(nativeSubagentId, cwd);
+        } else {
+          const sessionFile = sessionFileFromRef(parent);
+          transport = this.#createTransport({ cwd, sessionFile });
+          this.#inspections.add(transport);
+          await transport.start();
+          if (transport.state.sessionId !== parent.nativeSessionId)
+            throw new Error("Pi Subagent parent identity mismatch");
+          await transport.verifySessionCwd(cwd);
+          if (gotgenes)
+            return await readGotgenesChild(
+              await transport.getEntries(),
+              parent.nativeSessionId,
+              gotgenes,
+            );
+          if (workflow)
+            return await readPiWorkflowChild(
+              await transport.getEntries(),
+              parent.nativeSessionId,
+              workflow,
+            );
+          if (!transport.inspectSubagent)
+            throw new Error("Pi transport does not support Subagent inspection");
+          reply = await transport.inspectSubagent(nativeSubagentId);
+        }
+        if (reply.error)
+          return {
+            ok: false,
+            error: {
+              code:
+                reply.error.code === "foreign_session"
+                  ? "invalidRequest"
+                  : ["not_found", "stale"].includes(reply.error.code)
+                    ? "sessionNotFound"
+                    : "unavailable",
+              message: reply.error.message,
+              retryable: false,
+            },
+          };
+        return {
+          ok: true,
+          value: piSubagentSnapshot(parent.nativeSessionId, nativeSubagentId, reply),
+        };
+      } catch (error) {
+        return { ok: false, error: normalizedError(error, "unavailable") };
+      } finally {
+        if (transport) {
+          this.#inspections.delete(transport);
+          await transport.close();
+        }
+      }
+    },
+  };
+  readonly usageStatistics: ReturnType<typeof createPiUsageStatistics>;
+  readonly sessionImport = Object.freeze({
+    listCandidates: async () => {
+      const result = await this.#importScope.read((signal) => this.#importIndex.list(signal));
+      return result.ok
+        ? { ok: true as const, value: result.value.map(({ candidate }) => candidate) }
+        : result;
+    },
+    resolveCandidate: (nativeSessionId: string) =>
+      this.#importScope.resolve((signal) => this.#importIndex.resolve(nativeSessionId, signal)),
+  } satisfies HarnessSessionImportCapability);
+  readonly #importIndex: PiSessionImportIndex;
+  readonly #importScope = new SessionImportScope({
+    closedMessage: "Pi Adapter is closed",
+    unavailableMessage:
+      "Pi Session discovery failed; check storage access and duplicate Session identities, then retry after closing native clients",
+    notFoundMessage: "Pi Session is no longer importable",
+  });
+  readonly #closeTimeoutMs: number;
+  readonly #createTransport: PiAdapterDependencies["createTransport"];
+  readonly #inspectionCache = new Map<string, Extract<HarnessInspection, { status: "ready" }>>();
+  readonly #inspectionInFlight = new Map<string, Promise<HarnessInspection>>();
+  readonly #inspections = new Set<PiTurnTransport>();
+  readonly #sessions = new Set<PiHarnessSession>();
+  readonly #toolOutputLimit: number;
+  readonly #environment: NodeJS.ProcessEnv;
+  #closePromise: Promise<void> | null = null;
+  #thinkingSelectionSupported: boolean | null = null;
+
+  constructor(
+    options: PiAdapterOptions = {},
+    dependencies: PiAdapterDependencies = {
+      createTransport: (sessionOptions) => new PiRpcSession({ ...options, ...sessionOptions }),
+    },
+  ) {
+    const imports = createPiCredentialImports(options);
+    const updateCatalog = async (operation: Promise<void>): Promise<void> => {
+      await operation;
+      this.#inspectionCache.clear();
+      this.#inspectionInFlight.clear();
+    };
+    this.credentialImports = {
+      providers: imports.providers,
+      list: () => imports.list(),
+      listOthers: () => imports.listOthers?.() ?? Promise.resolve([]),
+      add: (name, credential) => updateCatalog(imports.add(name, credential)),
+      reimport: (name, credential) => updateCatalog(imports.reimport(name, credential)),
+      remove: (name) => updateCatalog(imports.remove(name)),
+    };
+    this.#createTransport = dependencies.createTransport;
+    this.#environment = options.environment ?? process.env;
+    this.#importIndex = new PiSessionImportIndex({ ...process.env, ...options.environment });
+    this.usageStatistics = createPiUsageStatistics({ ...process.env, ...options.environment });
+    this.#closeTimeoutMs = options.closeTimeoutMs ?? 2_000;
+    this.#toolOutputLimit = options.toolOutputLimit ?? DEFAULT_TOOL_OUTPUT_LIMIT;
+  }
+
+  /** Pi itself holds no Account; this reports configured Provider balances. */
+  async inspectAccounts() {
+    if (this.#closePromise) return [];
+    return fetchPiAccounts({ environment: this.#environment });
+  }
+
+  async inspectAccount() {
+    const accounts = await this.inspectAccounts();
+    return accounts[0] ?? null;
+  }
+
+  async inspect(input: InspectHarnessInput = {}): Promise<HarnessInspection> {
+    if (this.#closePromise) {
+      return {
+        status: "unavailable",
+        error: {
+          code: "invalidState",
+          message: "Pi Adapter is closed",
+          retryable: false,
+        },
+      };
+    }
+    const cwd = resolvePiInspectCwd(input.cwd);
+    const inFlight = this.#inspectionInFlight.get(cwd);
+    if (input.refresh) {
+      this.#inspectionCache.clear();
+      this.#inspectionInFlight.clear();
+      if (inFlight) this.#inspectionInFlight.set(cwd, inFlight);
+    }
+    if (inFlight) return inFlight;
+    const cached = this.#inspectionCache.get(cwd);
+    if (cached) return cached;
+
+    const inspection = this.#inspectCwd(cwd).then((result) => {
+      if (result.status === "ready" && this.#inspectionInFlight.get(cwd) === inspection) {
+        this.#inspectionCache.set(cwd, result);
+        this.#thinkingSelectionSupported = result.capabilities.configuration.selectThinkingOption;
+      }
+      return result;
+    });
+    this.#inspectionInFlight.set(cwd, inspection);
+    return inspection.finally(() => {
+      if (this.#inspectionInFlight.get(cwd) === inspection) {
+        this.#inspectionInFlight.delete(cwd);
+      }
+    });
+  }
+
+  async #inspectCwd(cwd: string): Promise<HarnessInspection> {
+    const startedAt = Date.now();
+    let stage = "spawn";
+    const transport = this.#createTransport({ cwd, onFault: () => undefined });
+    this.#inspections.add(transport);
+    try {
+      stage = "startup";
+      await transport.start();
+      stage = "model-catalog";
+      const models = await transport.getAvailableModels();
+      stage = "capabilities";
+      const thinkingLevels = await transport.getAvailableThinkingLevels();
+      const catalog = normalizePiModelCatalog(
+        models,
+        nativeModelFromState(transport.state),
+        thinkingLevels,
+        transport.state.thinkingLevel,
+        transport.state.modelReasoning ?? null,
+        await transport.supportsFastMode?.(),
+      );
+      await transport.close();
+      return {
+        status: "ready",
+        catalog,
+        capabilities: {
+          configuration: {
+            selectModel: true,
+            selectThinkingOption: thinkingLevels !== null,
+            selectPermissionMode: false,
+            permissionModeScope: "live",
+          },
+          history: { fork: true, forkAcrossCwd: true, rollbackLastTurn: true },
+          autonomousTurns: { observe: true },
+          subagents: { observe: true, readTranscript: true },
+        },
+      };
+    } catch (error) {
+      await transport.close().catch(() => undefined);
+      const normalized = normalizedError(error, "unavailable");
+      return {
+        status: normalized.code === "notInstalled" ? "notInstalled" : "error",
+        error: {
+          ...normalized,
+          stage,
+          durationMs: Date.now() - startedAt,
+          ...(normalized.stderrTail || !transport.stderrTail
+            ? {}
+            : { stderrTail: transport.stderrTail }),
+        },
+      };
+    } finally {
+      this.#inspections.delete(transport);
+    }
+  }
+
+  async open(input: OpenSessionInput): Promise<HarnessResult<HarnessSession>> {
+    if (this.#closePromise) {
+      return { ok: false, error: invalidState("Pi Adapter is closed") };
+    }
+    if (input.cwd.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: "invalidRequest",
+          message: "Pi Adapter requires cwd",
+          retryable: false,
+        },
+      };
+    }
+    if (input.kind === "create") {
+      if (input.permissionModeId) {
+        return {
+          ok: false,
+          error: {
+            code: "unsupported",
+            message: "Pi does not expose a selectable Permission Mode",
+            retryable: false,
+          },
+        };
+      }
+      if (input.model) {
+        const parsed = harnessModelRefSchema.safeParse(input.model);
+        if (!parsed.success || parsed.data.serviceTier === "ultrafast") {
+          return {
+            ok: false,
+            error: { code: "invalidRequest", message: "Invalid Pi Model Ref", retryable: false },
+          };
+        }
+        if (parsed.data.serviceTier === "priority") {
+          const inspection = await this.inspect({ cwd: input.cwd });
+          if (
+            inspection.status !== "ready" ||
+            !inspection.catalog.models.some(({ fastModel }) =>
+              sameHarnessModelRef(fastModel, parsed.data),
+            )
+          ) {
+            return {
+              ok: false,
+              error: {
+                code: "unsupported",
+                message: "Fast is unavailable for this Pi Model",
+                retryable: false,
+              },
+            };
+          }
+        }
+      }
+      const thinkingOptionId = input.thinkingOptionId
+        ? harnessThinkingOptionIdSchema.safeParse(input.thinkingOptionId)
+        : null;
+      if (thinkingOptionId && !thinkingOptionId.success) {
+        return {
+          ok: false,
+          error: {
+            code: "invalidRequest",
+            message: "Pi create Thinking option is invalid",
+            retryable: false,
+          },
+        };
+      }
+      return {
+        ok: true,
+        value: this.#trackSession(input.cwd, {
+          ...(input.environment ? { environment: input.environment } : {}),
+          ...(input.model ? { model: input.model } : {}),
+          ...(thinkingOptionId?.success ? { thinkingOptionId: thinkingOptionId.data } : {}),
+          supportsThinkingSelection: this.#thinkingSelectionSupported === true,
+        }),
+      };
+    }
+
+    const sourceRef = nativeSessionRefSchema.parse(
+      input.kind === "resume" ? input.nativeRef : input.sourceRef,
+    ) as NativeSessionRef;
+    let session: PiHarnessSession | undefined;
+    let transport: PiTurnTransport | undefined;
+    try {
+      if (sourceRef.harnessId !== this.harnessId) {
+        return {
+          ok: false,
+          error: {
+            code: "invalidRequest",
+            message: "Pi Adapter cannot open another Harness's Native Session",
+            retryable: false,
+          },
+        };
+      }
+      const sourceSessionFile = sessionFileFromRef(sourceRef);
+      if (input.kind === "fork") {
+        const checkpoint = nativeCheckpointRefSchema.parse(input.checkpoint);
+        if (
+          checkpoint.harnessId !== this.harnessId ||
+          checkpoint.nativeSessionId !== sourceRef.nativeSessionId
+        ) {
+          throw new PiAdapterFaultError({
+            code: "checkpointNotFound",
+            message: "Pi Checkpoint does not belong to the source Native Session",
+            retryable: false,
+          });
+        }
+      }
+      const emptySessionConfiguration =
+        input.kind === "resume"
+          ? await readPiEmptySessionConfiguration(sourceSessionFile)
+          : undefined;
+      transport = this.#createTransport({
+        cwd: input.cwd,
+        ...(input.environment ? { environment: input.environment } : {}),
+        ...(emptySessionConfiguration ? { emptySessionConfiguration } : {}),
+        ...(input.kind === "resume"
+          ? { sessionFile: sourceSessionFile }
+          : { forkSessionFile: sourceSessionFile }),
+        onFault: (error) => session?.handleTransportFault(error),
+      });
+      await transport.start();
+
+      if (input.kind === "resume") {
+        if (transport.state.sessionId !== sourceRef.nativeSessionId) {
+          throw new PiAdapterFaultError({
+            code: "sessionNotFound",
+            message: "Pi resumed Session identity does not match the persisted Native Session Ref",
+            retryable: false,
+          });
+        }
+      } else if (input.kind === "fork") {
+        const checkpoint = nativeCheckpointRefSchema.parse(input.checkpoint);
+        const startupSessionId = transport.state.sessionId;
+        if (startupSessionId === sourceRef.nativeSessionId) {
+          throw new Error("Pi Fork startup did not create a distinct Native Session identity");
+        }
+        const copiedHistory = await transport.getEntries();
+        let boundary: ReturnType<typeof resolvePiForkBoundary>;
+        try {
+          boundary = resolvePiForkBoundary(copiedHistory, checkpoint.checkpointId);
+        } catch {
+          throw new PiAdapterFaultError({
+            code: "checkpointNotFound",
+            message: "Pi Checkpoint is not on the source Session's active branch",
+            retryable: false,
+          });
+        }
+        const derivedState = boundary.nextUserEntryId
+          ? await transport.fork(boundary.nextUserEntryId)
+          : transport.state;
+        if (
+          derivedState.sessionId === sourceRef.nativeSessionId ||
+          (boundary.nextUserEntryId && derivedState.sessionId === startupSessionId)
+        ) {
+          throw new Error("Pi Fork did not create the required Native Session identity");
+        }
+        const derivedSnapshot = mapPiSnapshot(await transport.getEntries(), {
+          sessionId: derivedState.sessionId,
+          model: nativeModelForHistory(derivedState),
+        });
+        const terminal = derivedSnapshot.turns.at(-1);
+        if (
+          derivedSnapshot.turns.length !== boundary.targetTurnIndex + 1 ||
+          terminal?.nativeTurnRef.nativeTurnKey !== checkpoint.checkpointId
+        ) {
+          throw new Error("Pi Fork derived history does not match the requested Checkpoint");
+        }
+        await transport.verifySessionCwd(input.cwd);
+      } else {
+        const rolledBack = await rollbackPiLastTurn(
+          transport,
+          sourceRef.nativeSessionId,
+          input.cwd,
+        );
+        if (!rolledBack.ok) {
+          throw new PiAdapterFaultError({
+            code: rolledBack.reason === "unsupported" ? "unsupported" : "invalidState",
+            message:
+              rolledBack.reason === "unsupported"
+                ? "Pi cannot roll back a custom-triggered Turn at an exact native boundary"
+                : "Pi Native Session has no Turn to roll back",
+            retryable: false,
+          });
+        }
+        if (rolledBack.unpersisted) {
+          const state = transport.state;
+          const history = await transport.getEntries();
+          // Pi defers writing an empty fork until its first Assistant message. Stop this writer
+          // before publishing native history, then resume so Pi observes the already flushed file.
+          await transport.close();
+          await persistEmptyPiSession({
+            state,
+            history,
+            sourceSessionFile,
+            sourceSessionId: sourceRef.nativeSessionId,
+            cwd: input.cwd,
+          });
+          if (!state.sessionFile) throw new Error("Pi empty fork has no Session file");
+          const configuration = await readPiEmptySessionConfiguration(state.sessionFile);
+          if (!configuration) throw new Error("Pi empty fork has no restorable configuration");
+          transport = this.#createTransport({
+            cwd: input.cwd,
+            ...(input.environment ? { environment: input.environment } : {}),
+            sessionFile: state.sessionFile,
+            emptySessionConfiguration: configuration,
+            onFault: (error) => session?.handleTransportFault(error),
+          });
+          await transport.start();
+          if (transport.state.sessionId !== state.sessionId) {
+            throw new Error("Pi empty fork resumed with a different identity");
+          }
+          const model = nativeModelFromState(state);
+          if (model && !samePiModel(nativeModelFromState(transport.state), model)) {
+            await transport.selectModel(model);
+          }
+          if (state.thinkingLevel && transport.state.thinkingLevel !== state.thinkingLevel) {
+            await transport.selectThinkingOption(state.thinkingLevel);
+          }
+          if (
+            !samePiModel(nativeModelFromState(transport.state), model) ||
+            transport.state.thinkingLevel !== state.thinkingLevel
+          ) {
+            throw new Error("Pi empty fork could not restore its configuration");
+          }
+          await transport.verifySessionCwd(input.cwd);
+        }
+      }
+
+      const startedModels = await transport.getAvailableModels();
+      const current = nativeModelFromState(transport.state);
+      // Native history restores Model/Thinking; the stored Ref restores only Fast.
+      if (
+        input.kind === "resume" &&
+        input.model &&
+        current &&
+        sameHarnessModelRef(
+          input.model,
+          livePiModelIndex(startedModels, transport.state).ref({ ...current, fast: true }),
+        ) &&
+        (await isFastSupported(current, startedModels, transport))
+      ) {
+        if (!transport.selectFastMode) throw new Error("Pi Fast extension is unavailable");
+        await transport.selectFastMode(true);
+      }
+      const startedThinkingLevels = await transport.getAvailableThinkingLevels();
+      this.#thinkingSelectionSupported = startedThinkingLevels !== null;
+      const initialUsage = await transport.getSessionUsage().catch(() => null);
+      const usageHistory = await transport
+        .getEntries()
+        .then(piUsageHistory)
+        .catch(() => ({ requests: [], complete: false }));
+      session = this.#trackSession(input.cwd, {
+        usageHistory,
+        ...(input.environment ? { environment: input.environment } : {}),
+        startedTransport: transport,
+        startedModels,
+        startedThinkingLevels,
+        initialUsage,
+        supportsThinkingSelection: startedThinkingLevels !== null,
+      });
+      return { ok: true, value: session };
+    } catch (error) {
+      await transport?.close().catch(() => undefined);
+      return { ok: false, error: normalizedError(error, "nativeFailure") };
+    }
+  }
+
+  #trackSession(
+    cwd: string,
+    options: {
+      environment?: NodeJS.ProcessEnv;
+      model?: HarnessModelRef;
+      thinkingOptionId?: HarnessThinkingOptionId;
+      supportsThinkingSelection: boolean;
+      startedTransport?: PiTurnTransport;
+      startedModels?: readonly PiNativeModel[];
+      startedThinkingLevels?: HarnessThinkingOptionId[] | null;
+      initialUsage?: HostUsage | null;
+      usageHistory?: { requests: HostUsageRequest[]; complete: boolean };
+    },
+  ): PiHarnessSession {
+    const environment = options.environment;
+    const createTransport = environment
+      ? (input: PiRpcSessionOptions) => this.#createTransport({ ...input, environment })
+      : this.#createTransport;
+    const session = new PiHarnessSession(
+      cwd,
+      createTransport,
+      () => {
+        this.#sessions.delete(session);
+      },
+      {
+        closeTimeoutMs: this.#closeTimeoutMs,
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.thinkingOptionId ? { thinkingOptionId: options.thinkingOptionId } : {}),
+        toolOutputLimit: this.#toolOutputLimit,
+        supportsThinkingSelection: options.supportsThinkingSelection,
+        ...(options.startedTransport ? { startedTransport: options.startedTransport } : {}),
+        ...(options.startedModels ? { startedModels: options.startedModels } : {}),
+        ...(options.startedThinkingLevels !== undefined
+          ? { startedThinkingLevels: options.startedThinkingLevels }
+          : {}),
+        ...(options.initialUsage !== undefined ? { initialUsage: options.initialUsage } : {}),
+        ...(options.usageHistory ? { usageHistory: options.usageHistory } : {}),
+      },
+    );
+    this.#sessions.add(session);
+    return session;
+  }
+
+  close(): Promise<void> {
+    if (!this.#closePromise) {
+      this.#closePromise = Promise.all([
+        this.#importScope.close(),
+        ...[...this.#inspections].map((transport) => transport.close()),
+        ...[...this.#sessions].map((session) => session.close()),
+      ]).then(() => undefined);
+    }
+    return this.#closePromise;
+  }
+}

@@ -1,0 +1,1055 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { PassThrough } from "node:stream";
+
+import { describe, expect, it, vi } from "vitest";
+
+import { DELEGATION_HELP, runDelegationCli } from "../src/delegation-cli.js";
+import {
+  DELEGATION_RUNTIME_ENDPOINT_ENV,
+  DELEGATION_RUNTIME_TOKEN_ENV,
+  DELEGATION_THREAD_ID_ENV,
+  NATIVE_CODEX_THREAD_ID_ENV,
+} from "../src/delegation-types.js";
+
+function outputText(stream: PassThrough): string {
+  return stream.read()?.toString() ?? "";
+}
+
+function successfulFetch(body: unknown): typeof fetch {
+  return vi.fn(
+    async () => new Response(JSON.stringify(body), { status: 200 }),
+  ) as unknown as typeof fetch;
+}
+
+async function answersFixture() {
+  const directory = await mkdtemp(path.join(tmpdir(), "codexhost-cli-answers-"));
+  return {
+    directory,
+    async write(content: string) {
+      const file = path.join(directory, "answers.json");
+      await writeFile(file, content);
+      return file;
+    },
+    close: () => rm(directory, { recursive: true, force: true }),
+  };
+}
+
+function answerCli(file: string, fetchImpl: typeof fetch) {
+  const output = new PassThrough();
+  const diagnosticOutput = new PassThrough();
+  return {
+    output,
+    diagnosticOutput,
+    run: (extraArguments: string[] = []) =>
+      runDelegationCli({
+        arguments: [
+          "thread",
+          "answer",
+          "codex://threads/child",
+          "--interaction",
+          "interaction-1",
+          "--answers-file",
+          file,
+          ...extraArguments,
+        ],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output,
+        diagnosticOutput,
+        fetchImpl,
+      }),
+  };
+}
+
+describe("delegation CLI", () => {
+  it.each([
+    ["harness", "list", "--help"],
+    ["harness", "inspect", "--help"],
+    ["delegate", "start", "--help"],
+    ["thread", "send", "--help"],
+    ["thread", "cancel", "--help"],
+    ["thread", "read", "--help"],
+    ["thread", "wait", "--help"],
+    ["thread", "answer", "--help"],
+    ["thread", "watch", "--help"],
+    ["thread", "watches", "--help"],
+    ["thread", "list", "--help"],
+  ])("shows scoped help for %s %s", async (group, command, help) => {
+    const output = new PassThrough();
+    const fetchImpl = successfulFetch({});
+    expect(await runDelegationCli({ arguments: [group, command, help], output, fetchImpl })).toBe(
+      0,
+    );
+    const text = outputText(output);
+    expect(text).toContain(`codexhost ${group} ${command}`);
+    if (`${group} ${command}` === "delegate start") {
+      expect(text).toContain("--model <id>");
+      expect(text).toContain("gpt-6.2-sol~fast");
+      expect(text).toContain("gpt-6.2-sol~ultrafast");
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("discovers Harnesses without reading a Model catalog", async () => {
+    const fetchImpl = successfulFetch({ harnesses: ["codex", "pi"] });
+    const output = new PassThrough();
+    expect(
+      await runDelegationCli({
+        arguments: ["harness", "list", "--format", "compact"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(outputText(output))).toEqual({ harnesses: ["codex", "pi"] });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(String(vi.mocked(fetchImpl).mock.calls[0]?.[0])).toContain("/v1/harness/list");
+  });
+
+  it.each([
+    {
+      arguments: ["host", "info", "--refresh", "true"],
+      route: "/v1/host/info",
+      body: { refresh: true },
+    },
+    {
+      arguments: ["project", "list", "--query", "bat", "--offset", "0", "--limit", "10"],
+      route: "/v1/project/list",
+      body: { query: "bat", offset: 0, limit: 10 },
+    },
+    {
+      arguments: [
+        "thread",
+        "file",
+        "codex://threads/t1",
+        "--path",
+        "outputs/image.png",
+        "--offset",
+        "0",
+      ],
+      route: "/v1/thread/file",
+      body: { threadId: "t1", path: "outputs/image.png", offset: 0 },
+    },
+  ])(
+    "exposes inventory and validated result-file routes: $route",
+    async ({ arguments: args, route, body }) => {
+      const fetchImpl = successfulFetch({ ok: true });
+      const output = new PassThrough();
+      expect(
+        await runDelegationCli({
+          arguments: args,
+          environment: {
+            [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+            [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          },
+          output,
+          fetchImpl,
+        }),
+      ).toBe(0);
+      const call = vi.mocked(fetchImpl).mock.calls[0];
+      expect(String(call?.[0])).toContain(route);
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual(body);
+      expect(JSON.parse(outputText(output))).toEqual({ ok: true });
+    },
+  );
+
+  it.each(["--help", "-h", "help"])(
+    "shows Host group help for %s without connecting",
+    async (help) => {
+      const output = new PassThrough();
+      const fetchImpl = successfulFetch({});
+      expect(await runDelegationCli({ arguments: ["host", help], output, fetchImpl })).toBe(0);
+      expect(outputText(output)).toContain("codexhost host info");
+      expect(fetchImpl).not.toHaveBeenCalled();
+    },
+  );
+
+  it("prints the authoritative help", async () => {
+    const output = new PassThrough();
+    await expect(runDelegationCli({ arguments: ["delegate", "--help"], output })).resolves.toBe(0);
+    expect(outputText(output)).toBe(DELEGATION_HELP);
+  });
+
+  it("inspects Harness configuration through the Runtime", async () => {
+    const fetchImpl = successfulFetch({
+      harnessId: "pi",
+      inspection: { status: "ready", catalog: { models: [], thinkingOptions: [] } },
+    });
+    const output = new PassThrough();
+    await expect(
+      runDelegationCli({
+        arguments: ["harness", "inspect", "pi", "--cwd", "/synthetic", "--refresh", "true"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output,
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    const firstCall = vi.mocked(fetchImpl).mock.calls[0];
+    if (!firstCall) throw new Error("Runtime fetch was not called");
+    expect(String(firstCall[0])).toContain("/v1/harness/inspect");
+    expect(JSON.parse(String(firstCall[1]?.body))).toEqual({
+      harnessId: "pi",
+      cwd: path.resolve("/synthetic"),
+      refresh: true,
+      credentialAccess: "retry",
+    });
+  });
+
+  it("preserves the caller Thread while resolving a relative Harness inspection cwd", async () => {
+    const fetchImpl = successfulFetch({
+      harnessId: "pi",
+      inspection: { status: "ready", catalog: { models: [], thinkingOptions: [] } },
+    });
+    await expect(
+      runDelegationCli({
+        arguments: ["harness", "inspect", "pi", "--cwd", ".", "--refresh", "true"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          [DELEGATION_THREAD_ID_ENV]: "codex://threads/inspection-parent",
+        },
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    expect(JSON.parse(String(vi.mocked(fetchImpl).mock.calls[0]?.[1]?.body))).toEqual({
+      harnessId: "pi",
+      parentThreadId: "inspection-parent",
+      cwd: process.cwd(),
+      refresh: true,
+    });
+  });
+
+  it.each(["claude-code", "codex"])(
+    "normalizes deep links and sends Model selection for %s",
+    async (harnessId) => {
+      const fetchImpl = successfulFetch({ threadId: "child-1" });
+      const output = new PassThrough();
+      const environment = {
+        [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+        [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+      };
+      await expect(
+        runDelegationCli({
+          arguments: [
+            "delegate",
+            "start",
+            "--harness",
+            harnessId,
+            "--task",
+            "review auth",
+            "--task-name",
+            "Auth review",
+            "--cwd",
+            "/workspace/project",
+            "--model",
+            "provider/vendor/model: v1~fast",
+            "--thinking",
+            "high",
+            "--parent-thread",
+            "codex://threads/parent-1",
+            "--request-id",
+            "request-1",
+          ],
+          environment,
+          output,
+          fetchImpl,
+        }),
+      ).resolves.toBe(0);
+      const firstCall = vi.mocked(fetchImpl).mock.calls[0];
+      if (!firstCall) throw new Error("Runtime fetch was not called");
+      const [, init] = firstCall;
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        harnessId,
+        task: "review auth",
+        taskName: "Auth review",
+        cwd: path.resolve("/workspace/project"),
+        parentThreadId: "parent-1",
+        requestId: "request-1",
+        model: "provider/vendor/model: v1~fast",
+        thinkingOptionId: "high",
+      });
+      expect(JSON.parse(outputText(output))).toEqual({ threadId: "child-1" });
+    },
+  );
+
+  it("uses the Host-provided current Thread when --parent-thread is omitted", async () => {
+    const fetchImpl = successfulFetch({ threadId: "child-1" });
+    await expect(
+      runDelegationCli({
+        arguments: ["delegate", "start", "--harness", "pi", "--task", "review"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          [DELEGATION_THREAD_ID_ENV]: "parent-from-environment",
+        },
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    const call = vi.mocked(fetchImpl).mock.calls[0];
+    if (!call) throw new Error("Runtime fetch was not called");
+    const body = JSON.parse(String(call[1]?.body));
+    expect(body).toMatchObject({
+      parentThreadId: "parent-from-environment",
+    });
+    expect(body).not.toHaveProperty("cwd");
+    expect(body).not.toHaveProperty("model");
+    expect(body).not.toHaveProperty("thinkingOptionId");
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [{ [NATIVE_CODEX_THREAD_ID_ENV]: "native-codex-thread" }, "native-codex-thread"],
+    [
+      {
+        [DELEGATION_THREAD_ID_ENV]: "host-thread",
+        [NATIVE_CODEX_THREAD_ID_ENV]: "native-codex-thread",
+      },
+      "host-thread",
+    ],
+  ])("infers the parent from the caller Thread environment %#", async (caller, expected) => {
+    const fetchImpl = successfulFetch({ threadId: "child-1" });
+    await expect(
+      runDelegationCli({
+        arguments: ["delegate", "start", "--harness", "pi", "--task", "review"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          ...caller,
+        },
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    const call = vi.mocked(fetchImpl).mock.calls[0];
+    if (!call) throw new Error("Runtime fetch was not called");
+    expect(JSON.parse(String(call[1]?.body))).toMatchObject({ parentThreadId: expected });
+  });
+
+  it("notifies the native Codex caller Thread by default", async () => {
+    const fetchImpl = successfulFetch({
+      threadId: "child",
+      notifyThreadId: "native-codex-thread",
+      state: "watching",
+      status: "running",
+      timeoutMs: 1_740_000,
+    });
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "watch", "child"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          [NATIVE_CODEX_THREAD_ID_ENV]: "native-codex-thread",
+        },
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    const [, init] = vi.mocked(fetchImpl).mock.calls[0] ?? [];
+    expect(JSON.parse(String(init?.body))).toMatchObject({ notifyThreadId: "native-codex-thread" });
+  });
+
+  it("keeps a help-like task value and starts with native defaults in compact mode", async () => {
+    const fetchImpl = successfulFetch({
+      delegationId: "internal-delegation",
+      threadId: "child-1",
+      turnId: "internal-turn",
+      harnessId: "pi",
+      deepLink: "codex://threads/child-1",
+      status: "running",
+      cwd: "/workspace",
+      parentThreadId: "parent-1",
+      next: { read: "read", wait: "wait" },
+    });
+    const output = new PassThrough();
+    expect(
+      await runDelegationCli({
+        arguments: ["delegate", "start", "--harness", "pi", "--task", "-h", "--format", "compact"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(outputText(output))).toEqual({
+      thread: "codex://threads/child-1",
+      harnessId: "pi",
+      status: "running",
+      cwd: "/workspace",
+      parent: "codex://threads/parent-1",
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(vi.mocked(fetchImpl).mock.calls[0]?.[1]?.body))).toEqual({
+      harnessId: "pi",
+      task: "-h",
+    });
+  });
+
+  it("keeps full JSON while compact Turn ranges omit duplicated content and IDs", async () => {
+    const snapshot = {
+      threadId: "child-1",
+      harnessId: "pi",
+      status: "completed",
+      turn: { turnId: "internal-turn", status: "completed" },
+      progress: [],
+      result: { availability: "available", text: "Final answer" },
+      totalTurns: 4,
+      from: 2,
+      to: 2,
+      turns: [
+        {
+          turnId: "internal-turn",
+          turnNumber: 2,
+          status: "completed",
+          messages: [{ id: "message-id", role: "user", text: "Question" }],
+        },
+      ],
+    };
+    const fetchImpl = successfulFetch(snapshot);
+    for (const format of [undefined, "json", "compact"]) {
+      const output = new PassThrough();
+      expect(
+        await runDelegationCli({
+          arguments: [
+            "thread",
+            "read",
+            "codex://threads/child-1",
+            "--view",
+            "messages",
+            "--from",
+            "2",
+            "--to",
+            "2",
+            ...(format ? ["--format", format] : []),
+          ],
+          environment: {
+            [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+            [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          },
+          output,
+          fetchImpl,
+        }),
+      ).toBe(0);
+      expect(JSON.parse(outputText(output))).toEqual(
+        format === "compact"
+          ? {
+              thread: "codex://threads/child-1",
+              harnessId: "pi",
+              status: "completed",
+              totalTurns: 4,
+              from: 2,
+              to: 2,
+              turns: [
+                {
+                  turnNumber: 2,
+                  status: "completed",
+                  messages: [{ role: "user", text: "Question" }],
+                },
+              ],
+            }
+          : snapshot,
+      );
+    }
+    for (const [, init] of vi.mocked(fetchImpl).mock.calls) {
+      expect(JSON.parse(String(init?.body))).toEqual({
+        threadId: "child-1",
+        view: "messages",
+        from: 2,
+        to: 2,
+      });
+    }
+  });
+
+  it("sends follow-up messages and cancellation requests using deep links", async () => {
+    const fetchImpl = successfulFetch({ ok: true });
+    const environment = {
+      [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+      [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+    };
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "send", "codex://threads/child-1", "--message", "continue"],
+        environment,
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "cancel", "codex://threads/child-1"],
+        environment,
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).resolves.toBe(0);
+    const sendCall = vi.mocked(fetchImpl).mock.calls[0];
+    const cancelCall = vi.mocked(fetchImpl).mock.calls[1];
+    if (!sendCall || !cancelCall) throw new Error("Expected send and cancel Runtime calls");
+    expect(String(sendCall[0])).toContain("/v1/thread/send");
+    expect(JSON.parse(String(sendCall[1]?.body))).toEqual({
+      threadId: "child-1",
+      message: "continue",
+    });
+    expect(String(cancelCall[0])).toContain("/v1/thread/cancel");
+    expect(JSON.parse(String(cancelCall[1]?.body))).toEqual({ threadId: "child-1" });
+  });
+
+  it.each([undefined, "true", "false"])(
+    "sends steer=%s without a preliminary read",
+    async (steer) => {
+      const fetchImpl = successfulFetch({
+        threadId: "child-1",
+        turnId: "turn-1",
+        status: "running",
+      });
+      expect(
+        await runDelegationCli({
+          arguments: [
+            "thread",
+            "send",
+            "codex://threads/child-1",
+            "--message",
+            "adjust",
+            ...(steer === undefined ? [] : ["--steer", steer]),
+          ],
+          environment: {
+            [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+            [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          },
+          output: new PassThrough(),
+          fetchImpl,
+        }),
+      ).toBe(0);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const call = vi.mocked(fetchImpl).mock.calls[0];
+      expect(String(call?.[0])).toContain("/v1/thread/send");
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+        threadId: "child-1",
+        message: "adjust",
+        ...(steer === undefined ? {} : { steer: steer === "true" }),
+      });
+    },
+  );
+
+  it("reports a rejected steer without retrying", async () => {
+    const error = {
+      code: "DELEGATION_FAILED",
+      message: "Native steer rejected",
+      details: { notStarted: true },
+    };
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error }), { status: 409 }),
+    ) as unknown as typeof fetch;
+    const diagnosticOutput = new PassThrough();
+    expect(
+      await runDelegationCli({
+        arguments: ["thread", "send", "child", "--message", "adjust", "--steer", "true"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output: new PassThrough(),
+        diagnosticOutput,
+        fetchImpl,
+      }),
+    ).toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toEqual({ error });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects Turn ranges on the default result view", async () => {
+    const diagnosticOutput = new PassThrough();
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "read", "thread-1", "--from", "1"],
+        environment: {},
+        diagnosticOutput,
+      }),
+    ).resolves.toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toMatchObject({
+      error: { code: "INVALID_ARGUMENT" },
+    });
+  });
+
+  it("applies wait and list defaults", async () => {
+    const fetchImpl = successfulFetch({ ok: true });
+    const environment = {
+      [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+      [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+    };
+    await runDelegationCli({
+      arguments: ["thread", "wait", "thread-1"],
+      environment,
+      output: new PassThrough(),
+      fetchImpl,
+    });
+    await runDelegationCli({
+      arguments: ["thread", "list"],
+      environment,
+      output: new PassThrough(),
+      fetchImpl,
+    });
+    const waitCall = vi.mocked(fetchImpl).mock.calls[0];
+    const listCall = vi.mocked(fetchImpl).mock.calls[1];
+    if (!waitCall || !listCall) throw new Error("Expected wait and list Runtime calls");
+    expect(JSON.parse(String(waitCall[1]?.body))).toMatchObject({
+      threadId: "thread-1",
+      view: "result",
+      timeoutMs: 30_000,
+    });
+    expect(JSON.parse(String(listCall[1]?.body))).toMatchObject({
+      limit: 25,
+      sort: "created-desc",
+    });
+  });
+
+  it("splits waits longer than Node's response-header limit into bounded Runtime waits", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const requested: number[] = [];
+      const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        const { timeoutMs } = JSON.parse(String(init?.body)) as { timeoutMs: number };
+        requested.push(timeoutMs);
+        vi.setSystemTime(Date.now() + timeoutMs);
+        return new Response(JSON.stringify({ status: "running", timedOut: true }), { status: 200 });
+      }) as unknown as typeof fetch;
+      const output = new PassThrough();
+      await expect(
+        runDelegationCli({
+          arguments: ["thread", "wait", "thread-1", "--timeout-ms", "600000"],
+          environment: {
+            [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+            [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          },
+          output,
+          fetchImpl,
+        }),
+      ).resolves.toBe(0);
+      expect(requested).toEqual([240_000, 240_000, 120_000]);
+      expect(JSON.parse(outputText(output))).toEqual({ status: "running", timedOut: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns as soon as a sliced wait reaches a terminal state", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: "running", timedOut: true })))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ status: "completed", timedOut: false })),
+      ) as unknown as typeof fetch;
+    const output = new PassThrough();
+    await runDelegationCli({
+      arguments: ["thread", "wait", "thread-1", "--timeout-ms", "3600000"],
+      environment: {
+        [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+        [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+      },
+      output,
+      fetchImpl,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(outputText(output))).toEqual({ status: "completed", timedOut: false });
+  });
+
+  it("refuses Runtime redirects", async () => {
+    const fetchImpl = successfulFetch({ harnesses: [] });
+    await runDelegationCli({
+      arguments: ["harness", "list"],
+      environment: {
+        [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+        [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+      },
+      output: new PassThrough(),
+      fetchImpl,
+    });
+    expect(vi.mocked(fetchImpl).mock.calls[0]?.[1]).toMatchObject({ redirect: "error" });
+  });
+
+  it.each([
+    ["non-JSON", "<html>Bad Gateway</html>"],
+    ["JSON null", "null"],
+    ["JSON scalar", "42"],
+    ["JSON array", "[]"],
+  ])("reports a %s Runtime response as unreachable with its HTTP status", async (_name, text) => {
+    const diagnosticOutput = new PassThrough();
+    const fetchImpl = vi.fn(
+      async () => new Response(text, { status: 502 }),
+    ) as unknown as typeof fetch;
+    await expect(
+      runDelegationCli({
+        arguments: ["harness", "list"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        diagnosticOutput,
+        fetchImpl,
+      }),
+    ).resolves.toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toMatchObject({
+      error: {
+        code: "RUNTIME_UNREACHABLE",
+        details: { reason: "invalid_runtime_response", status: 502 },
+      },
+    });
+  });
+
+  it.each([
+    ["invalid format", ["thread", "read", "thread-1", "--format", "yaml"]],
+    ["invalid discovery arguments", ["harness", "list", "pi"]],
+    ["invalid view", ["thread", "read", "thread-1", "--view", "raw"]],
+    ["invalid timeout", ["thread", "wait", "thread-1", "--timeout-ms", "0"]],
+    [
+      "invalid message limit",
+      ["thread", "read", "thread-1", "--view", "messages", "--limit", "101"],
+    ],
+    ["missing send message", ["thread", "send", "thread-1"]],
+    ["invalid steer", ["thread", "send", "thread-1", "--message", "adjust", "--steer", "yes"]],
+    ["missing steer value", ["thread", "send", "thread-1", "--message", "adjust", "--steer"]],
+    [
+      "steer with interrupt",
+      ["thread", "send", "thread-1", "--message", "adjust", "--steer", "true", "--interrupt"],
+    ],
+    ["cancel option", ["thread", "cancel", "thread-1", "--message", "no"]],
+    ["invalid list limit", ["thread", "list", "--limit", "101"]],
+    ["invalid sort", ["thread", "list", "--sort", "newest"]],
+  ])("rejects %s before contacting Runtime", async (_name, arguments_) => {
+    const diagnosticOutput = new PassThrough();
+    const fetchImpl = successfulFetch({ ok: true });
+    await expect(
+      runDelegationCli({ arguments: arguments_, environment: {}, diagnosticOutput, fetchImpl }),
+    ).resolves.toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toMatchObject({
+      error: { code: "INVALID_ARGUMENT" },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      code: "THREAD_NOT_FOUND",
+      message: "Thread was not found",
+      details: { thread: "missing" },
+    },
+    {
+      code: "INTERNAL_ERROR",
+      message: "External Session shutdown could not be confirmed",
+      details: { externalThreadCode: -32075 },
+    },
+  ])("preserves structured Runtime errors: $code", async (error) => {
+    const diagnosticOutput = new PassThrough();
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ error }), { status: 400 }),
+    ) as unknown as typeof fetch;
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "read", "thread-1", "--format", "compact"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        diagnosticOutput,
+        fetchImpl,
+      }),
+    ).resolves.toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toEqual({ error });
+  });
+
+  it("reports a missing local Host without requiring injected credentials", async () => {
+    const diagnosticOutput = new PassThrough();
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "read", "thread-1"],
+        environment: { PATH: "/synthetic", CODEXHOST_DATA_DIR: "/synthetic" },
+        diagnosticOutput,
+      }),
+    ).resolves.toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toEqual({
+      error: {
+        code: "RUNTIME_UNREACHABLE",
+        message:
+          "No local CLI credentials were found. Start or update the local Host with its external listener enabled, or configure an external client token.",
+        details: {
+          reason: "missing_runtime_environment",
+          missingEnvironmentVariables: [
+            DELEGATION_RUNTIME_ENDPOINT_ENV,
+            DELEGATION_RUNTIME_TOKEN_ENV,
+          ],
+          nativeCodexRecovery: {
+            recommendedPolicy: {
+              inherit: "all",
+              ignoreDefaultExcludes: true,
+              includeOnlyMustContain: [
+                DELEGATION_RUNTIME_ENDPOINT_ENV,
+                DELEGATION_RUNTIME_TOKEN_ENV,
+              ],
+            },
+          },
+          externalClient: {
+            environmentVariables: ["CODEXHOST_CLIENT_TOKEN", "CODEXHOST_CLIENT_TOKEN_FILE"],
+            register: "codexhost client add <name>",
+          },
+        },
+      },
+    });
+  });
+
+  it("reports only the Host Runtime variables that are missing", async () => {
+    const diagnosticOutput = new PassThrough();
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "read", "thread-1"],
+        environment: { [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321" },
+        diagnosticOutput,
+      }),
+    ).resolves.toBe(1);
+    expect(JSON.parse(outputText(diagnosticOutput))).toMatchObject({
+      error: {
+        code: "RUNTIME_UNREACHABLE",
+        message: expect.stringContaining(`${DELEGATION_RUNTIME_TOKEN_ENV} is required`),
+        details: {
+          reason: "missing_runtime_environment",
+          missingEnvironmentVariables: [DELEGATION_RUNTIME_TOKEN_ENV],
+        },
+      },
+    });
+  });
+
+  it("reports a missing endpoint without exposing the provided token", async () => {
+    const diagnosticOutput = new PassThrough();
+    await expect(
+      runDelegationCli({
+        arguments: ["thread", "read", "thread-1"],
+        environment: { [DELEGATION_RUNTIME_TOKEN_ENV]: "token" },
+        diagnosticOutput,
+      }),
+    ).resolves.toBe(1);
+    const diagnostic = JSON.parse(outputText(diagnosticOutput)) as {
+      error: { message: string; details: { missingEnvironmentVariables: string[] } };
+    };
+    expect(diagnostic.error.message).toContain(`${DELEGATION_RUNTIME_ENDPOINT_ENV} is required`);
+    expect(diagnostic.error.message).not.toContain("token");
+    expect(diagnostic.error.details.missingEnvironmentVariables).toEqual([
+      DELEGATION_RUNTIME_ENDPOINT_ENV,
+    ]);
+  });
+
+  it("documents the safe native Codex environment-policy recovery", () => {
+    expect(DELEGATION_HELP).toContain("shell_environment_policy");
+    expect(DELEGATION_HELP).toContain("ignore_default_excludes = true");
+    expect(DELEGATION_HELP).toContain('include_only containing "CODEXHOST_RUNTIME_ENDPOINT"');
+    expect(DELEGATION_HELP).toContain('Avoid unconstrained inherit = "all"');
+  });
+
+  it("watches a Thread for the calling Thread with the 29 minute default", async () => {
+    const fetchImpl = successfulFetch({
+      threadId: "child",
+      notifyThreadId: "caller",
+      state: "watching",
+      status: "running",
+      timeoutMs: 1_740_000,
+    });
+    const output = new PassThrough();
+    expect(
+      await runDelegationCli({
+        arguments: ["thread", "watch", "codex://threads/child", "--format", "compact"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+          [DELEGATION_THREAD_ID_ENV]: "caller",
+        },
+        output,
+        fetchImpl,
+      }),
+    ).toBe(0);
+    const [url, init] = vi.mocked(fetchImpl).mock.calls[0] ?? [];
+    expect(String(url)).toContain("/v1/thread/watch");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      threadId: "child",
+      notifyThreadId: "caller",
+      timeoutMs: 1_740_000,
+    });
+    expect(JSON.parse(outputText(output))).toEqual({
+      thread: "codex://threads/child",
+      notify: "codex://threads/caller",
+      state: "watching",
+      status: "running",
+      timeoutMs: 1_740_000,
+    });
+  });
+
+  it("requires --notify when the caller Thread is unknown", async () => {
+    const fetchImpl = successfulFetch({});
+    const environment = {
+      [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+      [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+    };
+    expect(
+      await runDelegationCli({
+        arguments: ["thread", "watch", "child"],
+        environment,
+        output: new PassThrough(),
+        diagnosticOutput: new PassThrough(),
+        fetchImpl,
+      }),
+    ).toBe(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    expect(
+      await runDelegationCli({
+        arguments: ["thread", "watch", "child", "--notify", "codex://threads/parent"],
+        environment,
+        output: new PassThrough(),
+        fetchImpl,
+      }),
+    ).toBe(0);
+    const [, init] = vi.mocked(fetchImpl).mock.calls[0] ?? [];
+    expect(JSON.parse(String(init?.body))).toEqual({
+      threadId: "child",
+      notifyThreadId: "parent",
+      timeoutMs: 1_740_000,
+    });
+  });
+
+  it("answers a pending Question from an answers file", async () => {
+    const files = await answersFixture();
+    const fetchImpl = successfulFetch({
+      threadId: "child",
+      interactionId: "interaction-1",
+      turnId: "turn-1",
+      harnessId: "pi",
+      status: "running",
+      next: { read: "read", wait: "wait" },
+    });
+    try {
+      const file = await files.write(
+        JSON.stringify({
+          answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } },
+        }),
+      );
+      const cli = answerCli(file, fetchImpl);
+      expect(await cli.run(["--format", "compact"])).toBe(0);
+      const [url, init] = vi.mocked(fetchImpl).mock.calls[0] ?? [];
+      expect(String(url)).toContain("/v1/thread/answer");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        threadId: "child",
+        interactionId: "interaction-1",
+        result: { answers: { decision: { answers: ["Continue"] }, note: { answers: ["typed"] } } },
+      });
+      expect(JSON.parse(outputText(cli.output))).toEqual({
+        thread: "codex://threads/child",
+        interaction: "interaction-1",
+        turn: "turn-1",
+        harnessId: "pi",
+        status: "running",
+      });
+    } finally {
+      await files.close();
+    }
+  });
+
+  it("passes the answers file shape through and reports structured answer errors", async () => {
+    const files = await answersFixture();
+    const fetchImpl = successfulFetch({});
+    try {
+      const invalid = await files.write("not json");
+      expect(await answerCli(invalid, fetchImpl).run()).toBe(1);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      // The CLI passes the existing reply result through, including native extensions.
+      for (const result of [
+        { answers: { decision: { answers: ["Continue"] } }, nativeExtension: true },
+        { answers: {} },
+      ]) {
+        const file = await files.write(JSON.stringify(result));
+        expect(await answerCli(file, fetchImpl).run()).toBe(0);
+        const [, init] = vi.mocked(fetchImpl).mock.calls.at(-1) ?? [];
+        expect(JSON.parse(String(init?.body))).toMatchObject({ result });
+      }
+      expect(await answerCli(path.join(files.directory, "missing.json"), fetchImpl).run()).toBe(1);
+
+      const stale = successfulFetch({
+        error: { code: "QUESTION_NOT_PENDING", message: "Question request is not pending" },
+      });
+      const file = await files.write(
+        JSON.stringify({ answers: { decision: { answers: ["Continue"] } } }),
+      );
+      const cli = answerCli(file, stale);
+      expect(await cli.run()).toBe(1);
+      expect(JSON.parse(outputText(cli.diagnosticOutput))).toEqual({
+        error: { code: "QUESTION_NOT_PENDING", message: "Question request is not pending" },
+      });
+    } finally {
+      await files.close();
+    }
+  });
+
+  it("requests a send watch even when no caller identity is available locally", async () => {
+    const fetchImpl = successfulFetch({});
+    expect(
+      await runDelegationCli({
+        arguments: ["thread", "send", "child", "--message", "continue", "--watch", "true"],
+        environment: {
+          [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+          [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+        },
+        output: new PassThrough(),
+        diagnosticOutput: new PassThrough(),
+        fetchImpl,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(String(vi.mocked(fetchImpl).mock.calls[0]?.[1]?.body))).toEqual({
+      threadId: "child",
+      message: "continue",
+      watchTimeoutMs: 1_740_000,
+    });
+  });
+
+  it("asks delegate start to watch the child only when requested", async () => {
+    const environment = {
+      [DELEGATION_RUNTIME_ENDPOINT_ENV]: "http://127.0.0.1:4321",
+      [DELEGATION_RUNTIME_TOKEN_ENV]: "token",
+    };
+    const fetchImpl = successfulFetch({});
+    const base = ["delegate", "start", "--harness", "pi", "--task", "work"];
+    await runDelegationCli({ arguments: base, environment, output: new PassThrough(), fetchImpl });
+    await runDelegationCli({
+      arguments: [...base, "--watch", "true", "--watch-timeout-ms", "5000"],
+      environment,
+      output: new PassThrough(),
+      fetchImpl,
+    });
+    const bodies = vi
+      .mocked(fetchImpl)
+      .mock.calls.map(([, init]) => JSON.parse(String(init?.body)) as Record<string, unknown>);
+    expect(bodies[0]).not.toHaveProperty("watchTimeoutMs");
+    expect(bodies[1]).toMatchObject({ watchTimeoutMs: 5_000 });
+
+    const diagnosticOutput = new PassThrough();
+    expect(
+      await runDelegationCli({
+        arguments: [...base, "--watch-timeout-ms", "5000"],
+        environment,
+        output: new PassThrough(),
+        diagnosticOutput,
+        fetchImpl,
+      }),
+    ).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});

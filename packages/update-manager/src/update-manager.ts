@@ -1,0 +1,588 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { chmod, copyFile, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+import {
+  downloadArtifact,
+  validateArtifact,
+  verifyDownloadedArtifact,
+  type ArtifactDownloadProgress,
+  type ArtifactDownloader,
+  type ArtifactSource,
+} from "./artifact.js";
+import { prefetchNpmRelease, type NpmReleaseTarget } from "./npm-registry.js";
+import {
+  parseUpdateStatus,
+  preparedStatus,
+  requireSemanticVersion,
+  type BackgroundUpdateInstallation,
+  type BackgroundUpdateStatus,
+} from "./status.js";
+
+import { waitForUpdaterReady } from "./updater-ready.js";
+
+const REQUEST_SCHEMA_VERSION = 1;
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 30, 70, 150, 300] as const;
+
+export interface PreparedUpdateInfo {
+  version: string;
+  installation: BackgroundUpdateInstallation;
+  statusPath: string;
+}
+
+export interface CommonUpdateOptions {
+  version: string;
+  launcherPid: number;
+  launcherExecutable: string;
+  runtimeDescriptorPath: string;
+  updaterExecutable: string;
+  stateDirectory: string;
+  /** The independent Host supervisor hands the prepared operation to the Updater. */
+  serviceManaged?: boolean;
+  restartTarget?: "desktop" | "web";
+  dataDirectory?: string;
+  onPrepared?(info: PreparedUpdateInfo): void | Promise<void>;
+}
+
+export interface NpmUpdateOptions extends CommonUpdateOptions {
+  nodePath: string;
+  npmCliPath: string;
+  npmLauncherPath: string;
+  packageRoot: string;
+}
+
+export interface WindowsInstallerUpdateOptions extends CommonUpdateOptions {
+  artifact: ArtifactSource;
+  installRoot: string;
+}
+
+export interface MacOsDmgUpdateOptions extends CommonUpdateOptions {
+  artifact: ArtifactSource;
+  appPath: string;
+}
+
+export interface LinuxArchiveUpdateOptions extends CommonUpdateOptions {
+  artifact: ArtifactSource;
+  installRoot: string;
+}
+
+export interface PreparedBackgroundUpdate {
+  version: string;
+  installation: BackgroundUpdateInstallation;
+  requestPath: string;
+  statusPath: string;
+  helperPath: string;
+  artifactPath?: string;
+}
+
+export interface StartedBackgroundUpdate extends PreparedBackgroundUpdate {
+  updaterPid: number;
+}
+
+export interface BackgroundUpdateManagerDependencies {
+  platform?: NodeJS.Platform;
+  randomId?(): string;
+  download?: ArtifactDownloader;
+  spawnUpdater?(executable: string, requestPath: string): ChildProcess;
+  /** Downloads an npm release into the npm cache before any service stops. */
+  prefetchNpm?(target: NpmReleaseTarget): Promise<void>;
+  now?(): number;
+}
+
+export interface BackgroundUpdateManager {
+  prepareNpm(options: NpmUpdateOptions): Promise<PreparedBackgroundUpdate>;
+  prepareWindowsInstaller(
+    options: WindowsInstallerUpdateOptions,
+  ): Promise<PreparedBackgroundUpdate>;
+  prepareMacOsDmg(options: MacOsDmgUpdateOptions): Promise<PreparedBackgroundUpdate>;
+  prepareLinuxArchive(options: LinuxArchiveUpdateOptions): Promise<PreparedBackgroundUpdate>;
+  /** Resolves only after the Updater validates the owner and is waiting for its exit. */
+  start(
+    prepared: PreparedBackgroundUpdate,
+    transferOwnership?: (updaterPid: number) => Promise<void>,
+  ): Promise<StartedBackgroundUpdate>;
+  readStatus(statusPath: string): Promise<BackgroundUpdateStatus | null>;
+}
+
+interface InternalRequest {
+  schema_version: 1;
+  version: string;
+  wait_pid: number;
+  wait_executable: string;
+  runtime_descriptor_path: string;
+  status_path: string;
+  service_managed?: true;
+  restart_target?: "desktop" | "web";
+  data_directory?: string;
+  installation:
+    | {
+        kind: "npm";
+        node_path: string;
+        npm_cli_path: string;
+        npm_launcher_path: string;
+        npm_package_root: string;
+      }
+    | {
+        kind: "windows-installer";
+        installer_path: string;
+        artifact_sha256: string;
+        install_root: string;
+      }
+    | {
+        kind: "macos-dmg";
+        dmg_path: string;
+        artifact_sha256: string;
+        app_path: string;
+      }
+    | {
+        kind: "linux-archive";
+        archive_path: string;
+        artifact_sha256: string;
+        install_root: string;
+      };
+}
+
+interface PreparedCommonUpdate {
+  version: string;
+  launcherPid: number;
+  launcherExecutable: string;
+  runtimeDescriptorPath: string;
+  workDirectory: string;
+  helperPath: string;
+  requestPath: string;
+  statusPath: string;
+  serviceManaged?: boolean;
+  restartTarget?: "desktop" | "web";
+  dataDirectory?: string;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function systemErrorCode(error: unknown): string | null {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code: unknown }).code)
+    : null;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function replaceStatusFile(temporaryPath: string, statusPath: string): Promise<void> {
+  let retryIndex = 0;
+  for (;;) {
+    try {
+      await rename(temporaryPath, statusPath);
+      return;
+    } catch (error) {
+      const retryDelay = WINDOWS_RENAME_RETRY_DELAYS_MS[retryIndex];
+      const code = systemErrorCode(error);
+      if (
+        process.platform !== "win32" ||
+        retryDelay === undefined ||
+        (code !== "EACCES" && code !== "EBUSY" && code !== "EPERM")
+      ) {
+        throw error;
+      }
+      retryIndex += 1;
+      await delay(retryDelay);
+    }
+  }
+}
+
+function requireAbsolutePath(value: string, label: string): string {
+  if (!path.isAbsolute(value)) throw new Error(`${label} must be an absolute path`);
+  return path.normalize(value);
+}
+
+async function requireRegularFile(value: string, label: string): Promise<string> {
+  const filePath = requireAbsolutePath(value, label);
+  const metadata = await lstat(filePath).catch((error) => {
+    throw new Error(`${label} is unavailable: ${errorMessage(error)}`);
+  });
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`${label} must be a regular file`);
+  }
+  return filePath;
+}
+
+function requireLauncherPid(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("Launcher PID must be a positive integer");
+  }
+  return value;
+}
+
+async function writePrivateJson(filePath: string, value: unknown): Promise<void> {
+  await writeFile(filePath, `${JSON.stringify(value)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+}
+
+function defaultSpawnUpdater(executable: string, requestPath: string): ChildProcess {
+  const child = spawn(executable, ["apply", "--request", requestPath], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.unref();
+  return child;
+}
+
+export function createBackgroundUpdateManager(
+  dependencies: BackgroundUpdateManagerDependencies = {},
+): BackgroundUpdateManager {
+  const platform = dependencies.platform ?? process.platform;
+  const randomId = dependencies.randomId ?? randomUUID;
+  const download = dependencies.download ?? downloadArtifact;
+  const spawnUpdater = dependencies.spawnUpdater ?? defaultSpawnUpdater;
+  const prefetchNpm = dependencies.prefetchNpm ?? ((target) => prefetchNpmRelease(target));
+  const now = dependencies.now ?? Date.now;
+  const preparedRequests = new Set<string>();
+
+  async function writeStatusSnapshot(
+    statusPath: string,
+    status: BackgroundUpdateStatus,
+  ): Promise<void> {
+    const temporaryPath = path.join(path.dirname(statusPath), `.update-status-${randomId()}.tmp`);
+    try {
+      await writeFile(temporaryPath, `${JSON.stringify(status)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      await replaceStatusFile(temporaryPath, statusPath);
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  function statusSnapshot(
+    version: string,
+    installation: BackgroundUpdateInstallation,
+    phase: BackgroundUpdateStatus["phase"],
+    progress?: ArtifactDownloadProgress,
+    error?: unknown,
+  ): BackgroundUpdateStatus {
+    return {
+      schemaVersion: 1,
+      version,
+      installation,
+      phase,
+      updatedAt: Math.floor(now() / 1000),
+      ...(progress?.downloadedBytes === undefined
+        ? {}
+        : { downloadedBytes: progress.downloadedBytes }),
+      ...(progress?.totalBytes === undefined ? {} : { totalBytes: progress.totalBytes }),
+      ...(error === undefined ? {} : { error: errorMessage(error).slice(0, 500) }),
+    };
+  }
+
+  async function writeFailedStatus(
+    statusPath: string,
+    version: string,
+    installation: BackgroundUpdateInstallation,
+    error: unknown,
+  ): Promise<void> {
+    await writeStatusSnapshot(
+      statusPath,
+      statusSnapshot(version, installation, "failed", undefined, error),
+    ).catch(() => undefined);
+  }
+
+  function progressReporter(
+    statusPath: string,
+    version: string,
+    installation: BackgroundUpdateInstallation,
+    totalBytes: number | undefined,
+  ): { update(progress: ArtifactDownloadProgress): void; flush(): Promise<void> } {
+    let lastProgress: ArtifactDownloadProgress = { downloadedBytes: 0, totalBytes };
+    let lastWriteAt = 0;
+    let queued = Promise.resolve();
+    const enqueue = (progress: ArtifactDownloadProgress, force = false): void => {
+      lastProgress = progress;
+      const currentTime = Date.now();
+      if (!force && currentTime - lastWriteAt < 250) return;
+      lastWriteAt = currentTime;
+      queued = queued
+        .then(() =>
+          writeStatusSnapshot(
+            statusPath,
+            statusSnapshot(version, installation, "downloading", lastProgress),
+          ),
+        )
+        .catch(() => undefined);
+    };
+    enqueue(lastProgress, true);
+    return {
+      update(progress) {
+        enqueue(progress);
+      },
+      async flush() {
+        enqueue(lastProgress, true);
+        await queued;
+      },
+    };
+  }
+
+  async function prepareCommon(
+    options: CommonUpdateOptions,
+    installation: BackgroundUpdateInstallation,
+  ): Promise<PreparedCommonUpdate> {
+    const version = requireSemanticVersion(options.version);
+    const launcherPid = requireLauncherPid(options.launcherPid);
+    const launcherExecutable = await requireRegularFile(
+      options.launcherExecutable,
+      "Launcher executable",
+    );
+    const runtimeDescriptorPath = requireAbsolutePath(
+      options.runtimeDescriptorPath,
+      "runtime descriptor path",
+    );
+    const updaterExecutable = await requireRegularFile(
+      options.updaterExecutable,
+      "Updater executable",
+    );
+    const stateDirectory = requireAbsolutePath(options.stateDirectory, "update state directory");
+    const dataDirectory =
+      options.dataDirectory === undefined
+        ? undefined
+        : requireAbsolutePath(options.dataDirectory, "data directory");
+    if (options.restartTarget !== undefined && !["desktop", "web"].includes(options.restartTarget))
+      throw new Error("Invalid update restart target");
+    if ((options.serviceManaged || options.restartTarget === "web") && !dataDirectory)
+      throw new Error("Service updates require a data directory");
+    await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+    const workDirectory = path.join(stateDirectory, `update-${version}-${randomId()}`);
+    await mkdir(workDirectory, { recursive: false, mode: 0o700 });
+    const executableSuffix = platform === "win32" ? ".exe" : "";
+    const helperPath = path.join(workDirectory, `codexhost-updater${executableSuffix}`);
+    await copyFile(updaterExecutable, helperPath);
+    if (platform !== "win32") await chmod(helperPath, 0o700);
+    const requestPath = path.join(workDirectory, "request-v1.json");
+    const statusPath = path.join(workDirectory, "status-v1.json");
+    await writePrivateJson(statusPath, preparedStatus(version, installation, now()));
+    await options.onPrepared?.({ version, installation, statusPath });
+    return {
+      version,
+      launcherPid,
+      launcherExecutable,
+      runtimeDescriptorPath,
+      workDirectory,
+      helperPath,
+      requestPath,
+      statusPath,
+      ...(options.serviceManaged ? { serviceManaged: true } : {}),
+      ...(options.restartTarget ? { restartTarget: options.restartTarget } : {}),
+      ...(dataDirectory ? { dataDirectory } : {}),
+    };
+  }
+
+  async function prepareArtifact(
+    common: PreparedCommonUpdate,
+    installation: BackgroundUpdateInstallation,
+    sourceValue: ArtifactSource,
+    fileName: string,
+  ): Promise<{ source: ArtifactSource; artifactPath: string }> {
+    const source = validateArtifact(sourceValue);
+    const temporaryPath = path.join(common.workDirectory, `.${fileName}.download`);
+    const artifactPath = path.join(common.workDirectory, fileName);
+    const progress = progressReporter(common.statusPath, common.version, installation, source.size);
+    try {
+      const result = await download(source, temporaryPath, progress.update);
+      progress.update({ downloadedBytes: result.bytes, totalBytes: source.size });
+      await progress.flush();
+      const finalUrl = new URL(result.finalUrl);
+      if (finalUrl.protocol !== "https:" || finalUrl.username || finalUrl.password) {
+        throw new Error("update artifact downloader returned a non-HTTPS URL");
+      }
+      await verifyDownloadedArtifact(source, temporaryPath, result);
+      await rename(temporaryPath, artifactPath);
+      return { source, artifactPath };
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      await progress.flush();
+      await writeFailedStatus(common.statusPath, common.version, installation, error);
+      throw error;
+    }
+  }
+
+  async function finalize(
+    common: PreparedCommonUpdate,
+    installation: InternalRequest["installation"],
+    artifactPath?: string,
+  ): Promise<PreparedBackgroundUpdate> {
+    const request: InternalRequest = {
+      schema_version: REQUEST_SCHEMA_VERSION,
+      version: common.version,
+      wait_pid: common.launcherPid,
+      wait_executable: common.launcherExecutable,
+      runtime_descriptor_path: common.runtimeDescriptorPath,
+      status_path: common.statusPath,
+      ...(common.serviceManaged ? { service_managed: true as const } : {}),
+      ...(common.restartTarget ? { restart_target: common.restartTarget } : {}),
+      ...(common.dataDirectory ? { data_directory: common.dataDirectory } : {}),
+      installation,
+    };
+    await writePrivateJson(common.requestPath, request);
+    await writeStatusSnapshot(
+      common.statusPath,
+      statusSnapshot(common.version, installation.kind, "prepared"),
+    );
+    preparedRequests.add(common.requestPath);
+    return Object.freeze({
+      version: common.version,
+      installation: installation.kind,
+      requestPath: common.requestPath,
+      statusPath: common.statusPath,
+      helperPath: common.helperPath,
+      ...(artifactPath === undefined ? {} : { artifactPath }),
+    });
+  }
+
+  return Object.freeze({
+    async prepareNpm(options: NpmUpdateOptions): Promise<PreparedBackgroundUpdate> {
+      const common = await prepareCommon(options, "npm");
+      try {
+        const nodePath = await requireRegularFile(options.nodePath, "npm Node.js executable");
+        const npmCliPath = await requireRegularFile(options.npmCliPath, "npm CLI");
+        const packageRoot = requireAbsolutePath(options.packageRoot, "npm platform package root");
+        // The Updater installs from this cache after the services stop, so a registry that is
+        // unreachable or lacks the release fails here while everything keeps running.
+        await writeStatusSnapshot(
+          common.statusPath,
+          statusSnapshot(common.version, "npm", "downloading"),
+        );
+        await prefetchNpm({ nodePath, npmCliPath, packageRoot, version: common.version });
+        return await finalize(common, {
+          kind: "npm",
+          node_path: nodePath,
+          npm_cli_path: npmCliPath,
+          npm_launcher_path: await requireRegularFile(
+            options.npmLauncherPath,
+            "npm codexhost launcher",
+          ),
+          npm_package_root: packageRoot,
+        });
+      } catch (error) {
+        await writeFailedStatus(common.statusPath, common.version, "npm", error);
+        throw error;
+      }
+    },
+
+    async prepareWindowsInstaller(
+      options: WindowsInstallerUpdateOptions,
+    ): Promise<PreparedBackgroundUpdate> {
+      if (platform !== "win32") throw new Error("Windows installer updates require Windows");
+      const common = await prepareCommon(options, "windows-installer");
+      const artifact = await prepareArtifact(
+        common,
+        "windows-installer",
+        options.artifact,
+        "update.exe",
+      );
+      return finalize(
+        common,
+        {
+          kind: "windows-installer",
+          installer_path: artifact.artifactPath,
+          artifact_sha256: artifact.source.sha256,
+          install_root: requireAbsolutePath(options.installRoot, "Windows install root"),
+        },
+        artifact.artifactPath,
+      );
+    },
+
+    async prepareMacOsDmg(options: MacOsDmgUpdateOptions): Promise<PreparedBackgroundUpdate> {
+      if (platform !== "darwin") throw new Error("macOS DMG updates require macOS");
+      const common = await prepareCommon(options, "macos-dmg");
+      const appPath = requireAbsolutePath(options.appPath, "macOS application path");
+      if (path.extname(appPath) !== ".app") {
+        throw new Error("macOS application path must end in .app");
+      }
+      const artifact = await prepareArtifact(common, "macos-dmg", options.artifact, "update.dmg");
+      return finalize(
+        common,
+        {
+          kind: "macos-dmg",
+          dmg_path: artifact.artifactPath,
+          artifact_sha256: artifact.source.sha256,
+          app_path: appPath,
+        },
+        artifact.artifactPath,
+      );
+    },
+
+    async prepareLinuxArchive(
+      options: LinuxArchiveUpdateOptions,
+    ): Promise<PreparedBackgroundUpdate> {
+      if (platform !== "linux") throw new Error("Linux archive updates require Linux");
+      const common = await prepareCommon(options, "linux-archive");
+      const artifact = await prepareArtifact(
+        common,
+        "linux-archive",
+        options.artifact,
+        "update.tar.gz",
+      );
+      return finalize(
+        common,
+        {
+          kind: "linux-archive",
+          archive_path: artifact.artifactPath,
+          artifact_sha256: artifact.source.sha256,
+          install_root: requireAbsolutePath(options.installRoot, "Linux install root"),
+        },
+        artifact.artifactPath,
+      );
+    },
+
+    async start(
+      prepared: PreparedBackgroundUpdate,
+      transferOwnership?: (updaterPid: number) => Promise<void>,
+    ): Promise<StartedBackgroundUpdate> {
+      if (!preparedRequests.delete(prepared.requestPath)) {
+        throw new Error(
+          "background update was not prepared by this manager or was already started",
+        );
+      }
+      try {
+        const child = spawnUpdater(prepared.helperPath, prepared.requestPath);
+        await waitForUpdaterReady(
+          child,
+          () => this.readStatus(prepared.statusPath),
+          undefined,
+          async () => {
+            if (child.pid === undefined)
+              throw new Error("background Updater did not report a process ID");
+            await transferOwnership?.(child.pid);
+          },
+        );
+        return Object.freeze({ ...prepared, updaterPid: child.pid as number });
+      } catch (error) {
+        await writeFailedStatus(
+          prepared.statusPath,
+          prepared.version,
+          prepared.installation,
+          error,
+        );
+        throw error;
+      }
+    },
+
+    async readStatus(statusPathValue: string): Promise<BackgroundUpdateStatus | null> {
+      const statusPath = requireAbsolutePath(statusPathValue, "update status path");
+      try {
+        return parseUpdateStatus(JSON.parse(await readFile(statusPath, "utf8")));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
+    },
+  });
+}
