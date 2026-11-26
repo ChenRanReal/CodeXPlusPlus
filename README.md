@@ -17,6 +17,8 @@ $env:CODEXHOST_DATA_DIR = Join-Path $env:USERPROFILE '.codexhost-lite'
 npm start
 ```
 
+Windows 捷徑可用 PowerShell 7 的 `-Sta` 模式開啟 [CodeX++ 啟動視窗](scripts/windows/Show-CodeXPlusPlusLaunch.ps1)。啟動視窗會等到 Host 接通及桌面擴充載入後才顯示就緒。啟動失敗時可以查看或複製診斷並重試。使用 `-RuntimeDirectory` 指定包含 `node24/node.exe` 的本機執行環境目錄。
+
 下方是上游專案的完整功能和安裝說明。上游的下載與 npm 安裝指令會安裝完整版。
 
 <div align="center">
