@@ -21,6 +21,7 @@ import { parseSafeExtensionIconUrl } from "./desktop-extensions-shared.js";
 import { createRendererSettingsIcon } from "./icons.js";
 import {
   DEFAULT_RENDERER_SETTINGS_MESSAGES,
+  RENDERER_SETTINGS_BRAND_NAME,
   type RendererSettingsMessages,
 } from "./localization.js";
 import { CODEXHOST_GITHUB_REPOSITORY_URL, createDefaultRendererSettingsRegistry } from "./pages.js";
@@ -106,7 +107,7 @@ export function mountRendererSettingsShell(
   brandCopy.className = "settings-brand__copy";
   const brandName = ownerDocument.createElement("span");
   brandName.className = "settings-brand__name";
-  brandName.textContent = "CodexHost";
+  brandName.textContent = RENDERER_SETTINGS_BRAND_NAME;
   const brandTitle = ownerDocument.createElement("span");
   brandTitle.className = "settings-brand__title";
   brandTitle.id = "codexhost-settings-page-title";

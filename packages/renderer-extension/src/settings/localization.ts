@@ -21,6 +21,7 @@ import {
 } from "./harness-version-messages.js";
 
 export const RENDERER_SETTINGS_LOCALES = ["en", "zh-CN"] as const;
+export const RENDERER_SETTINGS_BRAND_NAME = "CodeX++";
 export type RendererSettingsLocale = (typeof RENDERER_SETTINGS_LOCALES)[number];
 
 export const RENDERER_SETTINGS_LANGUAGE_SELECTIONS = ["automatic", "en", "zh-CN", "other"] as const;
@@ -580,9 +581,9 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   pickerHideUnusedAgentsCta: "Hide unused agents",
   enabled: "Enabled",
   disabled: "Disabled",
-  openSettings: "Open codexhost settings",
-  settingsButtonTitle: "codexhost settings",
-  settingsUnavailableTitle: "codexhost settings unavailable",
+  openSettings: `Open ${RENDERER_SETTINGS_BRAND_NAME} settings`,
+  settingsButtonTitle: `${RENDERER_SETTINGS_BRAND_NAME} settings`,
+  settingsUnavailableTitle: `${RENDERER_SETTINGS_BRAND_NAME} settings unavailable`,
   updateCurrentVersion: "Current version",
   updateInstallation: "Installation method",
   updateInstallationNpm: "npm",
@@ -910,9 +911,9 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   pickerHideUnusedAgentsCta: "收起不常用的 Agent",
   enabled: "已开启",
   disabled: "已关闭",
-  openSettings: "打开 codexhost 设置",
-  settingsButtonTitle: "codexhost 设置",
-  settingsUnavailableTitle: "codexhost 设置不可用",
+  openSettings: `打开 ${RENDERER_SETTINGS_BRAND_NAME} 设置`,
+  settingsButtonTitle: `${RENDERER_SETTINGS_BRAND_NAME} 设置`,
+  settingsUnavailableTitle: `${RENDERER_SETTINGS_BRAND_NAME} 设置不可用`,
   updateCurrentVersion: "当前版本",
   updateInstallation: "安装方式",
   updateInstallationNpm: "npm",
