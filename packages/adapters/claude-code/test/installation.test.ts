@@ -7,6 +7,9 @@ const mocks = vi.hoisted(() => ({
   resolve: vi.fn(),
   realpath: vi.fn(),
   read: vi.fn(),
+  lstat: vi.fn(),
+  rm: vi.fn(),
+  unlink: vi.fn(),
 }));
 vi.mock("@codexhost/harness-discovery", async (original) => ({
   ...(await original<object>()),
@@ -18,12 +21,17 @@ vi.mock("node:fs/promises", async (original) => ({
   ...(await original<object>()),
   realpath: mocks.realpath,
   readFile: mocks.read,
+  lstat: mocks.lstat,
+  rm: mocks.rm,
+  unlink: mocks.unlink,
 }));
 vi.mock("../src/command.js", () => ({ resolveClaudeCodeExecutable: mocks.resolve }));
 import { createClaudeInstallation } from "../src/installation.js";
+import { resolveClaudeUninstaller } from "../src/uninstall.js";
 
 const environment = { HOME: path.resolve("claude-home") };
 const executable = path.join(environment.HOME, ".local", "bin", "claude");
+const support = path.join(environment.HOME, ".local", "share", "claude");
 beforeEach(() => {
   vi.resetAllMocks();
   vi.stubGlobal("process", { ...process, platform: "linux" });
@@ -37,6 +45,31 @@ beforeEach(() => {
   mocks.run.mockResolvedValue("2.1.0 (Claude Code)");
 });
 afterEach(() => vi.unstubAllGlobals());
+
+describe("Claude native uninstall", () => {
+  it.each([false, true])(
+    "removes only a verified native layout (redirected directory: %s)",
+    async (redirected) => {
+      mocks.lstat.mockResolvedValue({ isDirectory: () => true });
+      mocks.realpath.mockImplementation(async (file: string) => {
+        if (file === executable) return path.join(support, "versions", "2.1.0");
+        if (file === support && redirected) return path.resolve("unrelated");
+        return file;
+      });
+      const uninstall = await resolveClaudeUninstaller(environment);
+      if (redirected) {
+        expect(uninstall).toBeNull();
+        expect(mocks.rm).not.toHaveBeenCalled();
+        expect(mocks.unlink).not.toHaveBeenCalled();
+      } else {
+        expect(uninstall).toBeTypeOf("function");
+        await uninstall?.();
+        expect(mocks.unlink).toHaveBeenCalledExactlyOnceWith(executable);
+        expect(mocks.rm).toHaveBeenCalledExactlyOnceWith(support, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 describe("Claude installation", () => {
   it("reads the configured stable channel and uses the native policy-aware updater", async () => {

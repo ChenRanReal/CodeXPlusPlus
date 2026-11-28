@@ -292,9 +292,11 @@ describe("external Thread idle release", () => {
       expect(f.runtime.get(f.id)).toBe(f.thread);
       expect(f.open).not.toHaveBeenCalled();
       expect(f.diagnose).toHaveBeenCalled();
+      // A finished close is retried once. One that is still running is left alone.
+      expect(f.close).toHaveBeenCalledTimes(failure === "timeout" ? 1 : 2);
       late.resolve();
       await vi.advanceTimersByTimeAsync(30 * MINUTE);
-      expect(f.close).toHaveBeenCalledTimes(1);
+      expect(f.close).toHaveBeenCalledTimes(failure === "timeout" ? 1 : 2);
       expect(f.runtime.get(f.id)).toBe(f.thread);
       f.idle.stop();
     },
@@ -344,6 +346,28 @@ describe("external Thread idle release", () => {
     expect(f.open).not.toHaveBeenCalled();
     expect(f.runtime.get(f.id)).toBeUndefined();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("restores the thread on the next open once the failed release can finish", async () => {
+    const f = await fixture();
+    let alive = true;
+    f.close.mockImplementation(async () => {
+      if (alive) throw new Error("process still alive");
+      await FakeHarnessSession.prototype.close.call(f.thread.session);
+    });
+    f.idle.configure({ enabled: true, timeoutMinutes: 10 });
+    await vi.advanceTimersByTimeAsync(11 * MINUTE);
+    expect(f.runtime.get(f.id)).toBe(f.thread);
+    alive = false;
+    const result = await f.runtime.resolve(f.id);
+    expect(result.kind).toBe("external");
+    if (result.kind === "external") {
+      expect(result.historyFresh).toBe(true);
+      expect(result.thread).not.toBe(f.thread);
+      await result.thread.session.close();
+    }
+    expect(f.open).toHaveBeenCalledTimes(1);
+    f.idle.stop();
   });
 
   it("repeated release/resume cycles retain only the current instance and one scheduler", async () => {

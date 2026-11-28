@@ -1,4 +1,4 @@
-import { readFile, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { resolveHarnessExecutable } from "./resolve.js";
 import { withNodeRuntimeOnPath } from "./node-runtime.js";
@@ -102,6 +102,25 @@ export async function npmInstallation(
         prefix,
         currentVersion,
         canUpdate,
+        uninstall:
+          canUpdate && npm
+            ? async () => {
+                await runInstallationCommand(
+                  npm.executable,
+                  ["uninstall", "--global", "--prefix", prefix, "--ignore-scripts", name],
+                  env,
+                  300_000,
+                );
+                await lstat(directory).then(
+                  () => {
+                    throw new Error("The selected npm package is still installed");
+                  },
+                  (error: NodeJS.ErrnoException) => {
+                    if (error.code !== "ENOENT") throw error;
+                  },
+                );
+              }
+            : null,
         latest: async () => {
           const data = JSON.parse(
             await fetchInstallationText(

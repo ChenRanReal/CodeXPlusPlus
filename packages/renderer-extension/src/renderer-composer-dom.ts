@@ -6,6 +6,8 @@ import type {
 } from "./agent-selection-state.js";
 import { catalogModelForRef } from "@codexhost/shared-contracts";
 import type {
+  AccountBalanceSnapshot,
+  AccountCreditsSnapshot,
   CodexAccountSummary,
   HarnessPluginDescriptor,
   ThreadUsageSnapshot,
@@ -33,6 +35,16 @@ import {
   type RendererPermissionModePickerControl,
 } from "./renderer-permission-mode-picker.js";
 import {
+  mountRendererCreditsControl,
+  renderRendererCreditsControl,
+  type RendererCreditsControl,
+} from "./renderer-credits-control.js";
+import {
+  mountRendererUsageControl,
+  renderRendererUsageControl,
+  type RendererUsageControl,
+} from "./renderer-usage-control.js";
+import {
   mountRendererComposerIndicators,
   type RendererComposerIndicators,
 } from "./renderer-composer-indicators.js";
@@ -45,6 +57,7 @@ import {
   type RendererHarnessCommandControl,
 } from "./renderer-harness-command-control.js";
 import { observeRendererCompactComposer } from "./renderer-trigger-chip-style.js";
+import { isNativeModelLockedAppearanceButton } from "./renderer-native-model-locked.js";
 import { isNativeModelCarrierLoadingButton } from "./renderer-native-model-loading.js";
 import { isNativeModelRetryButton } from "./renderer-native-model-retry.js";
 
@@ -89,7 +102,9 @@ export interface ComposerAgentControl {
   nativePermissionModeControl: NativePermissionModeControlState | null;
   nativeContextUsageControl?: NativeControlState | null;
   nativePermissionModeControlVerified: boolean;
+  credits: RendererCreditsControl;
   composerIndicators: RendererComposerIndicators;
+  usage: RendererUsageControl | null;
   composerId: string;
   harnessCommands: RendererHarnessCommandControl;
   sendButton: HTMLButtonElement;
@@ -346,7 +361,8 @@ function nativeModelControlForComposer(composer: Element): HTMLElement | null {
       button.closest(CODEX_COMPOSER_SELECTOR) === composer &&
       (isNativeModelControlCandidate(button) ||
         isNativeModelRetryButton(button, composer) ||
-        isNativeModelCarrierLoadingButton(button)),
+        isNativeModelCarrierLoadingButton(button) ||
+        isNativeModelLockedAppearanceButton(button)),
   );
   return candidates.length === 1 ? (candidates[0] ?? null) : null;
 }
@@ -478,6 +494,34 @@ function refreshNativeModelControl(control: ComposerAgentControl): void {
 }
 
 /**
+ * Credits stays attached to the renderer-owned permission-mode slot. It is
+ * independent from the native context indicator because Credits describes
+ * account limits, not the current thread's context window.
+ */
+function usagePlacementAnchor(control: ComposerAgentControl): HTMLElement | null {
+  const context = control.nativeContextUsageControl?.element;
+  // The native radial indicator is wrapped by a text/line-height span inside
+  // FooterInlineControls. Place Usage beside that wrapper so its 28px control
+  // participates in the footer's flex alignment instead of being nested in
+  // the wrapper's 18px line box.
+  const contextWrapper = context?.parentElement;
+  if (contextWrapper?.parentElement) return contextWrapper;
+  // External Harnesses can publish reliable cache, token, or cost Usage before
+  // the native Context control exists. The renderer-owned Model control is a
+  // stable footer anchor, so early Usage remains visible instead of waiting for
+  // a later Context observation to create the native indicator.
+  const modelRoot = control.modelPicker?.root;
+  return modelRoot?.parentElement ? modelRoot : null;
+}
+
+export function creditsPlacementAnchor(control: ComposerAgentControl): HTMLElement | null {
+  // An unverified picker can be mounted at the Composer's end, outside the toolbar.
+  if (!control.nativePermissionModeControlVerified) return null;
+  const root = control.permissionModePicker?.root;
+  return root?.parentElement ? root : null;
+}
+
+/**
  * Mirrors the mount-time `allButtons.at(-1)` fallback for Composers whose
  * action button is neither `type="submit"` nor labelled as send. After mount
  * the Composer also contains our own controls, so skip their buttons.
@@ -544,6 +588,32 @@ function refreshTrailingClusterPlacement(control: ComposerAgentControl): void {
   parent.insertBefore(agentRoot, anchor);
 }
 
+function refreshUsagePlacement(control: ComposerAgentControl): void {
+  const anchor = usagePlacementAnchor(control);
+  if (!anchor || !control.usage) {
+    if (control.usage?.anchor) control.usage.root.remove();
+    if (control.usage) control.usage.anchor = null;
+    return;
+  }
+  const previousUsageParent = control.usage.root.parentElement;
+  const previousUsageNextSibling = control.usage.root.nextElementSibling;
+  control.usage.place(anchor);
+  const usagePositionChanged =
+    previousUsageParent !== control.usage.root.parentElement ||
+    previousUsageNextSibling !== control.usage.root.nextElementSibling;
+  if (usagePositionChanged) control.harnessCommands?.placeBefore(control.usage.root);
+}
+
+function refreshCreditsPlacement(control: ComposerAgentControl): void {
+  const anchor = creditsPlacementAnchor(control);
+  if (!anchor) {
+    if (control.credits?.anchor) control.credits.root.remove();
+    if (control.credits) control.credits.anchor = null;
+    return;
+  }
+  control.credits.place(anchor);
+}
+
 function refreshNativePermissionModeControl(control: ComposerAgentControl): void {
   const semanticCandidate = semanticNativePermissionModeControlForComposer(control.composer);
   if (semanticCandidate !== control.nativePermissionModeControl?.element) {
@@ -600,6 +670,8 @@ export function reconcileComposerNativeControls(
   // location for it within this same pass.
   refreshNativePermissionModeControl(control);
   refreshTrailingClusterPlacement(control);
+  refreshUsagePlacement(control);
+  refreshCreditsPlacement(control);
   control.composerIndicators?.place(
     control.nativePermissionModeControlVerified
       ? (control.nativePermissionModeControl?.element ?? null)
@@ -658,6 +730,7 @@ export function mountComposerAgentControl(
     composerId,
     onSelectPermissionMode,
   );
+  const credits = mountRendererCreditsControl(composerId);
   const composerIndicators = mountRendererComposerIndicators(composer);
 
   const toolbar = sendButton.parentElement;
@@ -715,12 +788,16 @@ export function mountComposerAgentControl(
     nativePermissionModeControl,
     nativeContextUsageControl,
     nativePermissionModeControlVerified,
+    credits,
     composerIndicators,
+    usage: null,
     harnessCommands,
     sendButton,
     sendDisabledBeforeSwitch: null,
   };
   refreshTrailingClusterPlacement(control);
+  refreshUsagePlacement(control);
+  refreshCreditsPlacement(control);
   control.stopCompactLayout = observeRendererCompactComposer(composer);
   return control;
 }
@@ -749,10 +826,16 @@ export function renderComposerAgentControl(
   modelView: ExternalModelControlView = { status: "idle" },
   permissionModeView: RendererPermissionModeControlView = { status: "idle" },
   usage: ThreadUsageSnapshot | null = null,
+  accountCredits: AccountCreditsSnapshot | null = null,
   locale: RendererSettingsLocale = "en",
   currentCodexAccount: CodexAccountSummary | null = null,
   ownershipError = false,
+  accountBalance: AccountBalanceSnapshot | null = null,
 ): boolean {
+  if (control.usage === null) {
+    control.usage = mountRendererUsageControl(control.composerId, locale);
+  }
+
   const selectedModel = modelView.selected;
   const selectedCatalogModel = catalogModelForRef(modelView.catalog, selectedModel);
   const availableThinkingOptions =
@@ -825,9 +908,13 @@ export function renderComposerAgentControl(
     permissionModeVisible ? (usage?.composerIndicators ?? []) : [],
     locale,
   );
+  if (control.usage) renderRendererUsageControl(control.usage, usage, locale);
   control.harnessCommands.setLocale(locale);
   control.harnessCommands.root.hidden = state.agent === "codex";
   control.harnessCommands.root.style.display = state.agent === "codex" ? "none" : "inline-flex";
+  if (control.credits) {
+    renderRendererCreditsControl(control.credits, accountCredits, locale, accountBalance);
+  }
   return state.agent !== "codex" && adapterState === "ready" && !submissionBlocked;
 }
 
@@ -843,6 +930,9 @@ export function disposeComposerAgentControl(control: ComposerAgentControl): void
   restoreNativeControl(control.nativeContextUsageControl);
   restoreNativeControl(control.nativePermissionModeControl);
   control.composerIndicators?.dispose();
+  control.credits?.dispose();
+  control.usage?.dispose();
+  control.usage = null;
   control.harnessCommands.dispose();
   control.permissionModePicker.dispose();
   control.modelPicker.dispose();

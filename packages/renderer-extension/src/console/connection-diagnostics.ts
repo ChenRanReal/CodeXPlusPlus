@@ -1,6 +1,7 @@
 import {
   harnessIdSchema,
   type CodexhostError,
+  type HarnessInstallationParams,
   type HarnessPluginDescriptor,
 } from "@codexhost/shared-contracts";
 import type { RendererAgentAvailability } from "../agent-selection-state.js";
@@ -101,7 +102,7 @@ export function createConsoleConnectionDiagnostics(
           installation: async (
             hostId: string,
             agent: string,
-            action: "check" | "update" | "install",
+            action: HarnessInstallationParams["action"],
             confirmedVersion?: string,
           ) => {
             if (hostId !== "local")

@@ -825,8 +825,13 @@ export class CodeBuddySession implements HarnessSession {
   }
 
   close(): Promise<void> {
-    this.#closing ??= this.#close();
-    return this.#closing;
+    if (this.#closing) return this.#closing;
+    const attempt = this.#close().catch((error: unknown) => {
+      if (this.#closing === attempt) this.#closing = undefined;
+      throw error;
+    });
+    this.#closing = attempt;
+    return attempt;
   }
   async #close() {
     this.#closed = true;

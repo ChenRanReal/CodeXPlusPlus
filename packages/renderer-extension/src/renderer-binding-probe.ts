@@ -108,6 +108,7 @@ import { RendererMethodUnavailableError } from "./renderer-request-sender.js";
 import { thinkingOptionsForModel } from "./renderer-model-picker.js";
 import { readClaudePermissionModePreference } from "./renderer-permission-mode-preference.js";
 import { isPermissionModeControlReady } from "./renderer-permission-mode-picker.js";
+import { clickNativeNewChat } from "./renderer-native-new-chat.js";
 import {
   readNewThreadAgentPreference,
   rendererNewThreadPreferenceStorage,
@@ -1207,10 +1208,20 @@ export function installRendererBindingProbe(
       refreshing ? { ...mounted.modelView, refreshing } : mounted.modelView,
       mounted.permissionModeView,
       mounted.usage,
+      mounted.accountCredits,
       settingsLifecycle.locale,
       currentCodexAccount ?? null,
       mounted.ownershipStatus === "error",
+      mounted.accountBalance,
     );
+    if (mounted.control.usage) {
+      mounted.control.usage.onOpen = () => {
+        void refreshThreadUsage(
+          mounted,
+          controller.get(mounted.composer).agent === "codex" ? undefined : "exact",
+        );
+      };
+    }
     const nativeTargetResolved =
       mounted.modelTarget?.[0] === "default" || mounted.modelTarget?.[0] === "conversation";
     const nativeEligible =
@@ -1445,7 +1456,7 @@ export function installRendererBindingProbe(
     }
   };
 
-  const refreshThreadUsage = async (mounted: MountedComposer): Promise<void> => {
+  const refreshThreadUsage = async (mounted: MountedComposer, refresh?: "exact"): Promise<void> => {
     const threadId = threadIdFromComposerModelTarget(mounted.modelTarget);
     if (!threadId) {
       await refreshDraftUsage(mounted);
@@ -1464,7 +1475,10 @@ export function installRendererBindingProbe(
     if (!client) return;
     const generation = ++mounted.usageRequestGeneration;
     try {
-      const result = await client.inspectThreadUsage({ threadId });
+      const result = await client.inspectThreadUsage({
+        threadId,
+        ...(refresh ? { refresh } : {}),
+      });
       if (
         disposed ||
         mountedByComposer.get(mounted.composer) !== mounted ||
@@ -1481,6 +1495,36 @@ export function installRendererBindingProbe(
       mounted.accountCredits = result.accountCredits ?? null;
       mounted.accountBalance = result.accountBalance ?? null;
       mounted.accountCreditsSupported = result.accountCreditsSupported ?? false;
+      const agent = controller.get(mounted.composer).agent;
+      if (
+        !mounted.accountCredits &&
+        !mounted.accountBalance &&
+        agent !== "codex" &&
+        client.inspectHarnessAccount
+      ) {
+        const account = await client.inspectHarnessAccount({
+          harnessId: harnessIdSchema.parse(agent),
+          refresh: true,
+        });
+        if (
+          disposed ||
+          mountedByComposer.get(mounted.composer) !== mounted ||
+          !mounted.composer.isConnected ||
+          mounted.usageRequestGeneration !== generation ||
+          mounted.hostId !== hostId ||
+          composerClient(mounted) !== client ||
+          threadIdFromComposerModelTarget(mounted.modelTarget) !== threadId ||
+          controller.get(mounted.composer).agent !== agent ||
+          account.harnessId !== agent
+        ) {
+          return;
+        }
+        const credits = account.account?.credits ?? null;
+        if (credits) {
+          mounted.accountCredits = credits;
+          mounted.accountCreditsSupported = true;
+        }
+      }
       if (
         result.usage !== null &&
         (!mounted.accountCreditsSupported || result.accountCredits || result.accountBalance)
@@ -2688,7 +2732,19 @@ export function installRendererBindingProbe(
       return false;
     }
     const state = controller.get(mounted.composer);
-    if (state.phase !== "draft" || controller.isSwitching(mounted.composer)) return false;
+    if (controller.isSwitching(mounted.composer)) return false;
+    if (state.phase === "locked") {
+      if (state.agent === agent) return true;
+      controller.armNewThreadAgent(agent);
+      writeNewThreadAgentPreference(agent, rendererNewThreadPreferenceStorage(mounted.hostId));
+      if (!clickNativeNewChat(document)) {
+        controller.clearArmedNewThreadAgent();
+        mounted.control.picker.showSwitchFailure("new-thread");
+        return false;
+      }
+      return true;
+    }
+    if (state.phase !== "draft") return false;
     controller.clearPendingSubmission(mounted.composer);
     const composerId = state.composerId;
     for (const candidate of mountedByComposer.values()) {
@@ -3396,11 +3452,14 @@ export function installRendererBindingProbe(
     const hostId = activeModelHostId(composer);
     const editor = composer.querySelector<HTMLElement>(EDITOR_SELECTOR);
     if (!editor) return;
+    const armedNewThreadAgent =
+      modelTarget?.[0] === "default" ? controller.takeArmedNewThreadAgent() : undefined;
     const state = controller.mount(
       composer,
       controllerTarget(modelTarget, hostId),
       modelTarget?.[0] === "default"
-        ? (readNewThreadAgentPreference(undefined, rendererNewThreadPreferenceStorage(hostId)) ??
+        ? (armedNewThreadAgent ??
+            readNewThreadAgentPreference(undefined, rendererNewThreadPreferenceStorage(hostId)) ??
             options.defaultAgent ??
             "codex")
         : undefined,

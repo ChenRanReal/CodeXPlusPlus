@@ -5,6 +5,9 @@ artwork belongs to `packages/adapters/<id>/assets/`, is declared in each plugin'
 manifest, and reaches the Renderer as a validated data URL in the Host directory.
 The Renderer uses an image element, never inline plugin SVG.
 
+`chatgpt-mark.png` is the ChatGPT knot shipped with Codex Desktop. Native
+application icons place that black knot on a light gray rounded tile beside a
+blue `++` monogram.
 `codex-logo.png` is the Codex X mark source; `codex-logo-transparent.png` removes
 its white background, and `codex-logo-bright.png` uses the official bright blue.
 `codex-agent.png` is the Codex App GA mark distributed with OpenAI's official
@@ -49,7 +52,7 @@ historical reference.
 - `codexhost-app-icon.svg`: the previous plated CH application mark, retained at
   its existing path for compatibility and historical reference. It is no longer
   used by settings, console, native application, or installer icons. Native PNG
-  and ICO assets are generated from `codexhost-otter-color.svg`; see the
+  and ICO assets show the ChatGPT knot beside a `++` monogram; see the
   [application icon instructions](../../../../crates/launcher/assets/README.md).
 
 ## External artwork provenance

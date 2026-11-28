@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { harnessAutoUpdateSettingsSchema } from "./harness-auto-update.js";
 import { idleReleaseSettingsSchema } from "./idle-release.js";
 import { harnessModelRefSchema, harnessThinkingOptionIdSchema } from "./harness-models.js";
 import { harnessPermissionModeIdSchema } from "./harness-permission-modes.js";
@@ -38,6 +39,7 @@ export const delegationDefaultsSchema = z.strictObject({
 const modelId = z.string().min(1).max(1024);
 export const harnessPreferenceValuesSchema = z.strictObject({
   idleRelease: idleReleaseSettingsSchema.optional(),
+  harnessAutoUpdate: harnessAutoUpdateSettingsSchema.optional(),
   favorites: z.record(preferenceHarnessKey, z.array(modelId).max(2048)).default({}),
   newThread: newThreadDefaultsSchema.optional(),
   delegation: delegationDefaultsSchema.optional(),
@@ -52,6 +54,10 @@ export const harnessPreferenceGetSchema = z.strictObject({
 });
 export const harnessPreferenceOperationSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("idleRelease"), value: idleReleaseSettingsSchema }),
+  z.strictObject({
+    kind: z.literal("harnessAutoUpdate"),
+    value: harnessAutoUpdateSettingsSchema,
+  }),
   z.strictObject({
     kind: z.literal("favorite"),
     harnessId: harnessIdSchema,

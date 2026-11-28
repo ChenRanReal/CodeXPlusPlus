@@ -1,6 +1,7 @@
 import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
 
-import { createHarnessInstaller } from "@codexhost/harness-discovery";
+import { createHarnessInstaller, npmInstallation } from "@codexhost/harness-discovery";
+import { deepSeekEnvironment, resolveDeepSeekCommand } from "./executable.js";
 import { DeepSeekHarnessAdapter } from "./deepseek-harness-adapter.js";
 import { createDeepSeekInstallation } from "./installation.js";
 
@@ -25,6 +26,22 @@ export function createHarnessAdapter(context: HarnessPluginContext): DeepSeekHar
     }),
     {
       install: createHarnessInstaller(environment, { npm: "@deepseek-ai/dsh@latest" }),
+      async resolveUninstaller() {
+        const invocation = resolveDeepSeekCommand(
+          environment[DEEPSEEK_HARNESS_COMMAND_ENV],
+          environment,
+        );
+        if (!invocation || invocation.kind === "npx") return null;
+        return (
+          (
+            await npmInstallation(
+              invocation.command,
+              ["@deepseek-ai/dsh"],
+              deepSeekEnvironment(invocation.command, environment),
+            )
+          )?.uninstall ?? null
+        );
+      },
       installation: createDeepSeekInstallation(
         environment,
         environment[DEEPSEEK_HARNESS_COMMAND_ENV],

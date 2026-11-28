@@ -50,6 +50,7 @@ const testState = vi.hoisted(() => ({
   renderedPermissionMode: null as
     null | Parameters<typeof RendererComposerDom.renderComposerAgentControl>[6],
   renderedUsage: null as ThreadUsageSnapshot | null,
+  renderedAccountCredits: null as AccountCreditsSnapshot | null,
   selectModel: null as null | ((modelId: string) => void),
   selectThinking: null as null | ((thinkingOptionId: string) => void),
   getConnectionDiagnostics: null as null | (() => RendererConnectionDiagnostics | null),
@@ -113,10 +114,12 @@ vi.mock("../src/renderer-composer-dom.js", async (importOriginal) => {
       modelView: RendererModelControlView,
       permissionModeView: Parameters<typeof RendererComposerDom.renderComposerAgentControl>[6],
       usage: ThreadUsageSnapshot | null,
+      accountCredits: AccountCreditsSnapshot | null = null,
     ) => {
       testState.renderedModelViews.push({ ...modelView });
       testState.renderedPermissionMode = permissionModeView;
       testState.renderedUsage = usage;
+      testState.renderedAccountCredits = accountCredits;
     },
     reconcileComposerNativeControls: vi.fn(),
     disposeComposerAgentControl: vi.fn(),
@@ -253,6 +256,7 @@ function installFakeBrowser(): void {
   testState.selectPermissionMode = null;
   testState.renderedPermissionMode = null;
   testState.renderedUsage = null;
+  testState.renderedAccountCredits = null;
   testState.selectModel = null;
   testState.selectThinking = null;
   testState.getConnectionDiagnostics = null;
@@ -1206,6 +1210,7 @@ describe("Renderer binding Host-scoped Claude catalogs", () => {
         await vi.advanceTimersByTimeAsync(16_000);
         expect(usageReads()).toBe(7);
         expect(testState.renderedUsage).toEqual({ totalTokens: 120 });
+        expect(testState.renderedAccountCredits).toBeNull();
 
         // A notification can refresh the saved snapshot after polling has ended.
         usage = { totalTokens: 180 };
@@ -1214,6 +1219,7 @@ describe("Renderer binding Host-scoped Claude catalogs", () => {
         notifyUsage({ method: THREAD_USAGE_UPDATED_METHOD, params: { threadId: "thread-a" } });
         await vi.advanceTimersByTimeAsync(16_000);
         expect(testState.renderedUsage).toEqual({ totalTokens: 180 });
+        expect(testState.renderedAccountCredits).toEqual(quota);
         expect(usageReads()).toBe(8); // Notification-triggered read, not renewed polling.
       } finally {
         probe.dispose();

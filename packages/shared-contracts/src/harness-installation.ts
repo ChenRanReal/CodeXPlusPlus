@@ -10,7 +10,7 @@ export const HARNESS_INSTALLATION_STATUS_METHOD = "codexhost/harness/installatio
 export const harnessInstallationParamsSchema = z
   .object({
     harnessId: harnessIdSchema,
-    action: z.enum(["check", "update", "install"]),
+    action: z.enum(["check", "update", "install", "checkUninstall", "uninstall"]),
     confirmedVersion: z.string().min(1).max(128).optional(),
   })
   .strict()
@@ -22,7 +22,8 @@ export function harnessInstallationRequestTimeoutMs(
 ): number | undefined {
   if (method !== HARNESS_INSTALLATION_METHOD) return;
   const parsed = harnessInstallationParamsSchema.safeParse(params);
-  if (!parsed.success || parsed.data.action === "check") return;
+  if (!parsed.success || parsed.data.action === "check" || parsed.data.action === "checkUninstall")
+    return;
   return HARNESS_INSTALLATION_MUTATION_TIMEOUT_MS;
 }
 export const harnessInstallationStateSchema = z
@@ -31,6 +32,8 @@ export const harnessInstallationStateSchema = z
     latestVersion: z.string().min(1).max(128),
     updateAvailable: z.boolean(),
     canUpdate: z.boolean(),
+    /** The Adapter identified an uninstall method for the selected CLI. */
+    canUninstall: z.literal(true).optional(),
     /** Present when the Adapter has a verified list and the available target is outside it. */
     latestVerifiedVersion: z.string().min(1).max(128).optional(),
     /** Update preflight stopped before running the installer; latestVersion needs confirmation. */

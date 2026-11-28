@@ -38,6 +38,7 @@ export function createConnectionVersions(
 ): {
   get(hostId: string, agent: ExternalRendererAgent, name: string): HarnessVersionPanel | undefined;
   isUpdating(hostId: string, agent: ExternalRendererAgent): boolean;
+  refresh(hostId: string, agent: ExternalRendererAgent): void;
 } {
   const panels = new Map<string, HarnessVersionPanel>();
   const installation = diagnostics?.installation?.bind(diagnostics);
@@ -46,6 +47,9 @@ export function createConnectionVersions(
     JSON.stringify([hostId, agent]);
 
   return {
+    refresh(hostId, agent) {
+      void sessions?.get(sessionKey(hostId, agent))?.check();
+    },
     isUpdating(hostId, agent) {
       return Boolean(sessions?.get(sessionKey(hostId, agent))?.updating);
     },

@@ -22,6 +22,8 @@ import {
   THREAD_CATALOG_READ_METHOD,
   threadCatalogReadParamsSchema,
   threadArchiveConfirmParamsSchema,
+  DEFAULT_HARNESS_AUTO_UPDATE_SETTINGS,
+  HARNESS_AUTO_UPDATE_COMPLETED_METHOD,
 } from "@codexhost/shared-contracts";
 import { requestDesktopRemoteConnections } from "@codexhost/desktop-control";
 import type { RuntimeMaintenance } from "./runtime-maintenance.js";
@@ -300,6 +302,8 @@ import { HostExtensionManager } from "./host-extension-manager.js";
 import { handleHostExtensionRequest } from "./host-extension-requests.js";
 import { codexhostDataDirectory } from "./external-clients.js";
 import { DesktopControlRequests } from "./desktop-control-requests.js";
+import { HarnessAutoUpdate } from "./harness-auto-update.js";
+import { HarnessInstallationTasks } from "./harness-installation-tasks.js";
 import { DesktopThreadRouting } from "./desktop-thread-routing.js";
 import { errorMessage, rpcEnvelope, rpcError, type HostRequestOrigin } from "./desktop-rpc.js";
 import { ThreadListTiming } from "./thread-list-timing.js";
@@ -896,6 +900,8 @@ export class AppServerHost {
   #writer: OrderedWriter;
   readonly clientEvents = new ClientChannelEvents();
   readonly #client: ClientChannelHost;
+  readonly #installationTasks = new HarnessInstallationTasks();
+  #autoUpdate: HarnessAutoUpdate | undefined;
   readonly #desktopControl: DesktopControlRequests;
   readonly hostExtensions: HostExtensionManager | undefined;
   readonly #threadRouting: DesktopThreadRouting;
@@ -1320,38 +1326,60 @@ export class AppServerHost {
             (revision) => this.clientEvents.extensionsChanged(revision),
             (message) => this.#diagnose(message),
           ));
-    this.#desktopControl = new DesktopControlRequests({
-      hostExtensions: this.hostExtensions,
-      writeJson: (value) => this.#writer.json(value),
-      dispatchReply: (request, run, threadId) => this.#dispatchDesktopReply(request, run, threadId),
-      waitForPlugins: () => this.#waitForPlugins(),
-      diagnose: (error) => this.#diagnose(error),
-      environment: this.#options.environment ?? process.env,
-      preferences: this.#preferences,
-      inspectCodexModels: async () => {
-        const { inspection } = await this.#inspectOfficialDelegationTarget({ harnessId: "codex" });
-        return inspection.status === "ready" ? inspection.catalog : undefined;
+    this.#autoUpdate =
+      desktopEnvironment.CODEXHOST_REMOTE_SSH_MANAGED === "1"
+        ? undefined
+        : new HarnessAutoUpdate({
+            directory: codexhostDataDirectory(desktopEnvironment),
+            adapters: () => this.#externalAdapters,
+            waitForPlugins: () => this.#waitForPlugins(),
+            tasks: this.#installationTasks,
+            label: (id) => this.#pluginDescriptors.find((plugin) => plugin.id === id)?.name ?? id,
+            notify: (result) => {
+              void this.#writer
+                .json({ method: HARNESS_AUTO_UPDATE_COMPLETED_METHOD, params: result })
+                .catch((error: unknown) => this.#diagnose(error));
+            },
+            diagnose: (error) => this.#diagnose(error),
+          });
+    this.#desktopControl = new DesktopControlRequests(
+      {
+        hostExtensions: this.hostExtensions,
+        writeJson: (value) => this.#writer.json(value),
+        dispatchReply: (request, run, threadId) =>
+          this.#dispatchDesktopReply(request, run, threadId),
+        waitForPlugins: () => this.#waitForPlugins(),
+        diagnose: (error) => this.#diagnose(error),
+        environment: this.#options.environment ?? process.env,
+        preferences: this.#preferences,
+        inspectCodexModels: async () => {
+          const { inspection } = await this.#inspectOfficialDelegationTarget({
+            harnessId: "codex",
+          });
+          return inspection.status === "ready" ? inspection.catalog : undefined;
+        },
+        displaySettings: this.#displaySettings,
+        launchSettings: this.#launchSettings,
+        modelPrices: this.#modelPrices,
+        usageStatistics: this.#options.usageStatistics,
+        externalAdapters: this.#externalAdapters,
+        pluginDescriptors: () => this.#pluginDescriptors,
+        listLoadedSessions: () => this.#externalRuntime.idleRelease.list(),
+        applyHarnessPreferences: (snapshot) => this.#applyHarnessPreferences(snapshot),
+        attachUsageStatistics: () => this.#attachUsageStatistics(),
+        inspectHarnessAccount: (adapter, refresh) => this.#inspectHarnessAccount(adapter, refresh),
+        releaseAnnouncement: options.releaseAnnouncement,
+        handleUpdateRequest: (request) => this.#handleUpdateRequest(request),
+        handleConsoleOpen: (request) => this.#handleConsoleOpen(request),
+        handleWebOpen: (request) => this.#handleWebOpen(request),
+        handleCodexAccountRequest: (request) => this.#handleCodexAccountRequest(request),
+        inspectHarness: (request) => this.#inspectHarness(request),
+        openHarnessWebUi: (request) => this.#openHarnessWebUi(request),
+        handleSessionImport: (request) =>
+          this.#desktopRequests.run(undefined, () => this.#handleSessionImport(request)),
       },
-      displaySettings: this.#displaySettings,
-      launchSettings: this.#launchSettings,
-      modelPrices: this.#modelPrices,
-      usageStatistics: this.#options.usageStatistics,
-      externalAdapters: this.#externalAdapters,
-      pluginDescriptors: () => this.#pluginDescriptors,
-      listLoadedSessions: () => this.#externalRuntime.idleRelease.list(),
-      applyHarnessPreferences: (snapshot) => this.#applyHarnessPreferences(snapshot),
-      attachUsageStatistics: () => this.#attachUsageStatistics(),
-      inspectHarnessAccount: (adapter, refresh) => this.#inspectHarnessAccount(adapter, refresh),
-      releaseAnnouncement: options.releaseAnnouncement,
-      handleUpdateRequest: (request) => this.#handleUpdateRequest(request),
-      handleConsoleOpen: (request) => this.#handleConsoleOpen(request),
-      handleWebOpen: (request) => this.#handleWebOpen(request),
-      handleCodexAccountRequest: (request) => this.#handleCodexAccountRequest(request),
-      inspectHarness: (request) => this.#inspectHarness(request),
-      openHarnessWebUi: (request) => this.#openHarnessWebUi(request),
-      handleSessionImport: (request) =>
-        this.#desktopRequests.run(undefined, () => this.#handleSessionImport(request)),
-    });
+      this.#installationTasks,
+    );
     this.#threadRouting = new DesktopThreadRouting({
       writeJson: (value) => this.#writer.json(value),
       dispatchReply: (request, run, threadId) => this.#dispatchDesktopReply(request, run, threadId),
@@ -1535,6 +1563,9 @@ export class AppServerHost {
     this.#externalRuntime.idleRelease.configure(
       snapshot.values.idleRelease ?? DEFAULT_IDLE_RELEASE_SETTINGS,
     );
+    void this.#autoUpdate
+      ?.configure(snapshot.values.harnessAutoUpdate ?? DEFAULT_HARNESS_AUTO_UPDATE_SETTINGS)
+      .catch((error: unknown) => this.#diagnose(error));
     this.#appliedPreferenceRevision = snapshot.revision;
   }
 
@@ -1572,6 +1603,7 @@ export class AppServerHost {
           })
           .catch((error) => this.#diagnose(error));
       }
+      void this.#autoUpdate?.start().catch((error: unknown) => this.#diagnose(error));
     } catch (error) {
       this.#diagnose(`Host initialization failed: ${errorMessage(error)}`);
       if (!this.#options.hostExtensions) await this.hostExtensions?.close();
@@ -1627,6 +1659,7 @@ export class AppServerHost {
       // Stop replacement waiters before waiting for their tracked Host operations.
       this.#externalSteering.close();
       await this.#desktopRequests.drain();
+      this.#autoUpdate?.stop();
       this.#externalRuntime.idleRelease.stop();
       await this.#externalRuntime.idleRelease.drain();
       await this.#pluginLoading;
@@ -5191,7 +5224,9 @@ export class AppServerHost {
 
   async #resolveExternalThread(threadId: string): Promise<ExternalThreadResolution> {
     const location = await this.#locateExternalThread(threadId);
-    if (location.kind !== "external") return location;
+    // locate reports a stuck release immediately. resolve retries that close once it has settled.
+    if (location.kind !== "external" && !this.#externalRuntime.releaseFailure(threadId))
+      return location;
     await this.#waitForPlugins();
     return this.#externalRuntime.resolve(threadId);
   }

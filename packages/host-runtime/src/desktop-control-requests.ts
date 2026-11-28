@@ -111,10 +111,11 @@ export interface DesktopControlRequestHost {
  */
 export class DesktopControlRequests {
   readonly #host: DesktopControlRequestHost;
-  readonly #installationTasks = new HarnessInstallationTasks();
+  readonly #installationTasks: HarnessInstallationTasks;
 
-  constructor(host: DesktopControlRequestHost) {
+  constructor(host: DesktopControlRequestHost, installationTasks = new HarnessInstallationTasks()) {
     this.#host = host;
+    this.#installationTasks = installationTasks;
   }
 
   /** Returns false when `request` is not a control request, leaving it to Thread routing. */

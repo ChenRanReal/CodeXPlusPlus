@@ -32,7 +32,7 @@
 
 必须：
 
-- check **不发起**模型 Turn，也不安装任何东西；只有用户明确点击时才执行 update。
+- check **不发起**模型 Turn，也不安装任何东西。update 由用户点击，或由本机 Host 按连接页「更新设置」自动调用。自动更新会提交检查到的 `confirmedVersion`，不处理 `canUpdate: false` 或只有手动下载的安装。
 - 版本来源、安装渠道识别、原生更新命令都由 Adapter 决定。无法确认当前安装渠道（自定义路径、包管理器、Nix 等）时，返回 `canUpdate: false` 和手动更新说明，不能更新另一份安装。
 - 并发的更新合并为一次；检查不能与更新后的版本回读竞争；更新后版本没有变化，不能报告成功。直接使用 `createInstallationManager({ check, update })` 即可满足这些要求。
 - 超时：普通命令 30 秒，更新命令最多 5 分钟，读取最新版本的网络请求 15 秒（`fetchInstallationText`）。

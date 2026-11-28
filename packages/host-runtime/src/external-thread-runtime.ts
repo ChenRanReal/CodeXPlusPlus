@@ -624,9 +624,22 @@ export class ExternalThreadRuntime {
     return { kind: "external", record, thread: null };
   }
 
+  releaseFailure(threadId: string): string | undefined {
+    const thread = this.#threads.get(threadId);
+    return thread ? this.idleRelease.failure(thread) : undefined;
+  }
+
   async resolve(threadId: string): Promise<ExternalThreadResolution> {
     try {
       return await this.#withLifecycle(threadId, async () => {
+        const blocked = this.#threads.get(threadId);
+        if (blocked && this.idleRelease.failure(blocked)) {
+          const released = await this.idleRelease.reclaim(blocked);
+          if (!released) {
+            const failure = this.idleRelease.failure(blocked);
+            if (failure) return { kind: "error", error: { code: -32075, message: failure } };
+          }
+        }
         // Read after admission, never act on a location captured before another recovery.
         const location = await this.#locate(threadId);
         if (location.kind !== "external") return location;

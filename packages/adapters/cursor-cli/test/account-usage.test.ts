@@ -1,6 +1,14 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
 import { describe, expect, it, vi } from "vitest";
 
-import { fetchCursorAccount, projectCursorAccountUsage } from "../src/account-usage.js";
+import {
+  fetchCursorAccount,
+  projectCursorAccountUsage,
+  readWindowsCursorAccessToken,
+} from "../src/account-usage.js";
 
 describe("Cursor account usage", () => {
   it("projects native Auto and API percentages without deriving spend", () => {
@@ -67,6 +75,27 @@ describe("Cursor account usage", () => {
       expect(init?.headers).toMatchObject({
         Authorization: "Bearer native-token",
       });
+    }
+  });
+
+  it("reads the Windows DPAPI auth file when auth.json only names the OS secret store", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "cursor-auth-"));
+    try {
+      await writeFile(
+        path.join(directory, "auth.dpapi"),
+        JSON.stringify({ version: 1, dpapi: Buffer.from("blob").toString("base64") }),
+        "utf8",
+      );
+      await expect(
+        readWindowsCursorAccessToken(directory, async () =>
+          JSON.stringify({ accessToken: "dpapi-token" }),
+        ),
+      ).resolves.toBe("dpapi-token");
+      await expect(
+        readWindowsCursorAccessToken(directory, async () => "not-json"),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
     }
   });
 });

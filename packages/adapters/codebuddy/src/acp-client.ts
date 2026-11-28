@@ -249,12 +249,29 @@ export class CodeBuddyAcpClient implements CodeBuddyClient {
   close(): Promise<void> {
     clearTimeout(this.#exitDrainTimer);
     this.#rejectFailure(new CodeBuddyError("invalidState", "ACP client is closed"));
-    this.#closing ??= this.#closeProcess();
-    return this.#closing;
+    if (this.#closing) return this.#closing;
+    // A rejected close stays retryable. The process can exit after the first attempt.
+    const attempt = this.#closeProcess().catch((error: unknown) => {
+      if (this.#closing === attempt) this.#closing = undefined;
+      throw error;
+    });
+    this.#closing = attempt;
+    return attempt;
+  }
+
+  #processHasExited(): boolean {
+    return this.#child.exitCode !== null || this.#child.signalCode !== null;
+  }
+
+  /** Descendants can keep stdio open after the process itself has exited. */
+  async #releaseClosedPipes(): Promise<void> {
+    this.#child.stdout.destroy();
+    this.#child.stderr.destroy();
+    await bounded(this.#exited, 3_000, "ACP closed process pipes");
   }
 
   async #closeProcess() {
-    this.#child.stdin.end();
+    if (!this.#child.stdin.writableEnded) this.#child.stdin.end();
     const exited = await bounded(
       this.#exited.then(() => true),
       1_000,
@@ -263,10 +280,8 @@ export class CodeBuddyAcpClient implements CodeBuddyClient {
     if (exited) return;
     // A dead parent's PID can be reused while descendants keep its pipes open.
     // Never target such a PID with taskkill or a process-group signal.
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) {
-      this.#child.stdout.destroy();
-      this.#child.stderr.destroy();
-      await bounded(this.#exited, 3_000, "ACP closed process pipes");
+    if (this.#processHasExited()) {
+      await this.#releaseClosedPipes();
       return;
     }
     const pid = this.#child.pid;
@@ -286,6 +301,22 @@ export class CodeBuddyAcpClient implements CodeBuddyClient {
         /* Already exited. */
       }
     }
-    await bounded(this.#exited, 3_000, "ACP process exit");
+    if (this.#processHasExited()) {
+      await this.#releaseClosedPipes();
+      return;
+    }
+    const exitSeen = bounded(
+      new Promise<void>((resolve) => {
+        this.#child.once("exit", () => resolve());
+      }),
+      3_000,
+      "ACP process exit",
+    );
+    void exitSeen.catch(() => {});
+    const outcome = await Promise.race([
+      this.#exited.then(() => "closed" as const),
+      exitSeen.then(() => "exited" as const),
+    ]);
+    if (outcome === "exited") await this.#releaseClosedPipes();
   }
 }

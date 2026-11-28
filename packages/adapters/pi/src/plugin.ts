@@ -3,6 +3,7 @@ import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
 import { createHarnessInstaller } from "@codexhost/harness-discovery";
 import { PiAdapter } from "./pi-adapter.js";
 import { createPiInstallation } from "./installation.js";
+import { resolvePiUninstaller } from "./uninstall.js";
 
 export const PI_COMMAND_ENV = "CODEXHOST_PI_COMMAND";
 
@@ -15,6 +16,7 @@ export function createHarnessAdapter(context: HarnessPluginContext): PiAdapter {
     }),
     {
       installation: createPiInstallation(environment, environment[PI_COMMAND_ENV]),
+      resolveUninstaller: () => resolvePiUninstaller(environment, environment[PI_COMMAND_ENV]),
       install: createHarnessInstaller(environment, {
         posix: "https://pi.dev/install.sh",
         windows: "https://pi.dev/install.ps1",

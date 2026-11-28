@@ -15,6 +15,8 @@ fn main() {
     let manifest = crate_root.join("windows.manifest");
     winresource::WindowsResource::new()
         .set_icon(icon.to_str().expect("icon path must be valid UTF-8"))
+        .set("FileDescription", "CodeX++")
+        .set("ProductName", "CodeX++")
         .set_manifest_file(
             manifest
                 .to_str()

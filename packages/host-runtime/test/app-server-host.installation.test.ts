@@ -49,7 +49,7 @@ describe("Host Harness CLI installation routing", () => {
   });
 
   it("answers task submission and status before the update ends and admits chat messages meanwhile", async () => {
-    const fixture = createFixture();
+    const fixture = createFixture({ environment: { CODEXHOST_REMOTE_SSH_MANAGED: "1" } });
     const update = Promise.withResolvers<HarnessInstallationState>();
     const installation = vi.fn(() => update.promise);
     Object.assign(fixture.adapter, { installation });
@@ -161,6 +161,38 @@ describe("Host Harness CLI installation routing", () => {
       expect(fixture.adapter.sessions).toHaveLength(0);
     } finally {
       update.resolve(state);
+      await stopFixture(fixture);
+    }
+  });
+
+  it("checks the selected uninstall method and blocks updates while it runs", async () => {
+    const fixture = createFixture({ environment: { CODEXHOST_REMOTE_SSH_MANAGED: "1" } });
+    const removed = Promise.withResolvers<void>();
+    let selected = true;
+    Object.assign(fixture.adapter, {
+      installation: async () => state,
+      resolveUninstaller: async () =>
+        selected
+          ? async () => {
+              await removed.promise;
+              selected = false;
+            }
+          : null,
+    });
+    const request = (action: string) =>
+      fixture.host.handleConsoleRequest(HARNESS_INSTALLATION_METHOD, { harnessId: "pi", action });
+    try {
+      await fixture.ready;
+      expect(await request("checkUninstall")).toMatchObject({ result: { canUninstall: true } });
+      expect(await request("check")).toEqual({ result: state });
+      const uninstall = request("uninstall");
+      expect(await request("update")).toMatchObject({ error: { code: -32077 } });
+      removed.resolve();
+      expect(await uninstall).toMatchObject({ result: { canUpdate: false } });
+      expect(await request("checkUninstall")).toMatchObject({ result: { canUpdate: false } });
+      expect(await request("uninstall")).toMatchObject({ error: { code: -32078 } });
+    } finally {
+      removed.resolve();
       await stopFixture(fixture);
     }
   });

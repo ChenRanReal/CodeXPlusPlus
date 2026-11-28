@@ -220,11 +220,26 @@ describe("release Host and independent plugin Bundles", () => {
       const preinstalled = preinstalledHarnessPlugins();
       const expectedIds = preinstalled.configuration.enabled;
       expect(expectedIds).toEqual([
-        "antigravity",
-        "cursor-cli",
+        "pi",
+        "claude-code",
         "deepseek-harness",
+        "opencode",
+        "grok",
+        "omp",
+        "qwen-code",
+        "antigravity",
+        "kiro-cli",
         "codebuddy",
+        "workbuddy",
+        "cursor-cli",
+        "devin",
+        "hermes",
+        "qoder",
         "qoder-cn",
+        "kimi-code",
+        "zcode",
+        "copilot",
+        "codex-usage",
       ]);
       // Desktop hides Web-only Harnesses; the client channel would still list them.
       const desktopIds = preinstalled.plugins
@@ -234,10 +249,15 @@ describe("release Host and independent plugin Bundles", () => {
       const runtimePackagesById = new Map(
         pluginAudits.map(({ id, runtimePackages }) => [id, runtimePackages]),
       );
-      for (const id of ["antigravity", "cursor-cli", "codebuddy"]) {
+      for (const id of ["antigravity", "grok", "cursor-cli", "codebuddy"]) {
         expect(runtimePackagesById.get(id)).toContain("@agentclientprotocol/sdk");
       }
+      expect(runtimePackagesById.get("claude-code")).toContain("@anthropic-ai/claude-agent-sdk");
+      expect(runtimePackagesById.get("opencode")).toEqual(
+        expect.arrayContaining(["@opencode-ai/sdk", "@opencode/client"]),
+      );
       expect(runtimePackagesById.get("deepseek-harness")).toEqual(["diff", "ws", "zod"]);
+      expect(runtimePackagesById.get("qoder")).toContain("@qoder-ai/qoder-agent-sdk");
       expect(runtimePackagesById.get("qoder-cn")).toContain("@qodercn-ai/qodercn-agent-sdk");
       const source = await readFile(path.join(app, "host-runtime.mjs"), "utf8");
       expect(source).not.toContain("class ClaudeCodeAdapter");
@@ -315,5 +335,5 @@ describe("release Host and independent plugin Bundles", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  }, 45_000);
+  }, 120_000);
 });

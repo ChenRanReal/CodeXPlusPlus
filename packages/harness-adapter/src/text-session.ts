@@ -755,6 +755,8 @@ export interface HarnessAdapter {
   ): Promise<HarnessInstallationState>;
   /** Explicit first-time CLI installation using an Adapter-owned official source. */
   install?(): Promise<void>;
+  /** Identifies the selected CLI's uninstall method without changing files. The returned operation removes only that installation. */
+  resolveUninstaller?(): Promise<(() => Promise<void>) | null>;
   readonly credentialExport?: HarnessCredentialExport;
   readonly credentialImports?: HarnessCredentialImports;
   readonly harnessId: HarnessId;

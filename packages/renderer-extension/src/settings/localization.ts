@@ -184,6 +184,12 @@ export interface RendererSettingsMessages {
   readonly connectionStatusUnavailable: string;
   readonly connectionStatusError: string;
   readonly connectionStatusInstalling: string;
+  readonly connectionStatusUninstalling: string;
+  readonly harnessUninstall: string;
+  readonly harnessUninstallTitle: string;
+  readonly harnessUninstallDetail: string;
+  readonly harnessUninstallCancel: string;
+  readonly harnessUninstallFailed: string;
   readonly connectionStatusUpdating: string;
   readonly connectionStatusUnsupported: string;
   readonly connectionComponent: string;
@@ -230,6 +236,22 @@ export interface RendererSettingsMessages {
   readonly harnessUpdateTargetChangedDetail: string;
   readonly harnessUpdateSkip: string;
   readonly harnessUpdateAnyway: string;
+  readonly harnessAutoUpdateSection: string;
+  readonly harnessAutoUpdateTitle: string;
+  readonly harnessAutoUpdateDescription: string;
+  readonly harnessAutoUpdateInterval: string;
+  readonly harnessAutoUpdateIntervalDescription: string;
+  readonly harnessAutoUpdateHourly: string;
+  readonly harnessAutoUpdateEvery6Hours: string;
+  readonly harnessAutoUpdateEvery12Hours: string;
+  readonly harnessAutoUpdateDaily: string;
+  readonly harnessAutoUpdateWeekly: string;
+  readonly harnessAutoUpdateTime: string;
+  readonly harnessAutoUpdateTimeDescription: string;
+  readonly harnessAutoUpdateWeekday: string;
+  readonly harnessAutoUpdateWeekdayDescription: string;
+  readonly harnessAutoUpdateWeekdays: readonly string[];
+  readonly harnessAutoUpdateFailed: string;
   readonly harnessVersionUpdating: string;
   readonly harnessVersionUpToDate: string;
   readonly harnessVersionUpdated: string;
@@ -488,6 +510,14 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   connectionStatusUnavailable: "Unavailable",
   connectionStatusError: "Error",
   connectionStatusInstalling: "Installing",
+  connectionStatusUninstalling: "Uninstalling…",
+  harnessUninstall: "Uninstall automatically",
+  harnessUninstallTitle: "Uninstall {name}?",
+  harnessUninstallDetail:
+    "This removes the selected CLI from {host}. Your settings and conversation history are kept.",
+  harnessUninstallCancel: "Cancel",
+  harnessUninstallFailed:
+    "Could not confirm the uninstall. Check the CLI installation and try again.",
   connectionStatusUpdating: "Updating",
   connectionStatusUnsupported: "Unsupported",
   connectionComponent: "Component",
@@ -543,6 +573,32 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   harnessUpdateTargetChangedDetail: "The update target changed to {name} {target}.",
   harnessUpdateSkip: "Skip this update",
   harnessUpdateAnyway: "Update anyway",
+  harnessAutoUpdateSection: "Update settings",
+  harnessAutoUpdateTitle: "Automatic updates",
+  harnessAutoUpdateDescription:
+    "Check this computer on the selected schedule and install Harness updates that can be applied here. A notice appears at the top of the window and in the system notification area when something changes.",
+  harnessAutoUpdateInterval: "Frequency",
+  harnessAutoUpdateIntervalDescription: "How often to check.",
+  harnessAutoUpdateHourly: "Every hour",
+  harnessAutoUpdateEvery6Hours: "Every 6 hours",
+  harnessAutoUpdateEvery12Hours: "Every 12 hours",
+  harnessAutoUpdateDaily: "Every day",
+  harnessAutoUpdateWeekly: "Every week",
+  harnessAutoUpdateTime: "Time",
+  harnessAutoUpdateTimeDescription:
+    "Daily and weekly runs use this time. Shorter intervals repeat from it.",
+  harnessAutoUpdateWeekday: "Day",
+  harnessAutoUpdateWeekdayDescription: "Used for the weekly schedule.",
+  harnessAutoUpdateWeekdays: [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+  ],
+  harnessAutoUpdateFailed: "Could not save update settings.",
   harnessVersionUpdating: "Updating…",
   harnessVersionUpToDate: "Up to date",
   harnessVersionUpdated:
@@ -827,6 +883,12 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   connectionStatusUnavailable: "不可用",
   connectionStatusError: "错误",
   connectionStatusInstalling: "安装中",
+  connectionStatusUninstalling: "卸载中…",
+  harnessUninstall: "一键卸载",
+  harnessUninstallTitle: "卸载 {name}？",
+  harnessUninstallDetail: "这会从「{host}」卸载当前检测到的 CLI，并保留设置和对话记录。",
+  harnessUninstallCancel: "取消",
+  harnessUninstallFailed: "无法确认卸载结果。请检查 CLI 的安装状态后重试。",
   connectionStatusUpdating: "更新中",
   connectionStatusUnsupported: "不支持",
   connectionComponent: "组件",
@@ -877,6 +939,23 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   harnessUpdateTargetChangedDetail: "更新目标已变更为 {name} {target}。",
   harnessUpdateSkip: "跳过此项",
   harnessUpdateAnyway: "继续更新",
+  harnessAutoUpdateSection: "更新设置",
+  harnessAutoUpdateTitle: "自动更新",
+  harnessAutoUpdateDescription:
+    "按所选频率检查这台电脑，并自动安装可以在这里完成的 Harness 更新。有变化时，窗口顶部和系统通知栏会提醒。",
+  harnessAutoUpdateInterval: "频率",
+  harnessAutoUpdateIntervalDescription: "多久检查一次。",
+  harnessAutoUpdateHourly: "每小时",
+  harnessAutoUpdateEvery6Hours: "每 6 小时",
+  harnessAutoUpdateEvery12Hours: "每 12 小时",
+  harnessAutoUpdateDaily: "每天",
+  harnessAutoUpdateWeekly: "每周",
+  harnessAutoUpdateTime: "时间",
+  harnessAutoUpdateTimeDescription: "每天和每周在这个时刻运行。更短的频率从这个时刻起重复。",
+  harnessAutoUpdateWeekday: "星期",
+  harnessAutoUpdateWeekdayDescription: "每周更新时使用。",
+  harnessAutoUpdateWeekdays: ["周日", "周一", "周二", "周三", "周四", "周五", "周六"],
+  harnessAutoUpdateFailed: "无法保存更新设置。",
   harnessVersionUpdating: "正在更新…",
   harnessVersionUpToDate: "已是最新",
   harnessVersionUpdated:

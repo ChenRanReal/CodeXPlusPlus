@@ -155,7 +155,11 @@ Codex 的会话用量解析已从公共协议层迁入 `codex-usage`，账户配
 
 Host 切换栏右侧提供「全部更新（数量）」，仅统计当前 Host 中检查结果已确认有新版本且支持自动更新的 Harness，包含「更多」分组；不安装缺失的 CLI，不纳入仅支持手动更新的安装。点击时固定本批次的 Host 与条目，同时调用各条目的同一更新入口，不设置并发上限，显示已完成数/总数，每项独立结算，失败不影响其他更新。单项与批量请求复用同一条目的进行中任务；存在单项更新时仍可启动批量更新。批量操作期间禁用该 Host 的重复批量操作，完成后按 Host 显示成功/失败数量，具体失败信息保留在各条目详情。切换 Host 不改变已开始批次的目标；关闭连接页停止页面反馈，Host 已接受的更新继续运行。
 
+本机 Host 按「设置 → 连接」顶部的更新设置自动检查并更新，不需要点击更新。默认开启，每天本地 09:00；可改为关闭，或每小时、每 6 小时、每 12 小时、每天、每周，并指定时刻（每周再指定星期）。没有上次运行记录时，开启后 Host 就绪即执行一次，之后等到所选时刻；错过的那次在下次 Host 运行时补做，不连续补多次。关闭后停止计时。到点后串行检查本机已安装且声明了版本管理的 Harness。`updateAvailable` 与 `canUpdate` 均为真、且没有 `manualUpdateUrl` 时，用检查到的 `latestVersion` 作为 `confirmedVersion` 调用与手动更新相同的入口，因此不再弹出确认。目标在执行前变化时，用新版本再确认一次。未安装、不能由 Host 安装或只能手动下载的条目保持原样。全部都已是最新时不发通知；有更新或失败时，Host 发送 `codexhost/harness/auto-update/completed`，Desktop 在窗口顶部显示结果，并在系统允许时显示系统通知。正在进行的会话不重启。受管 SSH 远程 Host 不启动这项计划。设置写在 `harness-preferences-v1.json`，上次运行时间写在数据目录的 `harness-auto-update-state.json`。
+
 Desktop 的检查、更新与安装通过 `codexhost/harness/installation/start` 提交 `{ harnessId, action }`，立即取得 `{ taskId, status }`；再以 `codexhost/harness/installation/status` 和 `{ taskId }` 读取 `running`、`succeeded`（含版本结果）或 `failed`（含脱敏错误）的任务状态。任务由目标 Host 持有，同一 Harness/action 的进行中提交复用任务，不设置跨 Harness 并发上限，完成结果保留 15 分钟。Renderer 每 500ms 读取一次状态，提交与状态请求采用 background 优先级及 15 秒传输超时；原生安装器的完整运行时间不占用 Desktop 的在途请求名额，给配置读取和消息提交保留通路。任务继续运行不依赖设置页保持打开。原 `codexhost/harness/installation` 保留给旧客户端及控制台；新版 Desktop 不向缺少任务接口的旧 Host 回退到长请求，需先升级目标 Host。
+
+连接页使用同一任务接口探测并卸载选中的 CLI。`checkUninstall` 只检查安装来源，返回 `canUninstall: true` 时显示「一键卸载」。确认后，目标 Host 重新识别安装来源并执行 Adapter 提供的卸载操作，同一 Harness 的安装、更新和卸载互斥。卸载后连接页重新诊断，检测到其他安装时显示该副本的实际状态。支持 Claude Code 和 Cursor CLI 的官方原生安装、Pi 受管安装，以及能确认归属的全局 npm 安装。卸载保留用户设置、登录资料和会话；其他安装渠道请使用原安装方式。Desktop 与控制台共用英文及简体中文设置文案，并沿用设置语言的选择和英文回退。
 
 可选 `HarnessAdapter.installation(action)` 接受 `check` / `update`，由所属 Adapter 决定版本来源、安装渠道和原生更新命令。公共 `codexhost/harness/installation` 只接受 `{ harnessId, action }`，返回 `{ currentVersion, latestVersion, updateAvailable, canUpdate, message?, messageCode?, notice?, latestVersionKind?, manualUpdateUrl?, versionKind? }`。`message` 保留为 Adapter 诊断文本，不在界面原样拼接；专属更新限制与渠道说明由插件通过 `notice: { en, "zh-CN"?, ... }` 提供，Renderer 按当前语言选择，缺少翻译回退到英文。`messageCode` 仅保留通用 `original-installer` 的旧客户端文案路径，不再维护 Harness 专属提示码翻译表。`latestVersionKind` 可标识 `unknown` / `tracking-branch`，避免将非版本状态当成英文版本号展示；真实版本号及提交标识保持原样。旧插件的 `Unknown` / `Tracking branch (new commits)` 仍按当前语言展示，缺少或无法识别提示码时仅显示通用本地化说明，不展示未翻译的诊断文本。Renderer 按连接页选中的 Host 发送请求，Host 等待插件加载后通过公共能力路由；不接受命令、路径、包名或下载地址，不直接依赖具体 Adapter。非法请求返回 `-32602`；单插件未支持返回 `-32078`，不使用会让浏览器缓存整个方法缺失的 `-32601`。原生失败及非法结果统一返回脱敏错误。
 
@@ -194,7 +198,7 @@ RPC 的 `action: "install"` 调用可选 `HarnessAdapter.install()`，不会把 
 | DeepSeek Harness | 原生 `--version`，独立查询 npm `@deepseek-ai/dsh` 的 `latest`，不受安装渠道限制。识别的全局安装更新原 prefix；npx 安装下载明确的版本，验证离线启动后才保存该版本供后续进程使用。复用常驻进程的新会话可能继续使用旧版本，直到该进程重建。Python wheel、桌面载体及项目安装仍使用原安装方式更新，不创建或更新另一份全局安装。 |
 | Hermes | 原生 `--version`、`update --plan`、`update --check`；使用原生渠道判定和提交标识而非普通 SemVer 比较。仅可原地更新且能报告提交标识、支持非交互与 Gateway 重启延后的干净 Git 安装执行 `update --yes --no-gateway-restart`；桌面包、Docker、Nix 等仍由原生安装所有者更新。 |
 
-检查不发起 Model Turn、不安装任何内容。只有用户明确点击更新才调用原生安装器；并发更新合并为一次，检查不与更新后版本回读竞争，安装后版本未改变不报告成功。普通命令有 30 秒超时，更新命令最多 5 分钟，最新版本网络读取有 15 秒超时；失败后可重新打开连接页触发自动检查。更新的是 Harness CLI，不是 Host 插件或 codexhost 自身，不降级较新安装，不主动重启已有 Session。关闭设置只停止页面更新，不取消已接受的原生更新；现有进程的升级行为遵循 Harness 本身。
+检查不发起 Model Turn、不安装任何内容。原生安装器在用户明确点击更新时调用，也会由本机按更新设置自动调用；自动更新会带上已检查到的目标版本，不再要求当场确认。并发更新合并为一次，检查不与更新后版本回读竞争，安装后版本未改变不报告成功。普通命令有 30 秒超时，更新命令最多 5 分钟，最新版本网络读取有 15 秒超时；失败后可重新打开连接页触发自动检查。更新的是 Harness CLI，不是 Host 插件或 codexhost 自身，不降级较新安装，不主动重启已有 Session。关闭设置只停止页面更新，不取消已接受的原生更新；现有进程的升级行为遵循 Harness 本身。
 
 需确认的更新以 `confirmedVersion` 提交用户选择的确切版本。若执行前的预检要求确认新目标，Host 返回 `confirmationRequired` 和最新目标版本，不运行安装器；设置页立即重新确认，批量更新在用户跳过时计为跳过而非失败。
 

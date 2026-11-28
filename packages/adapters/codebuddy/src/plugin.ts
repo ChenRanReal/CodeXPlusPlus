@@ -1,4 +1,8 @@
-import { createHarnessInstaller, resolveHarnessExecutable } from "@codexhost/harness-discovery";
+import {
+  createHarnessInstaller,
+  npmInstallation,
+  resolveHarnessExecutable,
+} from "@codexhost/harness-discovery";
 import { codeBuddyDiscoverySpec } from "./command.js";
 import { CODEBUDDY_COMMAND_CATALOG } from "./slash-commands.js";
 import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
@@ -24,6 +28,16 @@ export function createHarnessAdapter(context: HarnessPluginContext) {
   const environment = { ...context.environment };
   return Object.assign(new CodeBuddyAdapter({ environment }), {
     installation: createCodeBuddyInstallation(environment),
+    async resolveUninstaller() {
+      const executable = resolveHarnessExecutable(codeBuddyDiscoverySpec, {
+        environment,
+      })?.executable;
+      if (!executable) return null;
+      return (
+        (await npmInstallation(executable, ["@tencent-ai/codebuddy-code"], environment))
+          ?.uninstall ?? null
+      );
+    },
     install: createHarnessInstaller(environment, { npm: "@tencent-ai/codebuddy-code" }),
   });
 }

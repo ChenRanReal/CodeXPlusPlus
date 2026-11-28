@@ -36,6 +36,17 @@ export {
 } from "./console.js";
 import { WORKSPACE_CONTRACT_VERSION } from "./version.js";
 export {
+  DEFAULT_HARNESS_AUTO_UPDATE_SETTINGS,
+  HARNESS_AUTO_UPDATE_COMPLETED_METHOD,
+  HARNESS_AUTO_UPDATE_INTERVAL_HOURS,
+  harnessAutoUpdateCompletedSchema,
+  harnessAutoUpdateDue,
+  harnessAutoUpdateEligible,
+  harnessAutoUpdateSettingsSchema,
+  type HarnessAutoUpdateCompleted,
+  type HarnessAutoUpdateSettings,
+} from "./harness-auto-update.js";
+export {
   IDLE_RELEASE_SETTINGS_METHOD,
   IDLE_RELEASE_TIMEOUT_MINUTES_MAX,
   IDLE_RELEASE_TIMEOUT_MINUTES_MIN,

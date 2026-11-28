@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -9,6 +9,17 @@ import {
 } from "@codexhost/shared-contracts";
 
 const execute = promisify(execFile);
+const DPAPI_BLOB = /^[A-Za-z0-9+/]+={0,2}$/u;
+const DPAPI_UNPROTECT = [
+  "$ErrorActionPreference='Stop'",
+  "$ProgressPreference='SilentlyContinue'",
+  "Add-Type -AssemblyName System.Security",
+  "$r=[Console]::In.ReadToEnd()|ConvertFrom-Json",
+  "$s=[Security.Cryptography.DataProtectionScope]::CurrentUser",
+  "$d=[Convert]::FromBase64String($r.data)",
+  "try{$u=[Security.Cryptography.ProtectedData]::Unprotect($d,$null,$s)}catch{[Console]::Error.Write($_.Exception.GetBaseException().GetType().FullName);exit 3}",
+  "[Console]::Out.Write('F'+[Convert]::ToBase64String($u))",
+].join(";");
 const ENDPOINT = "https://api2.cursor.sh/aiserver.v1.DashboardService/";
 const record = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -65,6 +76,90 @@ export function projectCursorAccountUsage(
   return result.success ? result.data : null;
 }
 
+function powershellExecutable(environment: NodeJS.ProcessEnv): string {
+  const root = environment.SystemRoot ?? environment.SYSTEMROOT;
+  return root
+    ? path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    : "powershell.exe";
+}
+
+function runPowershell(
+  environment: NodeJS.ProcessEnv,
+  script: string,
+  input: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      powershellExecutable(environment),
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+      { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error("DPAPI unprotect timed out"));
+    }, 15_000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", () => undefined);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(stdout);
+      else reject(new Error(`DPAPI unprotect failed (${code ?? "unknown"})`));
+    });
+    child.stdin.end(input);
+  });
+}
+
+/** Cursor CLI stores the OAuth token beside auth.json when auth.json only says `os-secret-store`. */
+export async function readWindowsCursorAccessToken(
+  directory: string,
+  unprotect: (blob: string) => Promise<string>,
+): Promise<string | undefined> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(path.join(directory, "auth.dpapi"), "utf8"));
+  } catch {
+    return undefined;
+  }
+  const blob = record(parsed).dpapi;
+  if (record(parsed).version !== 1 || typeof blob !== "string" || !DPAPI_BLOB.test(blob))
+    return undefined;
+  let plain: string;
+  try {
+    plain = await unprotect(blob);
+  } catch {
+    return undefined;
+  }
+  let secret: unknown;
+  try {
+    secret = JSON.parse(plain);
+  } catch {
+    return undefined;
+  }
+  const token = record(secret).accessToken;
+  return typeof token === "string" && token.trim() ? token : undefined;
+}
+
+async function unprotectWindowsDpapi(
+  environment: NodeJS.ProcessEnv,
+  blob: string,
+): Promise<string> {
+  const stdout = (
+    await runPowershell(environment, DPAPI_UNPROTECT, JSON.stringify({ data: blob }))
+  ).trim();
+  const encoded = stdout.startsWith("F") ? stdout.slice(1) : "";
+  if (!DPAPI_BLOB.test(encoded)) throw new Error("DPAPI unprotect returned an unexpected response");
+  return Buffer.from(encoded, "base64").toString("utf8");
+}
+
 async function accessToken(environment: NodeJS.ProcessEnv): Promise<string | undefined> {
   if (environment.CURSOR_API_KEY?.trim() || environment.AGENT_CLI_CREDENTIAL_STORE === "memory")
     return undefined;
@@ -91,10 +186,19 @@ async function accessToken(environment: NodeJS.ProcessEnv): Promise<string | und
             "cursor",
             "auth.json",
           );
-  const auth = record(JSON.parse(await readFile(authPath, "utf8")));
-  return typeof auth.accessToken === "string" && auth.accessToken.trim()
-    ? auth.accessToken
-    : undefined;
+  let auth: Record<string, unknown>;
+  try {
+    auth = record(JSON.parse(await readFile(authPath, "utf8")));
+  } catch {
+    return undefined;
+  }
+  if (typeof auth.accessToken === "string" && auth.accessToken.trim()) return auth.accessToken;
+  if (process.platform === "win32" && auth.storedIn === "os-secret-store") {
+    return readWindowsCursorAccessToken(path.dirname(authPath), (blob) =>
+      unprotectWindowsDpapi(environment, blob),
+    );
+  }
+  return undefined;
 }
 
 export async function fetchCursorAccount(

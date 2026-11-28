@@ -829,6 +829,33 @@
   white-space: nowrap;
 }
 
+.settings-connection-auto-update {
+  margin: 0 0 12px;
+}
+
+.settings-connection-auto-update__control {
+  height: 32px;
+  padding: 0 10px;
+  color: var(--settings-text);
+  font-size: 13px;
+  color-scheme: dark;
+  background: var(--settings-surface);
+  border: 1px solid var(--settings-border);
+  border-radius: 8px;
+}
+
+.settings-connection-auto-update__control:disabled {
+  opacity: 0.55;
+}
+
+.settings-connection-auto-update__status {
+  margin: 0;
+  padding: 0 16px 12px;
+  color: var(--settings-danger);
+  font-size: 12px;
+  line-height: 18px;
+}
+
 .settings-connection-update-result {
   margin: 0;
   padding: 7px 10px;
@@ -2081,6 +2108,17 @@
   color: #fecaca;
   background: rgb(127 29 29 / 24%);
   border-color: rgb(248 113 113 / 45%);
+}
+
+.settings-harness-uninstall-button,
+.settings-harness-uninstall-button:hover:not(:disabled) {
+  color: var(--settings-danger);
+  background: var(--settings-danger-bg);
+  border-color: var(--settings-danger-border);
+}
+
+.settings-harness-uninstall-button:hover:not(:disabled) {
+  border-color: var(--settings-danger);
 }
 
 .settings-command-button:disabled {

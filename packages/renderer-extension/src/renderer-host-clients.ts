@@ -21,6 +21,7 @@ import {
   installRendererManualCompaction,
   type RendererMessageTarget,
 } from "./renderer-manual-compaction.js";
+import { installHarnessAutoUpdateNotice } from "./renderer-auto-update-notice.js";
 
 /** Model clients follow native connection identities, never the active Composer.
  * A captured client may finish an in-flight request after replacement, but may
@@ -156,6 +157,7 @@ export function createRendererHostClients(
             ),
           ),
         () => installRendererManualCompaction(target, route.hostId, messages),
+        () => installHarnessAutoUpdateNotice(route.hostId, messages),
       ]) {
         const cleanup = install();
         if (cleanup) cleanups.add(cleanup);

@@ -6,11 +6,13 @@ const mocks = vi.hoisted(() => ({
   resolve: vi.fn(),
   run: vi.fn(),
   fetch: vi.fn(),
+  lstat: vi.fn(),
 }));
 vi.mock("node:fs/promises", async (original) => ({
   ...(await original<object>()),
   readFile: mocks.read,
   realpath: mocks.realpath,
+  lstat: mocks.lstat,
 }));
 vi.mock("../src/resolve.js", () => ({ resolveHarnessExecutable: mocks.resolve }));
 vi.mock("../src/installation.js", async (original) => ({
@@ -58,6 +60,14 @@ describe("identified npm installation", () => {
     expect(mocks.run).toHaveBeenCalledWith(
       "/other/npm",
       ["install", "--global", "--prefix", prefix, "@deepseek-ai/dsh@0.2.0-rc.3"],
+      expect.any(Object),
+      300_000,
+    );
+    mocks.lstat.mockRejectedValueOnce(Object.assign(new Error("Removed"), { code: "ENOENT" }));
+    await expect(installation?.uninstall?.()).resolves.toBeUndefined();
+    expect(mocks.run).toHaveBeenCalledWith(
+      "/other/npm",
+      ["uninstall", "--global", "--prefix", prefix, "--ignore-scripts", "@deepseek-ai/dsh"],
       expect.any(Object),
       300_000,
     );
@@ -142,6 +152,7 @@ describe("identified npm installation", () => {
         {},
       );
       expect(installation?.canUpdate).toBe(false);
+      expect(installation?.uninstall).toBeNull();
       await expect(installation?.update("1.1.0")).rejects.toThrow("original package manager");
       expect(mocks.run).not.toHaveBeenCalled();
     },

@@ -76,6 +76,7 @@ export class DraftAgentController<Composer extends object> {
   #modelRequestSequence = 0;
   #ownershipRequestSequence = 0;
   #lastSubmittedAgent: RendererAgent;
+  #armedNewThreadAgent: RendererAgent | undefined;
 
   constructor(options: DraftAgentControllerOptions = {}) {
     this.#idFactory = options.idFactory ?? defaultIdFactory;
@@ -116,6 +117,22 @@ export class DraftAgentController<Composer extends object> {
   }
   isSwitching(composer: Composer): boolean {
     return this.#switching.has(this.#state(composer));
+  }
+  /**
+   * An existing Thread keeps its Harness. The next new-Thread draft consumes this
+   * choice once, before the saved preference write returns.
+   */
+  armNewThreadAgent(agent: RendererAgent): void {
+    if (!this.#enabledAgents.has(agent)) return;
+    this.#armedNewThreadAgent = agent;
+  }
+  takeArmedNewThreadAgent(): RendererAgent | undefined {
+    const agent = this.#armedNewThreadAgent;
+    this.#armedNewThreadAgent = undefined;
+    return agent;
+  }
+  clearArmedNewThreadAgent(): void {
+    this.#armedNewThreadAgent = undefined;
   }
   beginModelRequest(composer: Composer): number {
     const state = this.#state(composer);

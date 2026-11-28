@@ -653,6 +653,32 @@ describe("Renderer Composer DOM behavior", () => {
       expect(other.getAttribute("aria-hidden")).toBeNull();
       expect(control.nativeModelControl).toBeNull();
     }
+
+    const locked = new FakeElement();
+    locked.setAttribute(navigation, "reasoning");
+    locked.disabled = true;
+    Object.assign(locked, {
+      __reactFiber$fixture: {
+        memoizedProps: {
+          [navigation]: "reasoning",
+          disabled: true,
+          disabledAppearance: "unchanged",
+        },
+        return: null,
+      },
+    });
+    live = [locked];
+    reconcileComposerNativeControls(control, true, true);
+    expect(locked.hidden).toBe(true);
+    expect(locked.getAttribute("aria-hidden")).toBe("true");
+    live = [locked, replacement];
+    reconcileComposerNativeControls(control, true, true);
+    expect(locked.hidden).toBe(false);
+    expect(replacement.hidden).toBe(false);
+    expect(control.nativeModelControl).toBeNull();
+    live = [loading];
+    reconcileComposerNativeControls(control, true, true);
+    expect(loading.hidden).toBe(false);
     vi.unstubAllGlobals();
   });
 
@@ -1133,6 +1159,67 @@ describe("Renderer Composer DOM behavior", () => {
 
     expect(insertBefore).toHaveBeenCalledWith(modelRoot, pause);
     expect(insertBefore).toHaveBeenCalledWith(agentRoot, pause);
+  });
+
+  it("places the selected tool's remaining quota before the permission control", () => {
+    const attributes = new Map<string, string>();
+    const permission = {
+      hidden: false,
+      click: vi.fn(),
+      contains: () => false,
+      getAttribute: (name: string) => attributes.get(name) ?? null,
+      hasAttribute: (name: string) => attributes.has(name),
+      setAttribute: (name: string, value: string) => {
+        attributes.set(name, value);
+      },
+      removeAttribute: (name: string) => {
+        attributes.delete(name);
+      },
+      matches: (selector: string) =>
+        selector === 'button[aria-haspopup="menu"][data-composer-navigation-target="permissions"]',
+      __reactFiber$fixture: {
+        memoizedProps: {
+          "aria-haspopup": "menu",
+          "data-composer-navigation-target": "permissions",
+        },
+        return: {
+          memoizedProps: {
+            showPermissionsModeDropdown: true,
+            permissionsHostId: "local",
+            permissionsCwdOverride: null,
+          },
+          return: null,
+        },
+      },
+    };
+    const composer = {
+      ...noNativeRequest,
+      contains: () => false,
+      querySelectorAll: (selector: string) =>
+        selector.includes("permissions") ? [permission] : [],
+    };
+    const permissionRoot = { parentElement: {}, style: {} };
+    const place = vi.fn();
+    const control = {
+      composer,
+      sendButton: { isConnected: false, parentElement: null },
+      root: { parentElement: null },
+      modelPicker: { root: { parentElement: null }, trigger: { className: "", style: {} } },
+      permissionModePicker: {
+        root: permissionRoot,
+        trigger: { className: "", style: {} },
+      },
+      nativeModelControl: null,
+      nativePermissionModeControl: null,
+      nativeContextUsageControl: null,
+      nativePermissionModeControlVerified: false,
+      credits: { anchor: null, place, root: { remove: vi.fn(), style: {} } },
+      composerIndicators: { place: vi.fn() },
+    } as unknown as ComposerAgentControl;
+
+    reconcileComposerNativeControls(control, false, true);
+
+    expect(place).toHaveBeenCalledWith(permissionRoot);
   });
 
   it("freezes only on a non-composing Enter without Shift", () => {

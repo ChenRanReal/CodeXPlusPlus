@@ -11,6 +11,9 @@ import {
 const PINNED_VERSION_AGENT =
   /[/\\]cursor-agent[/\\]versions[/\\][^/\\]+[/\\]cursor-agent(?:\.exe)?$/iu;
 
+/** Directory name of a release laid down by the official Cursor installer. */
+export const cursorBundleVersionPattern = /^\d{4}\.\d{2}\.\d{2}-(?:\d{2}-\d{2}-\d{2}-)?[a-f0-9]+$/u;
+
 function cursorDiscoverySpec(skipPinnedVersions: boolean): HarnessDiscoverySpec {
   return {
     id: "cursor-cli",
@@ -61,7 +64,7 @@ export function cursorInvocation(
     const versions = path.join(root, "versions");
     if (existsSync(versions)) {
       const version = readdirSync(versions)
-        .filter((name) => /^\d{4}\.\d{2}\.\d{2}-(?:\d{2}-\d{2}-\d{2}-)?[a-f0-9]+$/u.test(name))
+        .filter((name) => cursorBundleVersionPattern.test(name))
         .sort()
         .reverse()
         .find(

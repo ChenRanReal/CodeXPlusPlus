@@ -18,7 +18,10 @@ import {
 import { linuxGlibcCargoArguments } from "../../scripts/release/linux-glibc.mjs";
 import { expectedWebPaths } from "../../scripts/release/web-resources.mjs";
 import { releaseTarget } from "../../scripts/release/targets.mjs";
-import { preinstalledHarnessPluginPaths } from "../../scripts/release/harness-plugins.mjs";
+import {
+  preinstalledHarnessPluginPaths,
+  preinstalledHarnessPlugins,
+} from "../../scripts/release/harness-plugins.mjs";
 
 async function temporaryDirectory() {
   return mkdtemp(path.join(os.tmpdir(), "codexhost-payload-"));
@@ -131,13 +134,9 @@ describe("release Payload", () => {
       expect(paths).toContain("app/plugins/enabled.json");
       expect(paths).toContain("app/console-server.mjs");
       expect(paths).toContain("app/console-web.js");
-      expect(paths).toContain("app/plugins/antigravity/plugin.mjs");
-      expect(paths).toContain("app/plugins/cursor-cli/plugin.mjs");
-      expect(paths).toContain("app/plugins/deepseek-harness/plugin.mjs");
-      expect(paths).toContain("app/plugins/codebuddy/plugin.mjs");
-      expect(paths).toContain("app/plugins/qoder-cn/plugin.mjs");
-      expect(paths).not.toContain("app/plugins/claude-code/plugin.mjs");
-      expect(paths).not.toContain("app/plugins/codex-usage/plugin.mjs");
+      for (const { manifest } of preinstalledHarnessPlugins().plugins) {
+        expect(paths).toContain(`app/plugins/${manifest.id}/plugin.mjs`);
+      }
       expect(expectedPayloadPaths(releaseTarget("windows-x64"))).toContain(
         "libexec/codexhost-node-repl.exe",
       );

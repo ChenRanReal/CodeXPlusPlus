@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { isNativeModelControlCandidate } from "../src/renderer-composer-dom.js";
+import { clickNativeNewChat, nativeNewChatButton } from "../src/renderer-native-new-chat.js";
 import { codexAccountDisplayName } from "../src/renderer-codex-account-options.js";
 import {
   rendererAgentMenuPlacement,
@@ -48,23 +49,31 @@ describe("Renderer Agent picker presentation", () => {
   });
 
   it("includes the active Codex Account in the locked hover detail", () => {
-    expect(
-      rendererAgentPickerTooltip(
-        { agent: "codex", phase: "locked" },
-        {
-          accountId: "reviewer",
-          label: "Reviewer",
-          email: "reviewer@example.com",
-        },
-      ),
-    ).toBe("Agent: Codex · reviewer@example.com (locked)");
-    expect(
-      rendererAgentPickerTooltip({ agent: "claude-code", phase: "locked" }, undefined, {
+    const codexTooltip = rendererAgentPickerTooltip(
+      { agent: "codex", phase: "locked" },
+      {
+        accountId: "reviewer",
+        label: "Reviewer",
+        email: "reviewer@example.com",
+      },
+    );
+    expect([
+      "Agent: Codex · reviewer@example.com · choosing another Agent starts a new chat",
+      "Agent: Codex · reviewer@example.com · 选择其他 Agent 会开始新对话",
+    ]).toContain(codexTooltip);
+    const claudeTooltip = rendererAgentPickerTooltip(
+      { agent: "claude-code", phase: "locked" },
+      undefined,
+      {
         id: "claude-code" as never,
         name: "Claude Code",
         version: "1",
-      }),
-    ).toBe("Agent: Claude Code (locked)");
+      },
+    );
+    expect([
+      "Agent: Claude Code · choosing another Agent starts a new chat",
+      "Agent: Claude Code · 选择其他 Agent 会开始新对话",
+    ]).toContain(claudeTooltip);
   });
 
   it("keeps a Codex draft switchable while disabling unavailable external Agents", () => {
@@ -108,7 +117,7 @@ describe("Renderer Agent picker presentation", () => {
     });
   });
 
-  it("hides the native Model for an external Agent and locks submitted selection", () => {
+  it("keeps an existing Thread on its Agent while other Agents can start a new chat", () => {
     expect(
       rendererAgentPickerView(
         { agent: "pi", phase: "locked" },
@@ -122,9 +131,9 @@ describe("Renderer Agent picker presentation", () => {
       ),
     ).toEqual({
       label: "Pi",
-      triggerDisabled: true,
+      triggerDisabled: false,
       nativeModelHidden: true,
-      optionDisabled: { codex: true, pi: true },
+      optionDisabled: { codex: false, pi: false },
       downloadVisible: { pi: false },
       errorVisible: { pi: false },
     });
@@ -268,5 +277,29 @@ describe("Renderer Agent picker presentation", () => {
     expect(
       isNativeModelControlCandidate(element(["data-codexhost-agent-control"], true, true)),
     ).toBe(false);
+  });
+
+  it("clicks the Codex new-chat button identified by onStartChat", () => {
+    const clicked: string[] = [];
+    const button = (name: string, props: Record<string, unknown>) => {
+      const node = {
+        tagName: "BUTTON",
+        click: () => clicked.push(name),
+      };
+      Object.defineProperty(node, "__reactFiber$test", {
+        value: { memoizedProps: props, return: null },
+      });
+      return node;
+    };
+    const root = {
+      querySelectorAll: () => [
+        button("other", { onClick: () => undefined }),
+        button("start", { onStartChat: () => undefined }),
+      ],
+    } as unknown as ParentNode;
+    expect(nativeNewChatButton(root)?.click).toBeTypeOf("function");
+    expect(clickNativeNewChat(root)).toBe(true);
+    expect(clicked).toEqual(["start"]);
+    expect(clickNativeNewChat({ querySelectorAll: () => [] } as unknown as ParentNode)).toBe(false);
   });
 });

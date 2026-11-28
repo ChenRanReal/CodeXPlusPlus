@@ -95,7 +95,7 @@ export interface RendererAgentPickerControl {
   plugins: readonly HarnessPluginDescriptor[];
   options: Partial<Record<RendererAgent, AgentOptionControl>>;
   updateAvailability(availability: AgentAvailability): void;
-  showSwitchFailure(): void;
+  showSwitchFailure(reason?: "draft" | "new-thread"): void;
   close(): void;
   dispose(): void;
 }
@@ -137,7 +137,13 @@ export function rendererAgentPickerTooltip(
     state.agent === "codex" && activeAccount
       ? ` · ${activeAccount.email ?? activeAccount.label}`
       : "";
-  return `Agent: ${rendererAgentLabel(state.agent, plugin)}${account}${state.phase === "locked" ? " (locked)" : ""}`;
+  const newThread =
+    state.phase === "locked"
+      ? pickerGroupMessages().locale === "zh-CN"
+        ? " · 选择其他 Agent 会开始新对话"
+        : " · choosing another Agent starts a new chat"
+      : "";
+  return `Agent: ${rendererAgentLabel(state.agent, plugin)}${account}${newThread}`;
 }
 
 export function rendererAgentPickerView(
@@ -152,7 +158,6 @@ export function rendererAgentPickerView(
     agents.map((agent) => [
       agent,
       switching ||
-        state.phase === "locked" ||
         (agent !== "codex" &&
           (adapterState !== "ready" || !isPickerAgentSelectable(availability[agent]))),
     ]),
@@ -169,8 +174,7 @@ export function rendererAgentPickerView(
   ) as Partial<Record<ExternalRendererAgent, boolean>>;
   return {
     label: rendererAgentLabel(state.agent, plugin),
-    triggerDisabled:
-      switching || state.phase === "locked" || (agents.length < 2 && state.agent === "codex"),
+    triggerDisabled: switching || (agents.length < 2 && state.agent === "codex"),
     nativeModelHidden: switching || state.agent !== "codex",
     optionDisabled,
     downloadVisible,
@@ -678,8 +682,19 @@ export function mountRendererAgentPicker(
       notInstalled = next;
       regroup();
     },
-    showSwitchFailure() {
+    showSwitchFailure(reason: "draft" | "new-thread" = "draft") {
       switchFailureNotice ??= mountRendererModelSelectionNotice(trigger);
+      if (reason === "new-thread") {
+        if (groupMessages.locale === "zh-CN") {
+          switchFailureNotice.show("无法开始新对话", "没有找到新聊天入口。");
+        } else {
+          switchFailureNotice.show(
+            "Couldn’t start a new chat",
+            "The new-chat control isn’t available.",
+          );
+        }
+        return;
+      }
       if (groupMessages.locale === "zh-CN") {
         switchFailureNotice.show("无法切换 Agent", "当前草稿暂时无法使用所选 Agent。");
       } else {
@@ -741,9 +756,7 @@ export function renderRendererAgentPicker(
     "aria-label",
     ownershipError
       ? pickerGroupMessages().ownershipErrorLabel
-      : state.phase === "locked"
-        ? `Agent: ${view.label}`
-        : `Select Agent, current ${view.label}`,
+      : `Select Agent, current ${view.label}`,
   );
   control.trigger.title = ownershipError
     ? pickerGroupMessages().ownershipErrorLabel

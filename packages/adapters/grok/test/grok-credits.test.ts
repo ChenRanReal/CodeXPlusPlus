@@ -154,6 +154,82 @@ describe("Grok account discovery", () => {
     },
   );
 
+  it("refreshes an expired native token before reading quota", async () => {
+    const input = fixture();
+    const stored = {
+      "https://auth.x.ai::cli": {
+        key: "expired-access",
+        refresh_token: "refresh-secret",
+        oidc_issuer: "https://auth.x.ai",
+        oidc_client_id: "client-id",
+        email: "user@example.com",
+        user_id: "native-user",
+        expires_at: "2026-08-01T00:00:00Z",
+      },
+    };
+    input.readAuthFile.mockResolvedValue(JSON.stringify(stored));
+    const written: string[] = [];
+    input.fetch.mockImplementation(async (url: string, init: RequestInit) => {
+      if (url.endsWith("/.well-known/openid-configuration")) {
+        return new Response(JSON.stringify({ token_endpoint: "https://auth.x.ai/oauth/token" }));
+      }
+      if (url === "https://auth.x.ai/oauth/token") {
+        const body = init.body instanceof URLSearchParams ? init.body : new URLSearchParams();
+        expect(body.get("grant_type")).toBe("refresh_token");
+        expect(body.get("client_id")).toBe("client-id");
+        expect(body.get("refresh_token")).toBe("refresh-secret");
+        return new Response(
+          JSON.stringify({
+            access_token: "new-access",
+            refresh_token: "next-refresh",
+            expires_in: 3600,
+          }),
+        );
+      }
+      if (url === GROK_CREDITS_ENDPOINT) {
+        expect(init.headers).toMatchObject({ Authorization: "Bearer new-access" });
+        return new Response(
+          JSON.stringify({ config: { creditUsagePercent: 12, currentPeriod: { type: "WEEKLY" } } }),
+        );
+      }
+      return new Response(JSON.stringify({ subscription_tier_display: "SuperGrok" }));
+    });
+    await expect(
+      fetchGrokAccount({
+        ...input,
+        writeAuthFile: async (_filePath, contents) => {
+          written.push(contents);
+        },
+      }),
+    ).resolves.toMatchObject({
+      email: "user@example.com",
+      credits: { usedPercent: 12, periodType: "weekly" },
+      plan: "SuperGrok",
+    });
+    expect(JSON.parse(written[0] ?? "{}")).toMatchObject({
+      "https://auth.x.ai::cli": { key: "new-access", refresh_token: "next-refresh" },
+    });
+  });
+
+  it("does not send a refresh token to a token endpoint outside auth.x.ai", async () => {
+    const input = fixture();
+    input.readAuthFile.mockResolvedValue(
+      JSON.stringify({
+        "https://auth.x.ai::cli": {
+          key: "expired-access",
+          refresh_token: "refresh-secret",
+          oidc_client_id: "client-id",
+          expires_at: "2026-08-01T00:00:00Z",
+        },
+      }),
+    );
+    input.fetch.mockResolvedValue(
+      new Response(JSON.stringify({ token_endpoint: "https://evil.example/oauth/token" })),
+    );
+    await expect(fetchGrokAccount(input)).resolves.toBeNull();
+    expect(input.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("does not send other issuers' tokens to xAI, or use expired credentials", async () => {
     const input = fixture();
     input.readAuthFile.mockResolvedValueOnce(

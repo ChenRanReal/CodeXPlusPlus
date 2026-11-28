@@ -301,6 +301,19 @@ describe("Renderer draft Agent controller", () => {
     });
   });
 
+  it("hands an armed Agent to the next new Thread without changing the locked one", () => {
+    const locked = {};
+    const agents = controller();
+    agents.mount(locked, ["conversation", "thread-1"]);
+    agents.lock(locked);
+    agents.armNewThreadAgent("missing");
+    expect(agents.takeArmedNewThreadAgent()).toBeUndefined();
+    agents.armNewThreadAgent("pi");
+    expect(agents.get(locked)).toMatchObject({ agent: "codex", phase: "locked" });
+    expect(agents.takeArmedNewThreadAgent()).toBe("pi");
+    expect(agents.takeArmedNewThreadAgent()).toBeUndefined();
+  });
+
   it("keeps a locally rejected submission mutable and locks only after a Thread binds", async () => {
     const rejectedComposer = {};
     const acceptedComposer = {};

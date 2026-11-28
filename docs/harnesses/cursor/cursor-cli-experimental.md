@@ -228,6 +228,7 @@ native extensions, not fabricated RPC methods.
 
 | Gap | Native interface and current result |
 | --- | --- |
+| CLI uninstall | Connections offers automatic uninstall for the verified layout of the official installer. Windows validates the copied launcher against the version bundles. macOS and Linux validate the installer's launcher symlinks. The Adapter removes the verified launchers and downloaded versions while preserving settings, sessions, and unrelated aliases. [Cursor CLI installation](https://cursor.com/docs/cli/installation) |
 | Thinking | `initialize.clientCapabilities._meta.parameterizedModelPicker = true`, `cursor/list_available_models`, and `session/set_config_option`; implemented. |
 | Slash commands | `available_commands_update` plus native `session/prompt` slash parsing; implemented for advertised commands only. |
 | Cross-Harness collaboration | Outbound delegation runs the Host CLI from the native shell through the `codexhost-delegation` skill; no MCP server is injected. Inbound unattended execution requests native `--force` Run Everything without claiming ACP policy confirmation. |

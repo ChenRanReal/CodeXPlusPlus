@@ -183,6 +183,35 @@ describe("shared Harness preferences", () => {
     }
   });
 
+  it("stores the automatic update schedule and keeps an existing one on initialize", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "harness-auto-update-preferences-"));
+    const store = new HarnessPreferencesStore(directory);
+    const value = { enabled: true, intervalHours: 24, timeMinutes: 9 * 60, weekday: 1 };
+    try {
+      const saved = await store.patch(
+        harnessPreferencePatchSchema.parse({
+          operations: [{ kind: "harnessAutoUpdate", value }],
+        }),
+      );
+      expect(saved.values.harnessAutoUpdate).toEqual(value);
+      const initialized = await store.patch(
+        harnessPreferencePatchSchema.parse({
+          initializeOnly: true,
+          operations: [
+            {
+              kind: "harnessAutoUpdate",
+              value: { enabled: false, intervalHours: 1, timeMinutes: 0, weekday: 0 },
+            },
+          ],
+        }),
+      );
+      expect(initialized.values.harnessAutoUpdate).toEqual(value);
+    } finally {
+      await store.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects corrupt files without overwriting them and recovers after repair", async () => {
     const directory = await mkdtemp(join(tmpdir(), "harness-pref-corrupt-"));
     const store = new HarnessPreferencesStore(directory);

@@ -16,6 +16,8 @@ interface Activity {
   lastActivity: number;
   outputFailed: boolean;
   closeFailed: boolean;
+  /** The latest close attempt has settled. An in-flight close is not retried. */
+  closeSettled: boolean;
 }
 
 /** Host-only coordination. Native background work is judged by `canRelease` (via `HarnessSession.hasBackgroundWork`). */
@@ -64,6 +66,7 @@ export class ExternalThreadIdleRelease {
         lastActivity: Date.now(),
         outputFailed: false,
         closeFailed: false,
+        closeSettled: false,
       });
   }
 
@@ -86,6 +89,18 @@ export class ExternalThreadIdleRelease {
 
   failure(thread: ExternalThread): string | undefined {
     return this.#activity.get(thread)?.closeFailed ? CLOSE_FAILURE : undefined;
+  }
+
+  /**
+   * One more close after a settled failure. Success removes the instance.
+   * An in-flight close, or a close that fails again, leaves the block in place.
+   */
+  async reclaim(thread: ExternalThread): Promise<boolean> {
+    const state = this.#activity.get(thread);
+    if (!state?.closeFailed || !state.closeSettled) return false;
+    if (this.options.get(thread.id) !== thread || this.#closing.has(thread.id)) return false;
+    await this.#close(thread);
+    return this.options.get(thread.id) !== thread;
   }
 
   async waitForClose(id: string): Promise<void> {
@@ -225,15 +240,19 @@ export class ExternalThreadIdleRelease {
     const state = this.#activity.get(thread);
     if (!state) return;
     let timeout: NodeJS.Timeout | undefined;
+    state.closeSettled = false;
     // Only the bounded waiter may retire the instance. Late underlying completion cannot do so.
     const closed = Promise.resolve().then(async () => {
       await thread.session.close();
       await thread.outputTask;
       await this.options.onClosed?.(thread);
     });
+    const tracked = closed.finally(() => {
+      state.closeSettled = true;
+    });
     try {
       await Promise.race([
-        closed,
+        tracked,
         new Promise<never>((_, reject) => {
           timeout = setTimeout(
             () => reject(new Error("Session release timed out")),

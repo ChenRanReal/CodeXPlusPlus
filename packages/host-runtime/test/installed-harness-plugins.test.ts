@@ -15,10 +15,25 @@ const sourceRuntimeUrl = pathToFileURL(path.resolve("packages/host-runtime/dist/
 const pluginRoot = path.resolve("packages/host-runtime/dist/plugins");
 const installedHarnessIds = [
   "antigravity",
+  "claude-code",
   "codebuddy",
+  "codex-usage",
+  "copilot",
   "cursor-cli",
   "deepseek-harness",
+  "devin",
+  "grok",
+  "hermes",
+  "kimi-code",
+  "kiro-cli",
+  "omp",
+  "opencode",
+  "pi",
+  "qoder",
   "qoder-cn",
+  "qwen-code",
+  "workbuddy",
+  "zcode",
 ];
 
 const unavailable: HarnessInspection = {
@@ -64,11 +79,24 @@ describe("installed Harness composition", () => {
 
   describe("explicit commands", () => {
     const commands: Array<[id: string, variable: string]> = [
+      ["copilot", "CODEXHOST_COPILOT_COMMAND"],
+      ["pi", "CODEXHOST_PI_COMMAND"],
+      ["claude-code", "CODEXHOST_CLAUDE_COMMAND"],
+      ["grok", "CODEXHOST_GROK_COMMAND"],
+      ["opencode", "CODEXHOST_OPENCODE_COMMAND"],
+      ["omp", "CODEXHOST_OMP_COMMAND"],
+      ["qwen-code", "CODEXHOST_QWEN_COMMAND"],
       ["antigravity", "CODEXHOST_ANTIGRAVITY_COMMAND"],
+      ["kiro-cli", "CODEXHOST_KIRO_COMMAND"],
       ["codebuddy", "CODEXHOST_CODEBUDDY_COMMAND"],
+      ["workbuddy", "CODEXHOST_WORKBUDDY_COMMAND"],
       ["cursor-cli", "CODEXHOST_CURSOR_COMMAND"],
-      ["deepseek-harness", "CODEXHOST_DEEPSEEK_HARNESS_COMMAND"],
+      ["devin", "CODEXHOST_DEVIN_COMMAND"],
+      ["hermes", "CODEXHOST_HERMES_COMMAND"],
+      ["qoder", "CODEXHOST_QODER_COMMAND"],
       ["qoder-cn", "CODEXHOST_QODERCN_COMMAND"],
+      ["deepseek-harness", "CODEXHOST_DEEPSEEK_HARNESS_COMMAND"],
+      ["kimi-code", "CODEXHOST_KIMI_COMMAND"],
     ];
     let registry: Awaited<ReturnType<typeof load>>;
     beforeAll(async () => {
@@ -87,7 +115,7 @@ describe("installed Harness composition", () => {
         const adapter = [...registry.adapters].find(([key]) => key === id)?.[1];
         expect(await adapter?.inspect()).toMatchObject({
           status: "notInstalled",
-          error: { code: "notInstalled" },
+          error: { code: id === "hermes" ? "HERMES_NOT_FOUND" : "notInstalled" },
         });
       },
       35_000,

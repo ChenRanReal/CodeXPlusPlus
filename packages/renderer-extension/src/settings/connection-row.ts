@@ -11,7 +11,7 @@ import { createRendererSettingsIcon } from "./icons.js";
 import type { RendererSettingsMessages } from "./localization.js";
 
 export type ConnectionAvailability =
-  RendererAgentAvailability | RendererAdapterStatus["state"] | "updating";
+  RendererAgentAvailability | RendererAdapterStatus["state"] | "updating" | "uninstalling";
 export type ConnectionTone = "ready" | "checking" | "setup" | "failed";
 
 export interface ConnectionListItem {
@@ -22,6 +22,7 @@ export interface ConnectionListItem {
   readonly agentSnapshot?: RendererConnectionAgentSnapshot;
   readonly openWebUi?: () => Promise<void>;
   readonly install?: () => void;
+  readonly uninstall?: () => void;
   readonly installError?: string;
   readonly version?: HarnessVersionPanel;
 }
@@ -56,6 +57,7 @@ export function connectionStatusLabel(
   hasError = false,
 ): string {
   if (availability === "updating") return messages.connectionStatusUpdating;
+  if (availability === "uninstalling") return messages.connectionStatusUninstalling;
   if (hasError && availability !== "notInstalled") return messages.connectionStatusError;
   if (availability === "ready") return messages.connectionStatusReady;
   if (availability === "checking") return messages.connectionStatusChecking;
@@ -74,7 +76,7 @@ export function connectionStatusTone(
   availability: ConnectionAvailability,
   hasError = false,
 ): ConnectionTone {
-  if (availability === "updating") return "checking";
+  if (availability === "updating" || availability === "uninstalling") return "checking";
   if (hasError && availability !== "notInstalled") return "failed";
   if (availability === "ready") return "ready";
   if (availability === "checking" || availability === "installing") return "checking";
@@ -278,7 +280,9 @@ export function createConnectionRowView(
           installButton = button;
         }
         installButton.disabled =
-          item.availability === "installing" || item.availability === "checking";
+          item.availability === "installing" ||
+          item.availability === "uninstalling" ||
+          item.availability === "checking";
         const installLabel = messages.connectionInstall;
         const ariaLabel = `${installLabel}: ${item.name}`;
         if (installButton.getAttribute("aria-label") !== ariaLabel) {

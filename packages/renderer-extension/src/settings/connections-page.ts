@@ -1,5 +1,6 @@
 import type {
   CodexhostError,
+  HarnessInstallationParams,
   HarnessInstallationState,
   HarnessLaunchSettings,
   HarnessPluginDescriptor,
@@ -25,12 +26,14 @@ import {
   type ConnectionRowGroupController,
   type ConnectionRowView,
 } from "./connection-row.js";
+import { mountConnectionAutoUpdate } from "./connection-auto-update.js";
 import { createConnectionUpdates } from "./connection-updates.js";
 import { createConnectionVersions } from "./connection-versions.js";
 import type { RendererSettingsPageDefinition, RendererSettingsPageMountContext } from "./core.js";
 import { harnessInstallStore } from "./harness-install-store.js";
 import { harnessHasInstallCommands } from "./harness-installation-guides.js";
 import { createHarnessInstallationPanel } from "./harness-installation-panel.js";
+import { confirmHarnessAction } from "./harness-update-confirmation.js";
 import { createHarnessLaunchControls } from "./harness-launch-controls.js";
 import { createRendererSettingsIcon } from "./icons.js";
 import type { RendererSettingsMessages } from "./localization.js";
@@ -67,7 +70,7 @@ export interface RendererConnectionDiagnostics {
   installation?(
     hostId: string,
     agent: ExternalRendererAgent,
-    action: "check" | "update" | "install",
+    action: HarnessInstallationParams["action"],
     confirmedVersion?: string,
   ): Promise<HarnessInstallationState>;
   getLaunchSettings?(hostId: string, agent: ExternalRendererAgent): Promise<HarnessLaunchSettings>;
@@ -292,6 +295,7 @@ function inspectorRenderSignature(
     notice,
     item.installError ?? "",
     Boolean(item.install),
+    Boolean(item.uninstall),
     plugin?.installation ?? null,
     Boolean(item.openWebUi),
     hasLaunchControls,
@@ -327,7 +331,7 @@ function renderConnectionInspector(
     body.append(compatibility);
   }
 
-  if (item.agentSnapshot?.availability === "notInstalled") {
+  if (item.agentSnapshot?.availability === "notInstalled" && item.availability !== "uninstalling") {
     const zh = messages.locale === "zh-CN";
     const busy = item.availability === "installing" || item.availability === "checking";
     const note = (text: string): void => {
@@ -347,7 +351,7 @@ function renderConnectionInspector(
         item.install
           ? {
               run: item.install,
-              status: busy ? (item.availability as "installing" | "checking") : "idle",
+              status: busy ? item.availability : "idle",
             }
           : undefined,
       ),
@@ -364,7 +368,7 @@ function renderConnectionInspector(
       refresh();
     });
     body.append(check);
-  } else if (item.error) {
+  } else if (item.error && item.availability !== "uninstalling") {
     const summary = document.createElement("div");
     summary.className = "settings-connection-error-summary";
     const title = document.createElement("strong");
@@ -413,7 +417,7 @@ function renderConnectionInspector(
     issueNote.className = "settings-connection-issue-note";
     issueNote.textContent = messages.connectionIssueDescription;
     body.append(summary, logHeader, log, actions, issueNote);
-  } else {
+  } else if (item.availability !== "uninstalling") {
     const status = document.createElement("div");
     status.className = "settings-connection-state-summary";
     const title = document.createElement("strong");
@@ -448,6 +452,19 @@ function renderConnectionInspector(
       });
       body.append(open);
     }
+  }
+
+  if (item.uninstall || item.availability === "uninstalling") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "settings-command-button settings-harness-uninstall-button";
+    button.dataset.connectionAction = "uninstall";
+    button.disabled = item.availability === "uninstalling";
+    button.textContent = button.disabled
+      ? messages.connectionStatusUninstalling
+      : messages.harnessUninstall;
+    button.addEventListener("click", () => item.uninstall?.());
+    body.append(button);
   }
 
   let launchControls: HTMLElement | null = null;
@@ -592,7 +609,8 @@ export function createConnectionsSettingsPage(
       const syncMessage = document.createElement("p");
       syncMessage.className = "settings-page-description";
       syncMessage.setAttribute("role", "status");
-      context.content.append(header, syncMessage, content);
+      const autoUpdate = mountConnectionAutoUpdate(document, messages, context.signal);
+      context.content.append(header, syncMessage, autoUpdate.element, content);
 
       let pending = false;
       let selectedHostId: string | null = null;
@@ -802,6 +820,16 @@ export function createConnectionsSettingsPage(
       };
 
       const syncSelectedInspector = (hostId: string, item: ConnectionListItem): void => {
+        if (
+          item.agentSnapshot &&
+          item.agentSnapshot.availability !== "notInstalled" &&
+          item.agentSnapshot.availability !== "checking" &&
+          item.availability !== "installing" &&
+          item.availability !== "uninstalling" &&
+          item.availability !== "updating"
+        ) {
+          installs?.checkUninstall(hostId, item.agentSnapshot.agent);
+        }
         const currentDiagnostics = getDiagnostics();
         const signature = inspectorRenderSignature(hostId, item, messages, currentDiagnostics);
         const versionElement = item.version?.element ?? null;
@@ -943,6 +971,7 @@ export function createConnectionsSettingsPage(
               updating ||
               (item.agentSnapshot?.availability !== "notInstalled" &&
                 availability !== "installing" &&
+                availability !== "uninstalling" &&
                 availability !== "checking")
                 ? versions.get(selectedHost.hostId, agent, item.name)
                 : undefined;
@@ -955,7 +984,38 @@ export function createConnectionsSettingsPage(
               ...(diagnostics?.installation && harnessHasInstallCommands(item.agentSnapshot?.plugin)
                 ? {
                     install: () => {
-                      void installs?.install(selectedHost.hostId, agent);
+                      void installs?.run(selectedHost.hostId, agent, "install").then(() => {
+                        versions.refresh(selectedHost.hostId, agent);
+                      });
+                    },
+                  }
+                : {}),
+              ...(installs?.canUninstall(selectedHost.hostId, agent) &&
+              item.agentSnapshot?.availability !== "notInstalled" &&
+              availability !== "uninstalling" &&
+              !updating
+                ? {
+                    uninstall: () => {
+                      const hostId = selectedHost.hostId;
+                      void confirmHarnessAction(context.content, context.signal, {
+                        title: messages.harnessUninstallTitle.replace("{name}", () => item.name),
+                        detail: messages.harnessUninstallDetail.replace(
+                          "{host}",
+                          () => hostNames.get(hostId) || connectionHostName(hostId, messages),
+                        ),
+                        cancel: messages.harnessUninstallCancel,
+                        confirm: messages.harnessUninstall,
+                        destructive: true,
+                      }).then(async (confirmed) => {
+                        if (!confirmed || versions.isUpdating(hostId, agent)) return;
+                        const stillInstalled = await installs.run(
+                          hostId,
+                          agent,
+                          "uninstall",
+                          messages.harnessUninstallFailed,
+                        );
+                        if (stillInstalled) versions.refresh(hostId, agent);
+                      });
                     },
                   }
                 : {}),
@@ -1235,6 +1295,7 @@ export function createConnectionsSettingsPage(
         return () => {
           cancelRender();
           hostScroller.dispose();
+          autoUpdate.dispose();
           unsubscribeGroup();
         };
       }
@@ -1244,6 +1305,7 @@ export function createConnectionsSettingsPage(
       return () => {
         cancelRender();
         hostScroller.dispose();
+        autoUpdate.dispose();
         unsubscribeInstalls?.();
         unsubscribe();
         unsubscribeGroup();

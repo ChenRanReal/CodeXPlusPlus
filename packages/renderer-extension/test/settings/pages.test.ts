@@ -1183,6 +1183,9 @@ describe("Renderer Connections page", () => {
       signal: scope.signal,
       runLatest: (op, handlers) => scope.runLatest(op, handlers),
     });
+    expect(visibleText(content)).toContain("Update settings");
+    expect(visibleText(content)).toContain("Automatic updates");
+    expect(visibleText(content)).toContain("Every day");
     const bulk = () => {
       const button = descendants(content).find(
         ({ dataset }) => dataset.connectionAction === "update-all",
@@ -1594,12 +1597,15 @@ describe("Renderer Connections page", () => {
   });
 
   it("places version controls in the selected Host's inspector and preserves them across diagnostics", async () => {
-    const installation = vi.fn(async () => ({
-      currentVersion: "1.0.0",
-      latestVersion: "1.1.0",
-      updateAvailable: true,
-      canUpdate: true,
-    }));
+    const installation = vi.fn<NonNullable<RendererConnectionDiagnostics["installation"]>>(
+      async (host, _agent, action) => ({
+        currentVersion: "1.0.0",
+        latestVersion: "1.1.0",
+        updateAvailable: true,
+        canUpdate: true,
+        ...(host === "local" && action === "checkUninstall" ? { canUninstall: true } : {}),
+      }),
+    );
     let notify: () => void = () => undefined;
     const diagnostics: RendererConnectionDiagnostics = {
       snapshot: () => ({
@@ -1639,17 +1645,20 @@ describe("Renderer Connections page", () => {
     row.dispatch("click", { target: null });
     const first = descendants(content).find((element) => element.dataset.harnessVersion === "pi");
     expect(first).toBeDefined();
+    await vi.waitFor(() => expect(visibleText(content)).toContain("Uninstall automatically"));
+    expect(installation).toHaveBeenCalledWith("local", "pi", "checkUninstall");
     notify();
     expect(descendants(content).find((element) => element.dataset.harnessVersion === "pi")).toBe(
       first,
     );
-    expect(installation).toHaveBeenCalledTimes(1);
+    expect(installation).toHaveBeenCalledTimes(2);
     const remoteTab = descendants(content).find(
       (element) => element.dataset.connectionHostTab === "remote-test",
     );
     if (!remoteTab) throw new Error("Expected remote Host tab");
     remoteTab.dispatch("click");
     await vi.waitFor(() => expect(installation).toHaveBeenCalledWith("remote-test", "pi", "check"));
+    expect(visibleText(content)).not.toContain("Uninstall automatically");
     expect(
       descendants(content).find((element) => element.dataset.harnessVersion === "pi"),
     ).not.toBe(first);
@@ -2077,7 +2086,11 @@ describe("Renderer Connections page", () => {
       input.value = "D:\\Custom Apps";
       input.dispatch("input");
       changed();
-      expect(descendants(content).find(({ tagName }) => tagName === "input")).toBe(input);
+      expect(
+        descendants(content).find(
+          (element) => element.getAttribute("aria-label") === messages.launchPathLabel,
+        ),
+      ).toBe(input);
       expect(input.value).toBe("D:\\Custom Apps");
       save.dispatch("click");
       save.dispatch("click");
