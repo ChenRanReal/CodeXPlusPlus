@@ -14,28 +14,39 @@ export const CLAUDE_CODE_COMMAND_ENV = "CODEXHOST_CLAUDE_COMMAND";
 
 export async function createHarnessAdapter(context: HarnessPluginContext): Promise<HarnessAdapter> {
   const environment = await withUserShellEnvironment({ ...context.environment });
+  const maintenance = {
+    resolveUninstaller: () =>
+      resolveClaudeUninstaller(environment, environment[CLAUDE_CODE_COMMAND_ENV]),
+    install: createHarnessInstaller(environment, {
+      posix: "https://claude.ai/install.sh",
+      windows: "https://claude.ai/install.ps1",
+    }),
+  };
   if (context.platform === "darwin" && context.managedRemoteHost) {
-    return new BrokeredHarnessAdapter({
-      sessionImport: true,
-      forwardDelegationEnvironment: true,
-      commandCatalog: claudeCommandCatalog,
-      liveCommandCatalog: true,
-      environment,
-      isInstalled: () => {
-        try {
-          resolveClaudeCodeExecutable({
-            ...(environment[CLAUDE_CODE_COMMAND_ENV]
-              ? { command: environment[CLAUDE_CODE_COMMAND_ENV] }
-              : {}),
-            environment,
-          });
-          return true;
-        } catch (error) {
-          return !(error instanceof ClaudeCodeExecutableError);
-        }
-      },
-      ...(context.brokerDescriptorPath ? { descriptorPath: context.brokerDescriptorPath } : {}),
-    });
+    return Object.assign(
+      new BrokeredHarnessAdapter({
+        sessionImport: true,
+        forwardDelegationEnvironment: true,
+        commandCatalog: claudeCommandCatalog,
+        liveCommandCatalog: true,
+        environment,
+        isInstalled: () => {
+          try {
+            resolveClaudeCodeExecutable({
+              ...(environment[CLAUDE_CODE_COMMAND_ENV]
+                ? { command: environment[CLAUDE_CODE_COMMAND_ENV] }
+                : {}),
+              environment,
+            });
+            return true;
+          } catch (error) {
+            return !(error instanceof ClaudeCodeExecutableError);
+          }
+        },
+        ...(context.brokerDescriptorPath ? { descriptorPath: context.brokerDescriptorPath } : {}),
+      }),
+      maintenance,
+    );
   }
   return Object.assign(
     new ClaudeCodeAdapter({
@@ -46,12 +57,7 @@ export async function createHarnessAdapter(context: HarnessPluginContext): Promi
     }),
     {
       installation: createClaudeInstallation(environment, environment[CLAUDE_CODE_COMMAND_ENV]),
-      resolveUninstaller: () =>
-        resolveClaudeUninstaller(environment, environment[CLAUDE_CODE_COMMAND_ENV]),
-      install: createHarnessInstaller(environment, {
-        posix: "https://claude.ai/install.sh",
-        windows: "https://claude.ai/install.ps1",
-      }),
+      ...maintenance,
     },
   );
 }

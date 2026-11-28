@@ -46,7 +46,7 @@
 | C1 | 展示元数据 | 必做 | P1 | 支持 | manifest.json、assets/icon.svg | Host installed-harness-plugins.test.ts | 动态目录 |
 | C2 | 手动安装指引 | 必做 | P1 | 支持 | manifest.json | 安装命令与登录指引 | macOS/Linux/Windows |
 | C3 | 版本检查与更新 | 必做 | P1 | 受限 | src/plugin.ts | 工厂未提供 installation() | 必做缺口，未实现 |
-| C4 | 首次安装 | 可选 | P2 | 不支持 | manifest.json | 仅提供原生安装脚本指引 | 无一键安装 |
+| C4 | 首次安装与卸载 | 可选 | P2 | 已实现 | src/plugin.ts、src/uninstall.ts | 官方 Shell/PowerShell 安装脚本，校验 distribution 标记后移除对应运行时 | 保留 Devin 用户数据 |
 | C5 | 自定义启动路径 | 条件必做 | P1 | 受限 | src/command.ts | CODEXHOST_DEVIN_COMMAND | 无连接页路径设置 |
 | C6 | 会话导入 | 可选 | P2 | 支持 | src/import.ts、src/sessions.ts、src/transport.ts | test/devin-adapter.test.ts、test/discovery.test.ts | sessionless 全分页 list/resolve；逐请求超时、关闭取消与进程清理 |
 | C7 | 全局用量统计 | 可选 | P2 | 待验证 | — | 未接入 | 不声明能力 |

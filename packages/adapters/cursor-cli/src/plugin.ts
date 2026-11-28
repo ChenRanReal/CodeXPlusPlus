@@ -9,33 +9,38 @@ import { BrokeredHarnessAdapter } from "@codexhost/harness-broker";
 import type { HarnessAdapter } from "@codexhost/harness-adapter";
 
 export function createHarnessAdapter(context: HarnessPluginContext): HarnessAdapter {
-  if (context.platform === "darwin" && context.managedRemoteHost) {
-    const environment = { ...context.environment };
-    return new BrokeredHarnessAdapter({
-      sessionImport: true,
-      accountCredits: false,
-      harnessId: "cursor-cli",
-      forwardDelegationEnvironment: true,
-      commandCatalog: CURSOR_COMMAND_CATALOG,
-      liveCommandCatalog: true,
-      environment,
-      isInstalled: () => {
-        try {
-          resolveCursorExecutable(environment);
-          return true;
-        } catch (error) {
-          return !(error instanceof CursorNotInstalledError);
-        }
-      },
-    });
-  }
   const environment = { ...context.environment };
-  return Object.assign(new CursorAdapter({ environment }), {
-    installation: createCursorInstallation(environment),
+  const maintenance = {
     resolveUninstaller: () => resolveCursorUninstaller(environment),
     install: createHarnessInstaller(environment, {
       posix: "https://cursor.com/install",
       windows: "https://cursor.com/install?win32=true",
     }),
+  };
+  if (context.platform === "darwin" && context.managedRemoteHost) {
+    return Object.assign(
+      new BrokeredHarnessAdapter({
+        sessionImport: true,
+        accountCredits: false,
+        harnessId: "cursor-cli",
+        forwardDelegationEnvironment: true,
+        commandCatalog: CURSOR_COMMAND_CATALOG,
+        liveCommandCatalog: true,
+        environment,
+        isInstalled: () => {
+          try {
+            resolveCursorExecutable(environment);
+            return true;
+          } catch (error) {
+            return !(error instanceof CursorNotInstalledError);
+          }
+        },
+      }),
+      maintenance,
+    );
+  }
+  return Object.assign(new CursorAdapter({ environment }), {
+    installation: createCursorInstallation(environment),
+    ...maintenance,
   });
 }

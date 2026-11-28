@@ -159,7 +159,7 @@ Host 切换栏右侧提供「全部更新（数量）」，仅统计当前 Host 
 
 Desktop 的检查、更新与安装通过 `codexhost/harness/installation/start` 提交 `{ harnessId, action }`，立即取得 `{ taskId, status }`；再以 `codexhost/harness/installation/status` 和 `{ taskId }` 读取 `running`、`succeeded`（含版本结果）或 `failed`（含脱敏错误）的任务状态。任务由目标 Host 持有，同一 Harness/action 的进行中提交复用任务，不设置跨 Harness 并发上限，完成结果保留 15 分钟。Renderer 每 500ms 读取一次状态，提交与状态请求采用 background 优先级及 15 秒传输超时；原生安装器的完整运行时间不占用 Desktop 的在途请求名额，给配置读取和消息提交保留通路。任务继续运行不依赖设置页保持打开。原 `codexhost/harness/installation` 保留给旧客户端及控制台；新版 Desktop 不向缺少任务接口的旧 Host 回退到长请求，需先升级目标 Host。
 
-连接页使用同一任务接口探测并卸载选中的 CLI。`checkUninstall` 只检查安装来源，返回 `canUninstall: true` 时显示「一键卸载」。确认后，目标 Host 重新识别安装来源并执行 Adapter 提供的卸载操作，同一 Harness 的安装、更新和卸载互斥。卸载后连接页重新诊断，检测到其他安装时显示该副本的实际状态。支持 Claude Code 和 Cursor CLI 的官方原生安装、Pi 受管安装，以及能确认归属的全局 npm 安装。卸载保留用户设置、登录资料和会话；其他安装渠道请使用原安装方式。Desktop 与控制台共用英文及简体中文设置文案，并沿用设置语言的选择和英文回退。
+连接页使用同一任务接口探测并卸载选中的安装。`checkUninstall` 只检查安装来源，返回 `canUninstall: true` 时显示「一键卸载」。确认后，目标 Host 重新识别安装来源并执行 Adapter 提供的卸载操作，同一 Harness 的安装、更新和卸载互斥。卸载后连接页重新诊断，检测到其他安装时显示该副本的实际状态。各 Adapter 按实际安装渠道选择原生命令、系统卸载器、npm 前缀或有归属证据的安装文件。卸载保留用户设置、登录资料和会话；自定义路径或无法确认归属的安装按原渠道移除。Desktop 与控制台共用英文及简体中文设置文案，并沿用设置语言的选择和英文回退。
 
 可选 `HarnessAdapter.installation(action)` 接受 `check` / `update`，由所属 Adapter 决定版本来源、安装渠道和原生更新命令。公共 `codexhost/harness/installation` 只接受 `{ harnessId, action }`，返回 `{ currentVersion, latestVersion, updateAvailable, canUpdate, message?, messageCode?, notice?, latestVersionKind?, manualUpdateUrl?, versionKind? }`。`message` 保留为 Adapter 诊断文本，不在界面原样拼接；专属更新限制与渠道说明由插件通过 `notice: { en, "zh-CN"?, ... }` 提供，Renderer 按当前语言选择，缺少翻译回退到英文。`messageCode` 仅保留通用 `original-installer` 的旧客户端文案路径，不再维护 Harness 专属提示码翻译表。`latestVersionKind` 可标识 `unknown` / `tracking-branch`，避免将非版本状态当成英文版本号展示；真实版本号及提交标识保持原样。旧插件的 `Unknown` / `Tracking branch (new commits)` 仍按当前语言展示，缺少或无法识别提示码时仅显示通用本地化说明，不展示未翻译的诊断文本。Renderer 按连接页选中的 Host 发送请求，Host 等待插件加载后通过公共能力路由；不接受命令、路径、包名或下载地址，不直接依赖具体 Adapter。非法请求返回 `-32602`；单插件未支持返回 `-32078`，不使用会让浏览器缓存整个方法缺失的 `-32601`。原生失败及非法结果统一返回脱敏错误。
 
@@ -169,12 +169,12 @@ DSH 的 npx 更新只在显式点击更新时执行 `npx --yes --prefer-online @
 
 ### 首次安装
 
-RPC 的 `action: "install"` 调用可选 `HarnessAdapter.install()`，不会把 `install` 传给旧插件的 `installation()`。Host 先刷新检查，只有 `notInstalled` 才安装，避免把未登录或不可用误认为未安装；安装后通过 `installation("check")` 回读 CLI 版本。安装失败或版本无法确认都不报告成功，原生异常脱敏后显示在右侧详情。
+RPC 的 `action: "install"` 调用 `HarnessAdapter.install()`。Host 先刷新检查，只有 `notInstalled` 才安装。具备版本管理的 Adapter 安装后回读版本；其余 Adapter 由连接页重新诊断确认。没有终端命令的应用可通过 `checkInstall` 公布安装能力。原生异常脱敏后显示在右侧详情。
 
-- DeepSeek Harness（`@deepseek-ai/dsh@latest`，安装时跟随 npm `latest` 标签；不代表该版本已验证兼容，连接仍须通过原生协议校验）、OpenCode、Grok、CodeBuddy 使用官方 npm 包；需要已有 Node.js/npm；npm 在 PATH 未命中时继续搜索版本管理器与标准安装位置，适配 Desktop 的精简 GUI 环境。Grok 保留 npm 安装脚本允许项。
-- Pi、Claude Code、OMP、Antigravity、Kiro CLI、Cursor CLI、Hermes、Qoder 两版和 Kimi Code 使用各自 Adapter 固定的官方 HTTPS 安装脚本，按 Host OS 选择 Shell/PowerShell。脚本下载到临时目录，执行后清理；安装命令最多 10 分钟，不自动提权，不自动安装系统依赖，安装器不能依赖交互输入。
-- WorkBuddy 仍引导安装桌面应用。旧插件、旧 Host 和未转发能力的 Broker 返回不支持，不回退到本机安装。
-- Host 按 Adapter 合并并发安装，安装期间的检查/更新等待同一结果。Renderer 按连接及 Host/Harness 保存安装状态：列表中显示安装中、检测中或错误，安装时禁用下载按钮，错误保留在右侧并允许重试。切换行、Host 或关闭再打开设置不会取消操作；Host/连接进程重启后不恢复任务。
+- DeepSeek Harness、OpenCode、Grok、CodeBuddy、Qwen Code 和 Copilot 使用官方 npm 包。需要已有 Node.js/npm。Grok 保留 npm 安装脚本允许项。DeepSeek Harness 跟随 npm `latest`，连接仍须通过原生协议校验。
+- Pi、Claude Code、Oh My Pi、Antigravity、Kiro CLI、Cursor CLI、Hermes、Qoder 两版、Kimi Code 和 Devin 使用官方 HTTPS 安装脚本，按目标 Host 的系统选择 Shell 或 PowerShell。临时脚本使用后清理。
+- WorkBuddy（Windows、macOS）和 ZCode（Windows、macOS、Linux）安装桌面应用及其内置 CLI。Windows 使用原厂安装器，macOS 使用官方磁盘映像，ZCode 在 Linux 使用官方 AppImage 的用户级解包。系统级 Windows 安装的卸载由 Windows 请求用户授权。
+- 同一 Harness 的各类变更互斥。切换行、Host 或关闭再打开设置不会取消操作，Host 重启后不恢复任务。
 - 成功和失败后均只重新诊断所选 Host：先等待该 Host 已有诊断结束，再发起安装完成后的新诊断，不能复用安装前的结果；普通后台刷新仍合并并发请求。CLI 安装完成不意味着登录、Provider 配置或所有 Adapter 能力可用。检测结果才决定最终连接状态：即使版本回读失败，只要同一 Host/Harness 的本次重新诊断确认 `ready`，就清除安装失败覆盖状态；其他 Host 的状态或刷新失败后的旧快照不能清除错误。版本回读还可能依赖更新源网络；版本检查失败时应先重新诊断，不盲目重装。
 
 安装路径来自仓库维护的官方指引，并非所有系统/架构已通过真实安装验收。前置依赖、网络、官方安装器交互和平台支持仍影响结果；模拟测试不代表真实安装成功。

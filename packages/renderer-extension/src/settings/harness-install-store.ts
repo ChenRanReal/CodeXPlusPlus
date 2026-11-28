@@ -24,37 +24,47 @@ function unknownInstallOutcome(message: string): boolean {
 const stores = new WeakMap<RendererConnectionDiagnostics, ReturnType<typeof createStore>>();
 function createStore(diagnostics: RendererConnectionDiagnostics) {
   const states = new Map<string, InstallState>();
+  const installChecks = new Map<string, boolean | Promise<void>>();
   const uninstallChecks = new Map<string, boolean | Promise<void>>();
   const listeners = new Set<() => void>();
   const key = (host: string, agent: ExternalRendererAgent) => JSON.stringify([host, agent]);
   const notify = () => listeners.forEach((listener) => listener());
+  const checkCapability = (
+    host: string,
+    agent: ExternalRendererAgent,
+    action: "checkInstall" | "checkUninstall",
+  ) => {
+    const id = key(host, agent);
+    const checking = action === "checkInstall" ? installChecks : uninstallChecks;
+    if (!diagnostics.installation || checking.has(id)) return;
+    const check = diagnostics
+      .installation(host, agent, action)
+      .then(
+        (result) => (action === "checkInstall" ? result.canInstall : result.canUninstall) === true,
+        () => false,
+      )
+      .then((supported) => {
+        if (checking.get(id) !== check) return;
+        checking.set(id, supported);
+        notify();
+      });
+    checking.set(id, check);
+  };
   return {
     get: (host: string, agent: ExternalRendererAgent) => states.get(key(host, agent)),
+    canInstall: (host: string, agent: ExternalRendererAgent) =>
+      installChecks.get(key(host, agent)) === true,
     canUninstall: (host: string, agent: ExternalRendererAgent) =>
       uninstallChecks.get(key(host, agent)) === true,
+    checkInstall(host: string, agent: ExternalRendererAgent) {
+      checkCapability(host, agent, "checkInstall");
+    },
     checkUninstall(host: string, agent: ExternalRendererAgent) {
-      const id = key(host, agent);
-      if (
-        !diagnostics.installation ||
-        uninstallChecks.has(id) ||
-        states.get(id)?.status === "uninstalling"
-      )
-        return;
-      const check = diagnostics
-        .installation(host, agent, "checkUninstall")
-        .then(
-          (result) => result.canUninstall === true,
-          () => false,
-        )
-        .then((supported) => {
-          if (uninstallChecks.get(id) !== check) return;
-          uninstallChecks.set(id, supported);
-          notify();
-        });
-      uninstallChecks.set(id, check);
+      checkCapability(host, agent, "checkUninstall");
     },
     clearErrors() {
       for (const [id, state] of states) if (state.status === "error") states.delete(id);
+      installChecks.clear();
       uninstallChecks.clear();
       notify();
     },

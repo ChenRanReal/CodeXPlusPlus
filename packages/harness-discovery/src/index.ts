@@ -33,5 +33,12 @@ export {
   versionFromOutput,
   type InstallationState,
 } from "./installation.js";
-export { npmInstallation } from "./npm-installation.js";
+export { npmInstallation, resolveNpmUninstaller } from "./npm-installation.js";
+export { resolveBinaryUninstaller, userInstallationPaths } from "./binary-uninstall.js";
+export {
+  installDesktopHarness,
+  resolveAppBundleUninstaller,
+  resolveNsisUninstaller,
+  runWindowsInstaller,
+} from "./desktop-installer.js";
 export { createHarnessInstaller, type HarnessInstallerSource } from "./installer.js";

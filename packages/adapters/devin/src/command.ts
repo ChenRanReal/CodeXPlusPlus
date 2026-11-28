@@ -1,6 +1,7 @@
 import { commandInvocation, resolveHarnessExecutable } from "@codexhost/harness-discovery";
 
-export function devinInvocation(environment: NodeJS.ProcessEnv, command?: string) {
+/** Selects the CLI, including the per-user Windows installation. */
+export function resolveDevinExecutable(environment: NodeJS.ProcessEnv, command?: string) {
   const resolution = resolveHarnessExecutable(
     {
       id: "devin",
@@ -8,11 +9,16 @@ export function devinInvocation(environment: NodeJS.ProcessEnv, command?: string
       commandEnvironmentVariable: "CODEXHOST_DEVIN_COMMAND",
       installRoots: {
         posix: ["~/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"],
+        windows: ["${LOCALAPPDATA}/devin/cli/bin"],
       },
     },
     { environment, ...(command ? { command } : {}) },
   );
   if (!resolution)
     throw new Error("Devin CLI is not installed; install devin or set CODEXHOST_DEVIN_COMMAND");
-  return commandInvocation(resolution.executable, ["acp"], environment);
+  return resolution.executable;
+}
+
+export function devinInvocation(environment: NodeJS.ProcessEnv, command?: string) {
+  return commandInvocation(resolveDevinExecutable(environment, command), ["acp"], environment);
 }

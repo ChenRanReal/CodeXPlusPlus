@@ -1,9 +1,14 @@
 import type { HarnessAdapter } from "@codexhost/harness-adapter";
 import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
 
-import { createHarnessInstaller } from "@codexhost/harness-discovery";
+import {
+  createHarnessInstaller,
+  resolveBinaryUninstaller,
+  userInstallationPaths,
+} from "@codexhost/harness-discovery";
 import { AntigravityAdapter } from "./antigravity-adapter.js";
 import { createAntigravityInstallation } from "./installation.js";
+import { resolveAntigravityExecutable } from "./command.js";
 
 export const ANTIGRAVITY_COMMAND_ENV = "CODEXHOST_ANTIGRAVITY_COMMAND";
 /** agy's documented switch for its background self-updater. */
@@ -57,6 +62,13 @@ export function createHarnessAdapter(context: HarnessPluginContext): Antigravity
         posix: "https://antigravity.google/cli/install.sh",
         windows: "https://antigravity.google/cli/install.ps1",
       }),
+      resolveUninstaller: () => {
+        const paths = userInstallationPaths(environment);
+        const executable = resolveAntigravityExecutable({ environment });
+        return context.platform === "win32"
+          ? resolveBinaryUninstaller(executable, paths.localAppData, "agy", "bin", "agy.exe")
+          : resolveBinaryUninstaller(executable, paths.home, ".local", "bin", "agy");
+      },
       installation: createAntigravityInstallation(
         environment,
         environment[ANTIGRAVITY_COMMAND_ENV],

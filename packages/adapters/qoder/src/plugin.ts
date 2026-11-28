@@ -1,10 +1,10 @@
 import type { HarnessPluginContext } from "@codexhost/harness-adapter/plugin";
-
 import { createHarnessInstaller } from "@codexhost/harness-discovery";
 import { QoderAdapter } from "./qoder-adapter.js";
 import { createQoderInstallation } from "./installation.js";
 import { CODEXHOST_QODER_COMMAND, CODEXHOST_QODERCN_COMMAND } from "./qoder-command.js";
 import type { QoderVariant } from "./qoder-runtime.js";
+import { resolveQoderUninstaller } from "./uninstall.js";
 
 export { CODEXHOST_QODER_COMMAND };
 
@@ -24,6 +24,7 @@ export function createHarnessAdapter(
     }),
     {
       installation: createQoderInstallation(environment, command, variant),
+      resolveUninstaller: () => resolveQoderUninstaller(environment, variant, command),
       install: createHarnessInstaller(
         environment,
         variant === "cn"

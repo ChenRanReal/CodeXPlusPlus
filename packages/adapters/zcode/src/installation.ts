@@ -7,6 +7,11 @@ import { ZcodeError } from "./errors.js";
 const DEFAULT_DARWIN_APP = "/Applications/ZCode.app";
 const DEFAULT_LINUX_APP = "/opt/ZCode";
 
+/** User-owned Linux AppImage extraction, parallel to vendor system packages. */
+export function portableZcodeApp(environment: NodeJS.ProcessEnv): string {
+  return path.join(environment.HOME ?? homedir(), ".local", "opt", "ZCode");
+}
+
 /** Files of an installed ZCode Desktop and the native data root its CLI uses. */
 export interface ZcodeInstallation {
   /** The CLI runtime executable (Electron Helper on macOS, main executable on Windows/Linux). */
@@ -76,7 +81,10 @@ async function resolveDefaultApp(
   platform: "darwin" | "win32" | "linux",
 ): Promise<string> {
   if (platform === "darwin") return DEFAULT_DARWIN_APP;
-  if (platform === "linux") return DEFAULT_LINUX_APP;
+  if (platform === "linux")
+    return (await isFile(path.join(DEFAULT_LINUX_APP, "resources", "app.asar")))
+      ? DEFAULT_LINUX_APP
+      : portableZcodeApp(environment);
   const candidates = [
     environment.LOCALAPPDATA && path.join(environment.LOCALAPPDATA, "Programs", "ZCode"),
     environment.ProgramFiles && path.join(environment.ProgramFiles, "ZCode"),

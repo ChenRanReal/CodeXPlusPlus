@@ -11,23 +11,8 @@ import { createCodeBuddyInstallation } from "./installation.js";
 import { BrokeredHarnessAdapter } from "@codexhost/harness-broker";
 
 export function createHarnessAdapter(context: HarnessPluginContext) {
-  if (context.platform === "darwin" && context.managedRemoteHost) {
-    const environment = { ...context.environment };
-    return new BrokeredHarnessAdapter({
-      sessionImport: true,
-      accountCredits: false,
-      harnessId: "codebuddy",
-      forwardDelegationEnvironment: true,
-      commandCatalog: CODEBUDDY_COMMAND_CATALOG,
-      liveCommandCatalog: true,
-      environment,
-      isInstalled: () =>
-        resolveHarnessExecutable(codeBuddyDiscoverySpec, { environment }) !== undefined,
-    });
-  }
   const environment = { ...context.environment };
-  return Object.assign(new CodeBuddyAdapter({ environment }), {
-    installation: createCodeBuddyInstallation(environment),
+  const maintenance = {
     async resolveUninstaller() {
       const executable = resolveHarnessExecutable(codeBuddyDiscoverySpec, {
         environment,
@@ -39,5 +24,25 @@ export function createHarnessAdapter(context: HarnessPluginContext) {
       );
     },
     install: createHarnessInstaller(environment, { npm: "@tencent-ai/codebuddy-code" }),
+  };
+  if (context.platform === "darwin" && context.managedRemoteHost) {
+    return Object.assign(
+      new BrokeredHarnessAdapter({
+        sessionImport: true,
+        accountCredits: false,
+        harnessId: "codebuddy",
+        forwardDelegationEnvironment: true,
+        commandCatalog: CODEBUDDY_COMMAND_CATALOG,
+        liveCommandCatalog: true,
+        environment,
+        isInstalled: () =>
+          resolveHarnessExecutable(codeBuddyDiscoverySpec, { environment }) !== undefined,
+      }),
+      maintenance,
+    );
+  }
+  return Object.assign(new CodeBuddyAdapter({ environment }), {
+    installation: createCodeBuddyInstallation(environment),
+    ...maintenance,
   });
 }

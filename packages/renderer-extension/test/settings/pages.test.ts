@@ -2177,10 +2177,16 @@ describe("Renderer Connections page", () => {
     cleanup?.();
     scope.dispose();
   });
-  it("offers automatic installation only for Harnesses with an install command", () => {
-    const installation = vi.fn(async () => {
-      throw new Error("not expected");
-    });
+  it("offers automatic installation for a desktop app when its Host supplies the installer", async () => {
+    const installation = vi.fn<NonNullable<RendererConnectionDiagnostics["installation"]>>(
+      async (_host, agent, action) => ({
+        currentVersion: "Unknown",
+        latestVersion: "Unknown",
+        updateAvailable: false,
+        canUpdate: false,
+        ...(agent === "workbuddy" && action === "checkInstall" ? { canInstall: true } : {}),
+      }),
+    );
     const diagnostics: RendererConnectionDiagnostics = {
       snapshot: () => ({
         adapter: { state: "ready", reason: "ready", modelUpdates: 1, hook: "request-bridge" },
@@ -2222,10 +2228,20 @@ describe("Renderer Connections page", () => {
       );
     };
     expect(offersInstall("kiro-cli")).toBe(true);
-    // Desktop apps are downloaded by the user; their plugins expose no installer.
-    expect(offersInstall("workbuddy")).toBe(false);
+    const choose = (agent: "workbuddy" | "zcode") => {
+      const row = descendants(content).find(({ dataset }) => dataset.connectionItem === agent);
+      if (!row) throw new Error("Expected desktop Harness row");
+      row.dispatch("click", { target: null });
+    };
+    choose("workbuddy");
+    await vi.waitFor(() => expect(offersInstall("workbuddy")).toBe(true));
+    const panel = elementWithClass(content, "settings-connection-inspector__body");
+    expect(visibleText(panel)).toContain("一键安装");
+    choose("zcode");
+    await vi.waitFor(() =>
+      expect(installation).toHaveBeenCalledWith("local", "zcode", "checkInstall"),
+    );
     expect(offersInstall("zcode")).toBe(false);
-    expect(installation).not.toHaveBeenCalled();
     cleanup?.();
     scope.dispose();
   });

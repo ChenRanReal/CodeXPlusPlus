@@ -196,6 +196,36 @@ describe("Host Harness CLI installation routing", () => {
       await stopFixture(fixture);
     }
   });
+  it("installs and uninstalls a Harness without an optional version manager", async () => {
+    const fixture = createFixture({ environment: { CODEXHOST_REMOTE_SSH_MANAGED: "1" } });
+    let present = false;
+    Object.assign(fixture.adapter, {
+      install: async () => {
+        present = true;
+      },
+      inspect: async () => ({ status: present ? "unavailable" : "notInstalled" }),
+      resolveUninstaller: async () =>
+        present
+          ? async () => {
+              present = false;
+            }
+          : null,
+    });
+    const request = (action: string) =>
+      fixture.host.handleConsoleRequest(HARNESS_INSTALLATION_METHOD, { harnessId: "pi", action });
+    try {
+      await fixture.ready;
+      expect(await request("checkInstall")).toMatchObject({ result: { canInstall: true } });
+      expect(await request("install")).toHaveProperty("result");
+      expect(await request("install")).toMatchObject({ error: { code: -32077 } });
+      expect(await request("check")).toMatchObject({ error: { code: -32078 } });
+      expect(await request("checkUninstall")).toMatchObject({ result: { canUninstall: true } });
+      expect(await request("uninstall")).toHaveProperty("result");
+      expect(await request("checkUninstall")).not.toMatchObject({ result: { canUninstall: true } });
+    } finally {
+      await stopFixture(fixture);
+    }
+  });
 
   it("rejects caller-supplied commands, missing capabilities, and sanitizes native errors", async () => {
     const fixture = createFixture();

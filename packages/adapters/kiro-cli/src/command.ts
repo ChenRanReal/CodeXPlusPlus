@@ -25,7 +25,13 @@ export const kiroDiscoverySpec: HarnessDiscoverySpec = {
       "/usr/local/bin",
       "/opt/homebrew/bin",
     ],
-    windows: ["${LOCALAPPDATA}/Kiro-Cli", "~/.kiro/bin", "${APPDATA}/npm", VERSION_MANAGER_ROOTS],
+    windows: [
+      "${LOCALAPPDATA}/Kiro-Cli",
+      "${ProgramFiles}/Kiro-Cli",
+      "~/.kiro/bin",
+      "${APPDATA}/npm",
+      VERSION_MANAGER_ROOTS,
+    ],
   },
 };
 

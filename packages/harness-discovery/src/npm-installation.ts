@@ -8,6 +8,15 @@ import {
   runInstallationCommand,
 } from "./installation.js";
 
+/** Resolves removal through the npm prefix that owns the selected executable. */
+export async function resolveNpmUninstaller(
+  command: string,
+  name: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<(() => Promise<void>) | null> {
+  return (await npmInstallation(command, [name], environment))?.uninstall ?? null;
+}
+
 function referencesNpmBin(shim: string, name: string, bin: string): boolean {
   if (bin.includes("..")) return false;
   const target = `node_modules/${name}/${bin.replace(/^\.\//, "")}`.toLowerCase();

@@ -25,7 +25,7 @@
 | --- | --- | --- |
 | `docs/` 有 102 篇 Markdown；已按 architecture、product、harnesses、platforms、operations、proposals、archive 分类 | [文档索引](../index.md) | 已有按领域组织的基础，适合渐进重组；无需先大规模移动文件 |
 | 同一索引同时面向使用者、开发者和调研阅读者；开头已提醒方案不代表实现 | [文档索引](../index.md) | 保留状态区分，并把它扩展到页面、导航和搜索，而非只在入口提醒 |
-| 主要技术内容为中文；英文主 README，另有中文、韩文 README，以及部分中英平台文档 | [英文 README](../../README.md)、[中文 README](../project/README.zh-CN.md)、[韩文 README](../project/README.ko.md)、[SSH 指南](../platforms/remote/remote-ssh-host.md) | 不能假设所有内容都已有英文权威源；需要按页面管理原文与译文 |
+| 主要技术内容为中文；项目说明在根目录 README，另有部分中英平台文档 | [项目说明](../../README.md)、[SSH 指南](../platforms/remote/remote-ssh-host.md) | 不能假设所有内容都已有英文权威源；需要按页面管理原文与译文 |
 | 英文与中文 README 重复维护大型能力表；插件另有能力审计清单和专项说明 | [能力边界](../harnesses/capability-boundaries.md)、[Claude Code 清单](../../packages/adapters/claude-code/CAPABILITIES.md) | 优先统一结构化事实；不要直接把审计清单中的“待验证”变成产品“不支持” |
 | 已有运行时能力 Schema、原生动态目录和插件 Manifest | [能力 Schema](../../packages/shared-contracts/src/harness-models.ts)、[Cursor Manifest](../../packages/adapters/cursor-cli/manifest.json) | 可以复用类型、身份、安装元数据，但静态网页不能冒充任意会话的实时能力 |
 | 预装插件由发行清单决定，其中包含 `kind: usage` 的能力插件 | [发行清单](../../scripts/release/harness-plugins.json)、[Codex usage Manifest](../../packages/adapters/codex-usage/manifest.json) | “预装插件数量”不能直接当作“可创建会话的 Harness 数量” |

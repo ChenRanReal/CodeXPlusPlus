@@ -39,7 +39,7 @@ description: 审计或修正读起来像“推理过程泄漏”的注释与文�
 - 必须有明确范围；没有就询问，不推断为全仓库。
 - 排除：`reference/`、`docs/archive/`、`.codexhost/`、`node_modules/`、`dist/`、`target/`、生成物，以及录制的 fixtures 与快照（它们保留原始口吻）。
 - 面向模型或用户可见的字符串，措辞即行为：不要静默改写，标出并按“有快照或测试支撑的变更”处理。
-- 多语言文档配对（如 `docs/project/README.zh-CN.md`、`README.ko.md`）：同步改对应语言版本。
+- 多语言文档配对：同一内容有对应语言版本时，同步修改。
 
 ## 流程
 

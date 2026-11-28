@@ -48,7 +48,7 @@
 | C1 | 展示元数据 | 必做 | P1 | 受限 | manifest.json、assets/icon.png | 真实 Loader 解析图标 | SDK v1.0.25 MIT 图标；浅色/深色真实 UI 尚未验收 |
 | C2 | 手动安装指引 | 必做 | P1 | 支持 | manifest.json | 官方 CLI 文档；Manifest schema 检查 | 展示 npm 安装、原生登录、显式路径指引；不自动安装 |
 | C3 | 版本检查与更新 | 必做 | P1 | 支持 | src/installation.ts | 真实安装 check：1.0.102；test/installation.test.ts | 只更新所选 npm prefix、合并并发更新；实际 CLI 无可用更新，未升级它 |
-| C4 | 首次安装 | 可选 | P2 | 待验证 | 未实现 | S8、当前 createHarnessInstaller | 官方安装来源与非交互行为尚未验证；不能因未登录而重装 |
+| C4 | 首次安装与卸载 | 可选 | P2 | 已实现 | src/plugin.ts | 官方 `@github/copilot` npm 包，按已检测的全局前缀卸载 | 已安装但未登录时保持现有安装 |
 | C5 | 自定义启动路径 | 条件必做 | P1 | 不适用 | — | S8：目标为独立 Copilot CLI；当前连接页规范 | 本方案不依赖桌面应用内置 CLI；显式命令覆盖走公共 discovery 的 CODEXHOST_COPILOT_COMMAND，不套用应用目录设置 |
 | C6 | 会话导入 | 可选 | P2 | 待验证 | 未实现 | S1：listSessions；S4：持久事件只读读取 | 只读 resolve 后返回完整 nativeRef；列表可见不代表一定可恢复，运行状态未知用 null |
 | C7 | 全局用量统计 | 可选 | P2 | 待验证 | 未实现 | S3：用量事件；原生存储格式尚未验证 | 必须直接只读本地存储，不为全局统计启动 SDK/CLI；验证跨 Fork 的去重身份 |

@@ -36,15 +36,17 @@ export async function handleHarnessInstallation(
   if (!parsed.success)
     throw new HarnessInstallationError(-32602, "Invalid Harness installation request");
   const adapter = adapters.get(parsed.data.harnessId);
-  if (!adapter?.installation)
+  if (!adapter)
     throw new HarnessInstallationError(
       -32078,
       "Harness version management is unavailable on this Host",
     );
   const install = adapter.install?.bind(adapter);
   const resolveUninstaller = adapter.resolveUninstaller?.bind(adapter);
-  const installation = adapter.installation.bind(adapter);
+  const installation = adapter.installation?.bind(adapter);
   const { action, confirmedVersion } = parsed.data;
+  if (action === "checkInstall")
+    return install ? { ...withoutVersion, canInstall: true } : withoutVersion;
   if (action === "install" && !install)
     throw new HarnessInstallationError(
       -32078,
@@ -54,6 +56,11 @@ export async function handleHarnessInstallation(
     const supported = !mutations.has(adapter) && (await resolveUninstaller?.().catch(() => null));
     return supported ? { ...withoutVersion, canUninstall: true } : withoutVersion;
   }
+  if ((action === "check" || action === "update") && !installation)
+    throw new HarnessInstallationError(
+      -32078,
+      "Harness version management is unavailable on this Host",
+    );
   const pending = mutations.get(adapter);
   if (pending) {
     if (action === pending.action || (action === "check" && pending.action !== "uninstall"))
@@ -79,8 +86,11 @@ export async function handleHarnessInstallation(
           throw new Error("Harness is already installed or its state is uncertain");
         if (!install) throw new Error("Installation capability unavailable");
         await install();
-        return harnessInstallationStateSchema.parse(await installation("check"));
+        return installation
+          ? harnessInstallationStateSchema.parse(await installation("check"))
+          : withoutVersion;
       }
+      if (!installation) throw new Error("Version management capability unavailable");
       return harnessInstallationStateSchema.parse(
         await (confirmedVersion === undefined
           ? installation(action)

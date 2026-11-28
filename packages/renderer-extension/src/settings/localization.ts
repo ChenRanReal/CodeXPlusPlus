@@ -514,7 +514,7 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   harnessUninstall: "Uninstall automatically",
   harnessUninstallTitle: "Uninstall {name}?",
   harnessUninstallDetail:
-    "This removes the selected CLI from {host}. Your settings and conversation history are kept.",
+    "This removes the selected installation from {host}. Your settings and conversation history are kept.",
   harnessUninstallCancel: "Cancel",
   harnessUninstallFailed:
     "Could not confirm the uninstall. Check the CLI installation and try again.",
@@ -886,7 +886,7 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   connectionStatusUninstalling: "卸载中…",
   harnessUninstall: "一键卸载",
   harnessUninstallTitle: "卸载 {name}？",
-  harnessUninstallDetail: "这会从「{host}」卸载当前检测到的 CLI，并保留设置和对话记录。",
+  harnessUninstallDetail: "这会从「{host}」卸载当前检测到的安装，并保留设置和对话记录。",
   harnessUninstallCancel: "取消",
   harnessUninstallFailed: "无法确认卸载结果。请检查 CLI 的安装状态后重试。",
   connectionStatusUpdating: "更新中",

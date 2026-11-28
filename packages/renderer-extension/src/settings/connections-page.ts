@@ -821,6 +821,15 @@ export function createConnectionsSettingsPage(
 
       const syncSelectedInspector = (hostId: string, item: ConnectionListItem): void => {
         if (
+          item.agentSnapshot?.availability === "notInstalled" &&
+          item.agentSnapshot.plugin &&
+          item.availability !== "installing" &&
+          item.availability !== "uninstalling" &&
+          !harnessHasInstallCommands(item.agentSnapshot.plugin)
+        ) {
+          installs?.checkInstall(hostId, item.agentSnapshot.agent);
+        }
+        if (
           item.agentSnapshot &&
           item.agentSnapshot.availability !== "notInstalled" &&
           item.agentSnapshot.availability !== "checking" &&
@@ -981,7 +990,9 @@ export function createConnectionsSettingsPage(
               ...(version ? { version } : {}),
               ...(version?.updating ? { availability: "updating" as const } : {}),
               ...(state?.error ? { installError: state.error } : {}),
-              ...(diagnostics?.installation && harnessHasInstallCommands(item.agentSnapshot?.plugin)
+              ...(diagnostics?.installation &&
+              (harnessHasInstallCommands(item.agentSnapshot?.plugin) ||
+                installs?.canInstall(selectedHost.hostId, agent))
                 ? {
                     install: () => {
                       void installs?.run(selectedHost.hostId, agent, "install").then(() => {

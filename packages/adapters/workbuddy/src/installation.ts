@@ -1,9 +1,13 @@
 import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import {
   fetchInstallationText,
+  installDesktopHarness,
   installationVersion,
   newerInstallationVersion,
   runInstallationCommand,
+  resolveAppBundleUninstaller,
+  resolveNsisUninstaller,
   targetPath,
   versionFromOutput,
 } from "@codexhost/harness-discovery";
@@ -26,6 +30,80 @@ const applicationNotice = {
 function appVersion(value: unknown): string {
   const version = installationVersion(value);
   return version.replace(/^(\d+\.\d+\.\d+)\.\d+$/u, "$1");
+}
+
+/** The official public WorkBuddy release manifest for a CPU and operating system. */
+async function workBuddyRelease(
+  root: "https://www.workbuddy.ai" | "https://www.workbuddy.cn",
+  target: string,
+  fetchText = fetchInstallationText,
+) {
+  const feed = JSON.parse(await fetchText(`${root}/v2/update?platform=workbuddy-${target}`)) as {
+    version?: unknown;
+    url?: unknown;
+  };
+  const version = installationVersion(feed.version);
+  const download = new URL(typeof feed.url === "string" ? feed.url : "");
+  const host = root.endsWith(".ai") ? "download.codebuddy.ai" : "download.codebuddy.cn";
+  const darwin = target.startsWith("darwin-");
+  if (
+    download.origin !== `https://${host}` ||
+    download.username ||
+    download.password ||
+    download.search ||
+    download.hash ||
+    !download.pathname.startsWith(`/workbuddy/saas/${target}/WorkBuddy-${target}-${version}-`) ||
+    !download.pathname.endsWith(darwin ? ".zip" : ".exe")
+  )
+    throw new Error("WorkBuddy update feed returned an invalid installer URL");
+  if (darwin) download.pathname = download.pathname.replace(/\.zip$/u, ".dmg");
+  return { version: appVersion(version), download };
+}
+
+/** Installs the public vendor app, including the CLI it ships. */
+export function createWorkBuddyInstaller(environment: NodeJS.ProcessEnv) {
+  const target =
+    process.platform === "darwin" && ["arm64", "x64"].includes(process.arch)
+      ? `darwin-${process.arch}`
+      : process.platform === "win32" && ["arm64", "x64"].includes(process.arch)
+        ? "win32-x64-user"
+        : null;
+  if (!target) return;
+  return async () => {
+    const root =
+      environment.WORKBUDDY_UPDATE_URL === "https://www.workbuddy.cn"
+        ? "https://www.workbuddy.cn"
+        : "https://www.workbuddy.ai";
+    const { download } = await workBuddyRelease(root, target);
+    await installDesktopHarness(download, environment, {
+      name: "WorkBuddy.app",
+      alternateName: "WorkBuddy AI.app",
+      destination: "/Applications/WorkBuddy.app",
+    });
+  };
+}
+
+/** Uninstalls the selected vendor app; custom WorkBuddy CLI paths have no app uninstaller. */
+export async function resolveWorkBuddyUninstaller(environment: NodeJS.ProcessEnv) {
+  const { bundle } = resolveWorkBuddyLaunch(environment);
+  if (!bundle) return null;
+  if (process.platform === "win32") {
+    const root = path.dirname(bundle.executable);
+    const allUsers = [environment.ProgramFiles, environment["ProgramFiles(x86)"]].some(
+      (base) => base && path.relative(base, path.dirname(root)) === "",
+    );
+    return (
+      (await resolveNsisUninstaller(root, "Uninstall WorkBuddy.exe", environment, allUsers)) ??
+      (await resolveNsisUninstaller(root, "Uninstall WorkBuddy AI.exe", environment, allUsers))
+    );
+  }
+  if (process.platform === "darwin") {
+    const app = path.resolve(bundle.executable, "../../..");
+    const name = path.basename(app);
+    if (name === "WorkBuddy.app" || name === "WorkBuddy AI.app")
+      return resolveAppBundleUninstaller(app, path.join("/Applications", name));
+  }
+  return null;
 }
 
 async function readProduct(file: string): Promise<WorkBuddyProduct> {
@@ -106,29 +184,11 @@ export function createWorkBuddyInstallation(
       return unknown;
     try {
       // The public download page uses this feed without account or tenant identifiers.
-      const feed = JSON.parse(
-        await (dependencies.fetchText ?? fetchInstallationText)(
-          `${root}/v2/update?platform=workbuddy-${target}`,
-        ),
-      ) as { version?: unknown; url?: unknown };
-      const feedVersion = installationVersion(feed.version);
-      const latestVersion = appVersion(feedVersion);
-      const download = new URL(typeof feed.url === "string" ? feed.url : "");
-      const downloadHost = root.endsWith(".ai") ? "download.codebuddy.ai" : "download.codebuddy.cn";
-      if (
-        download.origin !== `https://${downloadHost}` ||
-        download.username ||
-        download.password ||
-        download.search ||
-        download.hash ||
-        !download.pathname.startsWith(
-          `/workbuddy/saas/${target}/WorkBuddy-${target}-${feedVersion}-`,
-        ) ||
-        !download.pathname.endsWith(platform === "darwin" ? ".zip" : ".exe")
-      )
-        throw new Error("WorkBuddy update feed returned an invalid installer URL");
-      // This is the same zip-to-dmg conversion used by the official macOS download page.
-      if (platform === "darwin") download.pathname = download.pathname.replace(/\.zip$/u, ".dmg");
+      const { version: latestVersion, download } = await workBuddyRelease(
+        root,
+        target,
+        dependencies.fetchText,
+      );
       const updateAvailable = newerInstallationVersion(currentVersion, latestVersion);
       return {
         currentVersion,

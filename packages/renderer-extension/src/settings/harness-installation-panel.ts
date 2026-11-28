@@ -25,8 +25,7 @@ export function createHarnessInstallationPanel(
     paragraph(zh ? "请在远程 Host 上安装。" : "Install on the remote Host.");
   }
   if (guide.before) paragraph(guide.before);
-  const install =
-    installation && guide.commands.length > 0 ? document.createElement("button") : null;
+  const install = installation ? document.createElement("button") : null;
   if (install && installation) {
     install.type = "button";
     install.className = "settings-command-button";
@@ -46,7 +45,7 @@ export function createHarnessInstallationPanel(
       install.textContent = messages.connectionStatusInstalling;
       installation.run();
     });
-    if (guide.commands.length > 1) panel.append(install);
+    if (guide.commands.length !== 1) panel.append(install);
   }
   for (const { terminal, command } of guide.commands) {
     const block = document.createElement("div");
